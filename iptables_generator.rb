@@ -47,12 +47,6 @@ puts <<END
 :OUTPUT ACCEPT [0:0]
 :INPUT ACCEPT [0:0]
 
-#mark locally generated packets with the outgoing interface:
-#- active outbound connections: non-first packets
-#- active inbound connections: returning packets
-#- active outbound connections: only working if has been done a previous marking (ex. for a SMTP server)
-[0:0] -A OUTPUT -j CONNMARK --restore-mark
-
 #new outbound connections: force the connection to use a specific uplink instead of letting the multipath routing decide (ex. for a SMTP server)
 #[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m state --state NEW -p tcp --syn --dport XXX -j CONNMARK --set-mark YYY
 END
