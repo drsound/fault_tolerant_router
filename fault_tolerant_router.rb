@@ -6,10 +6,6 @@ require 'mail'
 require 'logger'
 require 'yaml'
 
-def shuffle
-  sort_by { rand }
-end
-
 def command(c)
   `#{c}` unless DEMO
   puts "Command: #{c}" if DEBUG
@@ -170,7 +166,7 @@ COMMIT
 
 *filter
 
-#[...] (integrate with existing rules)
+#[...] (merge existing rules)
 
 :LAN_WAN - [0:0]
 :WAN_LAN - [0:0]
@@ -183,7 +179,7 @@ END
 
   puts <<END
 
-#[...] (integrate with existing rules)
+#[...] (merge existing rules)
 
 END
   UPLINKS.each do |connection|
@@ -202,7 +198,7 @@ END
   end
   puts <<END
 
-#[...] (integrate with existing rules)
+#[...] (merge existing rules)
 
 COMMIT
 END
@@ -282,7 +278,7 @@ else
             puts "Uplink #{connection[:description]}: avoiding more tests because there are enough positive ones" if DEBUG
             break
           elsif TEST_IPS.size - connection[:unsuccessful_tests] < REQUIRED_SUCCESSFUL_TESTS
-            puts "Uplink #{connection[:description]}: avoiding more tests because too few are remaining" if DEBUG
+            puts "Uplink #{connection[:description]}: avoiding more tests because too many have been failed" if DEBUG
             break
           end
         end
@@ -294,7 +290,7 @@ else
     #only consider uplinks flagged as default route
     if UPLINKS.find_all { |connection| connection[:default_route] }.all? { |connection| !connection[:working] }
       UPLINKS.find_all { |connection| connection[:default_route] }.each { |connection| connection[:enabled] = true }
-      puts 'No uplink seems to be working, enabling them all' if DEBUG
+      puts 'No uplink seems to be working, enabling all of them' if DEBUG
     end
 
     UPLINKS.each do |connection|
@@ -332,9 +328,9 @@ else
         mail.delivery_method :smtp, SMTP_PARAMETERS
         begin
           mail.deliver
-        rescue Exception => ex
-          puts "Problem sending email: #{ex}" if DEBUG
-          logger.error("Problem sending email: #{ex}")
+        rescue Exception => e
+          puts "Problem sending email: #{e}" if DEBUG
+          logger.error("Problem sending email: #{e}")
         end
       end
     end
