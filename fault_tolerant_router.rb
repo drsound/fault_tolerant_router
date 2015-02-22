@@ -26,7 +26,7 @@ def set_default_route
     nexthops = nexthops.join(' ')
   end
   #set the route for first packet of outbound connections
-  command "ip route replace table 100 default #{nexthops}"
+  command "ip route replace table #{BASE_TABLE + UPLINKS.size} default #{nexthops}"
   #apply the routing changes
   command 'ip route flush cache'
 end
@@ -92,7 +92,8 @@ SEND_EMAIL = config[:email][:send]
 EMAIL_SENDER = config[:email][:sender]
 EMAIL_RECIPIENTS = config[:email][:recipients]
 SMTP_PARAMETERS = config[:email][:smtp_parameters]
-
+BASE_TABLE = config[:base_table]
+BASE_PRIORITY = config[:base_priority]
 
 if ARGV[0] == 'generate_iptables'
   puts <<END
@@ -212,15 +213,14 @@ else
     connection[:enabled] = connection[:default_route]
   end
 
-  #clean all previous configurations, try to clean more than needed to avoid problems in case of changes in the
+  #clean all previous configurations, try to clean more than needed (double) to avoid problems in case of changes in the
   #number of uplinks between different executions
-  10.times do |i|
-    command "ip rule del priority #{39001 + i} &> /dev/null"
-    command "ip rule del priority #{40001 + i} &> /dev/null"
-    command "ip route del table #{1 + i} &> /dev/null"
+  ((UPLINKS.size * 2 + 1) * 2).times do |i|
+    command "ip rule del priority #{BASE_PRIORITY + i} &> /dev/null"
   end
-  command 'ip rule del priority 40100 &> /dev/null'
-  command 'ip route del table 100 &> /dev/null'
+  ((UPLINKS.size + 1) * 2).times do |i|
+    command "ip route del table #{BASE_TABLE + i} &> /dev/null"
+  end
 
   #disable "reverse path filtering" on the uplink interfaces
   command 'echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter'
@@ -232,12 +232,12 @@ else
   #- returning packets of inbound connections coming from ethX
   #- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
   UPLINKS.each_with_index do |connection, i|
-    command "ip route add table #{1 + i} default via #{connection[:gateway]} src #{connection[:ip]}"
-    command "ip rule add priority #{39001 + i} from #{connection[:ip]} lookup #{1 + i}"
-    command "ip rule add priority #{40001 + i} fwmark #{1 + i} lookup #{1 + i}"
+    command "ip route add table #{BASE_TABLE + i} default via #{connection[:gateway]} src #{connection[:ip]}"
+    command "ip rule add priority #{BASE_PRIORITY + i} from #{connection[:ip]} lookup #{BASE_TABLE + i}"
+    command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size + i} fwmark #{1 + i} lookup #{BASE_TABLE + i}"
   end
   #first packet of outbound connections
-  command 'ip rule add priority 40100 from all lookup 100'
+  command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size * 2} from all lookup #{BASE_TABLE + UPLINKS.size}"
   set_default_route
 
   loop do
