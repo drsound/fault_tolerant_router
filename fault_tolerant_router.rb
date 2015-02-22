@@ -13,15 +13,15 @@ end
 
 def set_default_route
   #find the enabled uplinks
-  enabled_connections = UPLINKS.find_all { |connection| connection[:enabled] }
+  enabled_uplinks = UPLINKS.find_all { |uplink| uplink[:enabled] }
   #do not use balancing if there is just one enabled uplink
-  if enabled_connections.size == 1
-    nexthops = "via #{enabled_connections.first[:gateway]}"
+  if enabled_uplinks.size == 1
+    nexthops = "via #{enabled_uplinks.first[:gateway]}"
   else
-    nexthops = enabled_connections.collect do |connection|
+    nexthops = enabled_uplinks.collect do |uplink|
       #the "weight" parameter is optional
-      weight = connection[:weight] ? " weight #{connection[:weight]}" : ''
-      "nexthop via #{connection[:gateway]}#{weight}"
+      weight = uplink[:weight] ? " weight #{uplink[:weight]}" : ''
+      "nexthop via #{uplink[:gateway]}#{weight}"
     end
     nexthops = nexthops.join(' ')
   end
@@ -107,8 +107,8 @@ if ARGV[0] == 'generate_iptables'
 #new outbound connections: force connection to use a specific uplink instead of letting multipath routing decide (for
 #example for an SMTP server). Uncomment if needed.
 END
-  UPLINKS.each_with_index do |connection, i|
-    puts "##{connection[:description]}"
+  UPLINKS.each_with_index do |uplink, i|
+    puts "##{uplink[:description]}"
     puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}"
     puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}" if DMZ_INTERFACE
   end
@@ -125,17 +125,17 @@ END
 
 #new inbound connections: mark with the incoming interface (decided by the connecting host)
 END
-  UPLINKS.each_with_index do |connection, i|
-    puts "##{connection[:description]}"
-    puts "[0:0] -A PREROUTING -i #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+  UPLINKS.each_with_index do |uplink, i|
+    puts "##{uplink[:description]}"
+    puts "[0:0] -A PREROUTING -i #{uplink[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
 #new outbound connections: mark with the outgoing interface (decided by the multipath routing)
 END
-  UPLINKS.each_with_index do |connection, i|
-    puts "##{connection[:description]}"
-    puts "[0:0] -A POSTROUTING -o #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+  UPLINKS.each_with_index do |uplink, i|
+    puts "##{uplink[:description]}"
+    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
@@ -149,25 +149,25 @@ COMMIT
 
 #DNAT: WAN --> DMZ. Uncomment if needed.
 END
-  UPLINKS.each do |connection|
-    puts "##{connection[:description]}"
-    puts "#[0:0] -A PREROUTING -i #{connection[:interface]} -d #{connection[:ip]} -j DNAT --to-destination XXX.XXX.XXX.XXX"
+  UPLINKS.each do |uplink|
+    puts "##{uplink[:description]}"
+    puts "#[0:0] -A PREROUTING -i #{uplink[:interface]} -d #{uplink[:ip]} -j DNAT --to-destination XXX.XXX.XXX.XXX"
   end
   puts <<END
 
 #SNAT: LAN/DMZ --> WAN: force the usage of a specific source address (for example for an SMTP server). Uncomment if needed.
 END
-  UPLINKS.each do |connection|
-    puts "##{connection[:description]}"
-    puts "#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o #{connection[:interface]} -j SNAT --to-source YYY.YYY.YYY.YYY"
+  UPLINKS.each do |uplink|
+    puts "##{uplink[:description]}"
+    puts "#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o #{uplink[:interface]} -j SNAT --to-source YYY.YYY.YYY.YYY"
   end
   puts <<END
 
 #SNAT: LAN --> WAN
 END
-  UPLINKS.each do |connection|
-    puts "##{connection[:description]}"
-    puts "[0:0] -A POSTROUTING -o #{connection[:interface]} -j SNAT --to-source #{connection[:ip]}"
+  UPLINKS.each do |uplink|
+    puts "##{uplink[:description]}"
+    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -j SNAT --to-source #{uplink[:ip]}"
   end
   puts <<END
 
@@ -192,18 +192,18 @@ END
 #[...] (merge existing rules)
 
 END
-  UPLINKS.each do |connection|
-    puts "[0:0] -A FORWARD -i #{LAN_INTERFACE} -o #{connection[:interface]} -j LAN_WAN"
+  UPLINKS.each do |uplink|
+    puts "[0:0] -A FORWARD -i #{LAN_INTERFACE} -o #{uplink[:interface]} -j LAN_WAN"
   end
-  UPLINKS.each do |connection|
-    puts "[0:0] -A FORWARD -i #{connection[:interface]} -o #{LAN_INTERFACE} -j WAN_LAN"
+  UPLINKS.each do |uplink|
+    puts "[0:0] -A FORWARD -i #{uplink[:interface]} -o #{LAN_INTERFACE} -j WAN_LAN"
   end
   if DMZ_INTERFACE
-    UPLINKS.each do |connection|
-      puts "[0:0] -A FORWARD -i #{DMZ_INTERFACE} -o #{connection[:interface]} -j DMZ_WAN"
+    UPLINKS.each do |uplink|
+      puts "[0:0] -A FORWARD -i #{DMZ_INTERFACE} -o #{uplink[:interface]} -j DMZ_WAN"
     end
-    UPLINKS.each do |connection|
-      puts "[0:0] -A FORWARD -i #{connection[:interface]} -o #{DMZ_INTERFACE} -j WAN_DMZ"
+    UPLINKS.each do |uplink|
+      puts "[0:0] -A FORWARD -i #{uplink[:interface]} -o #{DMZ_INTERFACE} -j WAN_DMZ"
     end
   end
   puts <<END
@@ -216,10 +216,10 @@ else
   logger = Logger.new(LOG_FILE, 10, 1024000)
 
   #enable all the uplinks
-  UPLINKS.each do |connection|
-    connection[:working] = true
-    connection[:default_route] ||= connection[:default_route].nil?
-    connection[:enabled] = connection[:default_route]
+  UPLINKS.each do |uplink|
+    uplink[:working] = true
+    uplink[:default_route] ||= uplink[:default_route].nil?
+    uplink[:enabled] = uplink[:default_route]
   end
 
   #clean all previous configurations, try to clean more than needed (double) to avoid problems in case of changes in the
@@ -233,16 +233,16 @@ else
 
   #disable "reverse path filtering" on the uplink interfaces
   command 'echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter'
-  UPLINKS.each do |connection|
-    command "echo 2 > /proc/sys/net/ipv4/conf/#{connection[:interface]}/rp_filter"
+  UPLINKS.each do |uplink|
+    command "echo 2 > /proc/sys/net/ipv4/conf/#{uplink[:interface]}/rp_filter"
   end
 
   #- locally generated packets having as source ip the ethX ip
   #- returning packets of inbound connections coming from ethX
   #- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
-  UPLINKS.each_with_index do |connection, i|
-    command "ip route add table #{BASE_TABLE + i} default via #{connection[:gateway]} src #{connection[:ip]}"
-    command "ip rule add priority #{BASE_PRIORITY + i} from #{connection[:ip]} lookup #{BASE_TABLE + i}"
+  UPLINKS.each_with_index do |uplink, i|
+    command "ip route add table #{BASE_TABLE + i} default via #{uplink[:gateway]} src #{uplink[:ip]}"
+    command "ip rule add priority #{BASE_PRIORITY + i} from #{uplink[:ip]} lookup #{BASE_TABLE + i}"
     command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size + i} fwmark #{BASE_FWMARK + i} lookup #{BASE_TABLE + i}"
   end
   #first packet of outbound connections
@@ -251,23 +251,23 @@ else
 
   loop do
     #for each uplink...
-    UPLINKS.each do |connection|
+    UPLINKS.each do |uplink|
       #set current "working" state as the previous one
-      connection[:previously_working] = connection[:working]
+      uplink[:previously_working] = uplink[:working]
       #set current "enabled" state as the previous one
-      connection[:previously_enabled] = connection[:enabled]
-      connection[:successful_tests] = 0
-      connection[:unsuccessful_tests] = 0
+      uplink[:previously_enabled] = uplink[:enabled]
+      uplink[:successful_tests] = 0
+      uplink[:unsuccessful_tests] = 0
       #for each test (in random order)...
       TEST_IPS.shuffle.each_with_index do |test, i|
         successful_test = false
         #retry for several times...
         PING_RETRIES.times do
           if DEBUG
-            print "Uplink #{connection[:description]}: ping #{test}... "
+            print "Uplink #{uplink[:description]}: ping #{test}... "
             STDOUT.flush
           end
-          if ping(test, connection[:ip])
+          if ping(test, uplink[:ip])
             successful_test = true
             puts 'ok' if DEBUG
             #avoid more pings to the same ip after a successful one
@@ -277,54 +277,54 @@ else
           end
         end
         if successful_test
-          connection[:successful_tests] += 1
+          uplink[:successful_tests] += 1
         else
-          connection[:unsuccessful_tests] += 1
+          uplink[:unsuccessful_tests] += 1
         end
         #if not currently doing the last test...
         if i + 1 < TEST_IPS.size
-          if connection[:successful_tests] >= REQUIRED_SUCCESSFUL_TESTS
-            puts "Uplink #{connection[:description]}: avoiding more tests because there are enough positive ones" if DEBUG
+          if uplink[:successful_tests] >= REQUIRED_SUCCESSFUL_TESTS
+            puts "Uplink #{uplink[:description]}: avoiding more tests because there are enough positive ones" if DEBUG
             break
-          elsif TEST_IPS.size - connection[:unsuccessful_tests] < REQUIRED_SUCCESSFUL_TESTS
-            puts "Uplink #{connection[:description]}: avoiding more tests because too many have been failed" if DEBUG
+          elsif TEST_IPS.size - uplink[:unsuccessful_tests] < REQUIRED_SUCCESSFUL_TESTS
+            puts "Uplink #{uplink[:description]}: avoiding more tests because too many have been failed" if DEBUG
             break
           end
         end
       end
-      connection[:working] = connection[:successful_tests] >= REQUIRED_SUCCESSFUL_TESTS
-      connection[:enabled] = connection[:working] && connection[:default_route]
+      uplink[:working] = uplink[:successful_tests] >= REQUIRED_SUCCESSFUL_TESTS
+      uplink[:enabled] = uplink[:working] && uplink[:default_route]
     end
 
     #only consider uplinks flagged as default route
-    if UPLINKS.find_all { |connection| connection[:default_route] }.all? { |connection| !connection[:working] }
-      UPLINKS.find_all { |connection| connection[:default_route] }.each { |connection| connection[:enabled] = true }
+    if UPLINKS.find_all { |uplink| uplink[:default_route] }.all? { |uplink| !uplink[:working] }
+      UPLINKS.find_all { |uplink| uplink[:default_route] }.each { |uplink| uplink[:enabled] = true }
       puts 'No uplink seems to be working, enabling all of them' if DEBUG
     end
 
-    UPLINKS.each do |connection|
+    UPLINKS.each do |uplink|
       description = case
-                      when connection[:enabled] && !connection[:previously_enabled] then
+                      when uplink[:enabled] && !uplink[:previously_enabled] then
                         ', enabled'
-                      when !connection[:enabled] && connection[:previously_enabled] then
+                      when !uplink[:enabled] && uplink[:previously_enabled] then
                         ', disabled'
                       else
                         ''
                     end
-      puts "Uplink #{connection[:description]}: #{connection[:successful_tests]} successful tests, #{connection[:unsuccessful_tests]} unsuccessful tests#{description}"
+      puts "Uplink #{uplink[:description]}: #{uplink[:successful_tests]} successful tests, #{uplink[:unsuccessful_tests]} unsuccessful tests#{description}"
     end if DEBUG
 
     #set a new default route if there are changes between the previous and the current uplinks situation
-    set_default_route if UPLINKS.any? { |connection| connection[:enabled] != connection[:previously_enabled] }
+    set_default_route if UPLINKS.any? { |uplink| uplink[:enabled] != uplink[:previously_enabled] }
 
-    if UPLINKS.any? { |connection| connection[:working] != connection[:previously_working] }
+    if UPLINKS.any? { |uplink| uplink[:working] != uplink[:previously_working] }
       body = ''
-      UPLINKS.each do |connection|
-        body += "Uplink #{connection[:description]}: #{connection[:previously_working] ? 'up' : 'down'}"
-        if connection[:previously_working] == connection[:working]
+      UPLINKS.each do |uplink|
+        body += "Uplink #{uplink[:description]}: #{uplink[:previously_working] ? 'up' : 'down'}"
+        if uplink[:previously_working] == uplink[:working]
           body += "\n"
         else
-          body += " --> #{connection[:working] ? 'up' : 'down'}\n"
+          body += " --> #{uplink[:working] ? 'up' : 'down'}\n"
         end
       end
 
