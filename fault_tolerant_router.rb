@@ -1,85 +1,10 @@
 #!/usr/bin/env ruby
 
-LAN_INTERFACE = 'eth0'
-
-#set to "nil" if you don't have a DMZ
-#DMZ_INTERFACE = 'eth1'
-DMZ_INTERFACE = nil
-
-#ping retries in case of ping error
-PING_RETRIES = 1
-
-#number of successful pinged addresses to consider an uplink to be functional
-REQUIRED_SUCCESSFUL_TESTS = 4
-
-#seconds between a check of the uplinks and the next one
-PROBES_INTERVAL = 60
-
-SEND_EMAIL = false
-EMAIL_SENDER = "root@#{`hostname -f`.strip}"
-EMAIL_RECIPIENTS = %w(user@domain.com)
-SMTP_PARAMETERS = {
-    address: 'mail.domain.com',
-    #port: 25,
-    #domain: 'domain.com',
-    #authentication: :plain,
-    #enable_starttls_auto: false,
-    user_name: 'user@domain.com',
-    password: 'my-secret-password'
-}
-
-#LOG_FILE = '/var/log/fault_tolerant_router.log'
-LOG_FILE = '/tmp/fault_tolerant_router.log'
-
-DEBUG = true
-DEMO = true
-
-UPLINKS = [
-    {
-        interface: 'eth1',
-        ip: '1.1.1.1',
-        gateway: '1.1.1.254',
-        description: 'Example Provider 1',
-        #optional
-        weight: 1,
-        #optional
-        default_route: false
-    },
-    {
-        interface: 'eth2',
-        ip: '2.2.2.2',
-        gateway: '2.2.2.254',
-        description: 'Example Provider 2',
-        #optional
-        weight: 2,
-        #optional
-        #default_route: false
-    },
-    {
-        interface: 'eth3',
-        ip: '3.3.3.3',
-        gateway: '3.3.3.254',
-        description: 'Example Provider 3',
-        #optional
-        # weight: 3,
-        #optional
-        # default_route: false
-    }
-]
-
-TESTS = %w(
-  208.67.222.222
-  208.67.220.220
-  8.8.8.8
-  8.8.4.4
-  4.2.2.2
-  4.2.2.3
-)
-
 require 'optparse'
 require 'net/smtp'
 require 'mail'
 require 'logger'
+require 'yaml'
 
 def shuffle
   sort_by { rand }
@@ -106,7 +31,7 @@ def set_default_route
   end
   #set the route for first packet of outbound connections
   command "ip route replace table 100 default #{nexthops}"
-  #apply the routeing changes
+  #apply the routing changes
   command 'ip route flush cache'
 end
 
@@ -120,9 +45,16 @@ def ping(ip, source)
   end
 end
 
-
+options = {
+    config: '/etc/fault_tolerant_router.conf',
+    debug: false,
+    demo: false
+}
 parser = OptionParser.new do |opts|
   opts.banner = "Use: #{File.basename($0)} [options] generate_iptables|monitor"
+  opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
+    options[:config] = configuration_file
+  end
   opts.on('--debug', 'Print debug output') do |debug|
     options[:debug] = debug
   end
@@ -141,6 +73,30 @@ if ARGV.size != 1 || !%w(generate_iptables monitor).include?(ARGV[0])
   puts parser.help
   exit 1
 end
+
+unless File.exists?(options[:config])
+  puts "Configuration file #{options[:config]} does not exists!"
+  exit 1
+end
+
+DEMO = options[:demo]
+#activate debug if we are in demo mode
+DEBUG = options[:debug] || DEMO
+
+config = YAML.load_file(options[:config])
+UPLINKS = config[:uplinks]
+LAN_INTERFACE = config[:downlinks][:lan]
+DMZ_INTERFACE = config[:downlinks][:dmz]
+TEST_IPS = config[:tests][:ips]
+REQUIRED_SUCCESSFUL_TESTS = config[:tests][:required_successful]
+PING_RETRIES = config[:tests][:ping_retries]
+TEST_INTERVAL = config[:tests][:interval]
+LOG_FILE = config[:log_file]
+SEND_EMAIL = config[:email][:send]
+EMAIL_SENDER = config[:email][:sender]
+EMAIL_RECIPIENTS = config[:email][:recipients]
+SMTP_PARAMETERS = config[:email][:smtp_parameters]
+
 
 if ARGV[0] == 'generate_iptables'
   puts <<END
@@ -260,8 +216,8 @@ else
     connection[:enabled] = connection[:default_route]
   end
 
-#clean all previous configurations, try to clean more than needed to avoid problems in case of changes in the
-#number of uplinks between different executions
+  #clean all previous configurations, try to clean more than needed to avoid problems in case of changes in the
+  #number of uplinks between different executions
   10.times do |i|
     command "ip rule del priority #{39001 + i} &> /dev/null"
     command "ip rule del priority #{40001 + i} &> /dev/null"
@@ -270,21 +226,21 @@ else
   command 'ip rule del priority 40100 &> /dev/null'
   command 'ip route del table 100 &> /dev/null'
 
-#disable "reverse path filtering" on the uplink interfaces
+  #disable "reverse path filtering" on the uplink interfaces
   command 'echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter'
   UPLINKS.each do |connection|
     command "echo 2 > /proc/sys/net/ipv4/conf/#{connection[:interface]}/rp_filter"
   end
 
-#- locally generated packets having as source ip the ethX ip
-#- returning packets of inbound connections coming from ethX
-#- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
+  #- locally generated packets having as source ip the ethX ip
+  #- returning packets of inbound connections coming from ethX
+  #- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
   UPLINKS.each_with_index do |connection, i|
     command "ip route add table #{1 + i} default via #{connection[:gateway]} src #{connection[:ip]}"
     command "ip rule add priority #{39001 + i} from #{connection[:ip]} lookup #{1 + i}"
     command "ip rule add priority #{40001 + i} fwmark #{1 + i} lookup #{1 + i}"
   end
-#first packet of outbound connections
+  #first packet of outbound connections
   command 'ip rule add priority 40100 from all lookup 100'
   set_default_route
 
@@ -298,7 +254,7 @@ else
       connection[:successful_tests] = 0
       connection[:unsuccessful_tests] = 0
       #for each test (in random order)...
-      TESTS.shuffle.each_with_index do |test, i|
+      TEST_IPS.shuffle.each_with_index do |test, i|
         successful_test = false
         #retry for several times...
         PING_RETRIES.times do
@@ -321,11 +277,11 @@ else
           connection[:unsuccessful_tests] += 1
         end
         #if not currently doing the last test...
-        if i + 1 < TESTS.size
+        if i + 1 < TEST_IPS.size
           if connection[:successful_tests] >= REQUIRED_SUCCESSFUL_TESTS
             puts "Uplink #{connection[:description]}: avoiding more tests because there are enough positive ones" if DEBUG
             break
-          elsif TESTS.size - connection[:unsuccessful_tests] < REQUIRED_SUCCESSFUL_TESTS
+          elsif TEST_IPS.size - connection[:unsuccessful_tests] < REQUIRED_SUCCESSFUL_TESTS
             puts "Uplink #{connection[:description]}: avoiding more tests because too few are remaining" if DEBUG
             break
           end
@@ -383,7 +339,7 @@ else
       end
     end
 
-    puts "Waiting #{PROBES_INTERVAL} seconds..." if DEBUG
-    sleep PROBES_INTERVAL
+    puts "Waiting #{TEST_INTERVAL} seconds..." if DEBUG
+    sleep TEST_INTERVAL
   end
 end
