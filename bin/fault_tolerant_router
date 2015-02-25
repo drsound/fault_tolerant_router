@@ -5,7 +5,9 @@ require 'net/smtp'
 require 'mail'
 require 'logger'
 require 'yaml'
-require 'fault_tolerant_router/iptables'
+require 'fault_tolerant_router/version'
+require 'fault_tolerant_router/generate_config'
+require 'fault_tolerant_router/generate_iptables'
 require 'fault_tolerant_router/monitor'
 
 options = {
@@ -14,16 +16,28 @@ options = {
     demo: false
 }
 parser = OptionParser.new do |opts|
-  opts.banner = "Usage: #{File.basename($0)} [options] generate_iptables|monitor"
+  opts.banner = "Usage: #{File.basename($0)} [OPTION]... ACTION"
+  opts.separator ''
+  opts.separator 'ACTION = generate_config|generate_iptables|monitor'
+  opts.separator ''
+  opts.separator '         generate_config: print an example configuration'
+  opts.separator '         generate_iptables: generate an iptables iptables-save configuration'
+  opts.separator '         monitor: monitor uplinks and change routing accordingly'
+  opts.separator ''
+  opts.separator '"generate_iptables" and "monitor" specific options:'
   opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
     options[:config] = configuration_file
   end
+  opts.separator ''
+  opts.separator '"monitor" specific options:'
   opts.on('--debug', 'Print debug output') do |debug|
     options[:debug] = debug
   end
-  opts.on('--demo', 'Demo routing changes by faking random uplink failures') do |demo|
+  opts.on('--demo', 'Demo the program by faking random uplink failures') do |demo|
     options[:demo] = demo
   end
+  opts.separator ''
+  opts.separator "Version #{FaultTolerantRouter::VERSION} - Alessandro Zarrilli <alessandro@zarrilli.net>"
 end
 begin
   parser.parse!
@@ -32,9 +46,18 @@ rescue OptionParser::ParseError
   exit 1
 end
 
-if ARGV.size != 1 || !%w(generate_iptables monitor).include?(ARGV[0])
+DEMO = options[:demo]
+#activate debug if we are in demo mode
+DEBUG = options[:debug] || DEMO
+
+unless ARGV.size == 1 && %w(generate_config generate_iptables monitor).include?(ARGV[0])
   puts parser.help
   exit 1
+end
+
+if ARGV[0] == 'generate_config'
+  generate_config
+  exit 0
 end
 
 unless File.exists?(options[:config])
@@ -42,10 +65,7 @@ unless File.exists?(options[:config])
   exit 1
 end
 
-DEMO = options[:demo]
-#activate debug if we are in demo mode
-DEBUG = options[:debug] || DEMO
-
+#todo: do not use symbols in yaml config file
 config = YAML.load_file(options[:config])
 UPLINKS = config[:uplinks]
 LAN_INTERFACE = config[:downlinks][:lan]
@@ -54,10 +74,9 @@ TEST_IPS = config[:tests][:ips]
 REQUIRED_SUCCESSFUL_TESTS = config[:tests][:required_successful]
 PING_RETRIES = config[:tests][:ping_retries]
 TEST_INTERVAL = config[:tests][:interval]
-LOG_FILE = config[:log_file]
-#todo: add in configuration file
-LOG_MAX_SIZE = 1024000
-LOG_OLD_FILES = 10
+LOG_FILE = config[:log][:log_file]
+LOG_MAX_SIZE = config[:log][:max_size]
+LOG_OLD_FILES = config[:log][:old_files]
 SEND_EMAIL = config[:email][:send]
 EMAIL_SENDER = config[:email][:sender]
 EMAIL_RECIPIENTS = config[:email][:recipients]

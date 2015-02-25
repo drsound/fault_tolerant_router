@@ -1,5 +1,5 @@
-#todo: move away from here
-#todo: use strings, not symbols
+def generate_config
+  puts <<END
 #add as many uplinks as needed
 :uplinks:
 - :interface: eth1
@@ -45,8 +45,13 @@
   :ping_retries: 1
   #seconds between a check of the uplinks and the next one
   :interval: 60
-:log_file: "/tmp/fault_tolerant_router.log"
-#:log_file: "/var/log/fault_tolerant_router.log"
+:log:
+  #file: "/var/log/fault_tolerant_router.log"
+  :file: "/tmp/fault_tolerant_router.log"
+  #max log file size (in bytes)
+  :max_size: 1024000
+  #number of old log files to keep
+  :old_files: 10
 :email:
   :send: false
   :sender: router@domain.com
@@ -66,3 +71,5 @@
 :base_priority: 40000
 #base fwmark
 :base_fwmark: 1
+END
+end
