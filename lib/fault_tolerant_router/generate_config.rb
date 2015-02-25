@@ -67,7 +67,7 @@ def generate_config
     :password: secret-password
 #base ip route table
 :base_table: 1
-#base ip rule priority
+#base ip rule priority, must be higher than 32767 (default priority, see "ip rule")
 :base_priority: 40000
 #base fwmark
 :base_fwmark: 1

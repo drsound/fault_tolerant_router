@@ -16,12 +16,10 @@ And then execute:
 
 ## To do
 - [ ] improve documentation
-- [ ] split monitor and iptables generation in external required files
 - [ ] option to send a test email
 
 ## License
 GNU General Public License v2.0, see LICENSE file
 
 ## Author
-Alessandro Zarrilli  
-alessandro@zarrilli.net
+Alessandro Zarrilli - <alessandro@zarrilli.net>
