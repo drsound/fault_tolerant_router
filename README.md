@@ -4,6 +4,18 @@ This is a Ruby daemon, to be run in the backgound on a Linux router or firewall.
 
 Fault Tolerant Router is well tested and already used in production by several years, in several customers sites. I've just released it to GitHub, I will write some documentation in the next days.
 
+## Installation
+
+    $ gem install fault_tolerant_router
+
+And then execute:
+
+    $ fault_tolerant_router
+
+## Usage
+
+TODO: Write usage instructions here
+
 ## To do
 - [ ] improve documentation
 - [ ] split monitor and iptables generation in external required files

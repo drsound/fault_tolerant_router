@@ -47,7 +47,7 @@ options = {
     demo: false
 }
 parser = OptionParser.new do |opts|
-  opts.banner = "Use: #{File.basename($0)} [options] generate_iptables|monitor"
+  opts.banner = "Usage: #{File.basename($0)} [options] generate_iptables|monitor"
   opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
     options[:config] = configuration_file
   end
