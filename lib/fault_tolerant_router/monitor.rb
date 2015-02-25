@@ -33,6 +33,16 @@ def set_default_route
   command 'ip route flush cache'
 end
 
+def send_email(body)
+  mail = Mail.new
+  mail.from = EMAIL_SENDER
+  mail.to = EMAIL_RECIPIENTS
+  mail.subject = 'Uplinks status change'
+  mail.body = body
+  mail.delivery_method :smtp, SMTP_PARAMETERS
+  mail.deliver
+end
+
 def monitor
   logger = Logger.new(LOG_FILE, LOG_OLD_FILES, LOG_MAX_SIZE)
 
@@ -152,14 +162,8 @@ def monitor
       logger.warn(body.gsub("\n", ';'))
 
       if SEND_EMAIL
-        mail = Mail.new
-        mail.from = EMAIL_SENDER
-        mail.to = EMAIL_RECIPIENTS
-        mail.subject = 'Uplinks status change'
-        mail.body = body
-        mail.delivery_method :smtp, SMTP_PARAMETERS
         begin
-          mail.deliver
+          send_email(body)
         rescue Exception => e
           puts "Problem sending email: #{e}" if DEBUG
           logger.error("Problem sending email: #{e}")

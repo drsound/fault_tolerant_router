@@ -18,13 +18,14 @@ options = {
 parser = OptionParser.new do |opts|
   opts.banner = "Usage: #{File.basename($0)} [OPTION]... ACTION"
   opts.separator ''
-  opts.separator 'ACTION = generate_config|generate_iptables|monitor'
+  opts.separator 'ACTION = generate_config|generate_iptables|test_email|monitor'
   opts.separator ''
   opts.separator '         generate_config: print an example configuration'
   opts.separator '         generate_iptables: generate an iptables iptables-save configuration'
+  opts.separator '         test_email: send a test email to test the correctness of smtp parameters'
   opts.separator '         monitor: monitor uplinks and change routing accordingly'
   opts.separator ''
-  opts.separator '"generate_iptables" and "monitor" specific options:'
+  opts.separator 'option valid for all the actions except "generate_config":'
   opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
     options[:config] = configuration_file
   end
@@ -50,7 +51,7 @@ DEMO = options[:demo]
 #activate debug if we are in demo mode
 DEBUG = options[:debug] || DEMO
 
-unless ARGV.size == 1 && %w(generate_config generate_iptables monitor).include?(ARGV[0])
+unless ARGV.size == 1 && %w(generate_config generate_iptables test_email monitor).include?(ARGV[0])
   puts parser.help
   exit 1
 end
@@ -84,8 +85,16 @@ BASE_TABLE = config['base_table']
 BASE_PRIORITY = config['base_priority']
 BASE_FWMARK = config['base_fwmark']
 
-if ARGV[0] == 'generate_iptables'
-  generate_iptables
-else
-  monitor
+case ARGV[0]
+  when 'generate_iptables'
+    generate_iptables
+  when 'test_email'
+    begin
+      send_email('fault_tolerant_router test')
+      puts 'email sent'
+    rescue Exception => e
+      puts "Problem sending email: #{e}"
+    end
+  else
+    monitor
 end

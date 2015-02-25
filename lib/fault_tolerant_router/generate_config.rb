@@ -65,12 +65,12 @@ email:
   - user3@domain.com
   #see http://ruby-doc.org/stdlib-2.2.0/libdoc/net/smtp/rdoc/Net/SMTP.html
   smtp_parameters:
-    address: smtp.domain.com
-    #port: 25
+    address: smtp.gmail.com
+    port: 587
     #domain: domain.com
-    #authentication: :plain
-    #enable_starttls_auto: false
-    user_name: user@domain.com
+    authentication: :login
+    enable_starttls_auto: true
+    user_name: user@gmail.com
     password: secret-password
 
 #base ip route table

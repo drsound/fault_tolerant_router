@@ -16,7 +16,7 @@ And then execute:
 
 ## To do
 - [ ] improve documentation
-- [ ] option to send a test email
+- [ ] i18n
 
 ## License
 GNU General Public License v2.0, see LICENSE file
