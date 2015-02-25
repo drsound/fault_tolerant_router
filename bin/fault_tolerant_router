@@ -37,7 +37,9 @@ parser = OptionParser.new do |opts|
     options[:demo] = demo
   end
   opts.separator ''
-  opts.separator "Version #{FaultTolerantRouter::VERSION} - Alessandro Zarrilli <alessandro@zarrilli.net>"
+  opts.separator "Version #{FaultTolerantRouter::VERSION}"
+  opts.separator 'Alessandro Zarrilli <alessandro@zarrilli.net>'
+  opts.separator 'https://github.com/drsound/fault_tolerant_router'
 end
 begin
   parser.parse!

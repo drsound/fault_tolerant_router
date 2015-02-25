@@ -6,6 +6,7 @@ end
 def ping(ip, source)
   if DEMO
     sleep 0.1
+    #todo: should be easier a link is up
     rand(2) == 0
   else
     `ping -n -c 1 -W 2 -I #{source} #{ip}`
@@ -172,6 +173,7 @@ def monitor
     end
 
     puts "Waiting #{TEST_INTERVAL} seconds..." if DEBUG
+    #todo: sleep less seconds if in demo mode
     sleep TEST_INTERVAL
   end
 end

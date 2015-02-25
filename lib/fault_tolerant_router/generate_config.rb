@@ -40,6 +40,7 @@ downlinks:
 
 tests:
   #add as many ips as needed, make sure they are reliable ones, these are Google DNS, OpenDNS DNS, public DNS server
+  #list order is not important, because the list is shuffled before every test
   ips:
   - 8.8.8.8
   - 8.8.4.4
