@@ -1,5 +1,7 @@
 def generate_iptables
   puts <<END
+#integrate with your existing "iptables-save" configuration, or adapt to work with any other iptables configuration system
+
 *mangle
 :PREROUTING ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]

@@ -1,5 +1,11 @@
-def generate_config
-  puts <<END
+def generate_config(file_path)
+  if File.exists?(file_path)
+    puts "Configuration file #{file_path} already exists, will not overwrite!"
+    exit 1
+  end
+  begin
+    open(file_path, 'w') do |file|
+      file.puts <<END
 #add as many uplinks as needed
 uplinks:
 - interface: eth1
@@ -82,4 +88,10 @@ base_priority: 40000
 #base fwmark
 base_fwmark: 1
 END
+    end
+    puts "Example configuration saved to #{file_path}"
+  rescue
+    puts "Error while saving configuration file #{file_path}!"
+    exit 1
+  end
 end

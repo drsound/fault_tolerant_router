@@ -11,23 +11,22 @@ require 'fault_tolerant_router/generate_iptables'
 require 'fault_tolerant_router/monitor'
 
 options = {
-    config: '/etc/fault_tolerant_router.conf',
+    configuration_file: '/etc/fault_tolerant_router.conf',
     debug: false,
     demo: false
 }
 parser = OptionParser.new do |opts|
   opts.banner = "Usage: #{File.basename($0)} [OPTION]... ACTION"
   opts.separator ''
-  opts.separator 'ACTION = generate_config|generate_iptables|test_email|monitor'
+  opts.separator 'ACTION = generate_config|generate_iptables|email_test|monitor'
   opts.separator ''
-  opts.separator '         generate_config: print an example configuration'
-  opts.separator '         generate_iptables: generate an iptables iptables-save configuration'
-  opts.separator '         test_email: send a test email to test the correctness of smtp parameters'
+  opts.separator '         generate_config: save an example configuration'
+  opts.separator '         generate_iptables: generate an "iptables-save" configuration'
+  opts.separator '         email_test: send a test email to verify the correctness of smtp parameters'
   opts.separator '         monitor: monitor uplinks and change routing accordingly'
   opts.separator ''
-  opts.separator 'option valid for all the actions except "generate_config":'
   opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
-    options[:config] = configuration_file
+    options[:configuration_file] = configuration_file
   end
   opts.separator ''
   opts.separator '"monitor" specific options:'
@@ -51,22 +50,22 @@ DEMO = options[:demo]
 #activate debug if we are in demo mode
 DEBUG = options[:debug] || DEMO
 
-unless ARGV.size == 1 && %w(generate_config generate_iptables test_email monitor).include?(ARGV[0])
+unless ARGV.size == 1 && %w(generate_config generate_iptables email_test monitor).include?(ARGV[0])
   puts parser.help
   exit 1
 end
 
 if ARGV[0] == 'generate_config'
-  generate_config
+  generate_config(options[:configuration_file])
   exit 0
 end
 
-unless File.exists?(options[:config])
-  puts "Configuration file #{options[:config]} does not exists!"
+unless File.exists?(options[:configuration_file])
+  puts "Configuration file #{options[:configuration_file]} does not exists!"
   exit 1
 end
 
-config = YAML.load_file(options[:config])
+config = YAML.load_file(options[:configuration_file])
 UPLINKS = config['uplinks'].map { |uplink| Hash[uplink.map { |k, v| [k.to_sym, v] }] }
 LAN_INTERFACE = config['downlinks']['lan']
 DMZ_INTERFACE = config['downlinks']['dmz']
@@ -88,10 +87,10 @@ BASE_FWMARK = config['base_fwmark']
 case ARGV[0]
   when 'generate_iptables'
     generate_iptables
-  when 'test_email'
+  when 'email_test'
     begin
       send_email('fault_tolerant_router test')
-      puts 'email sent'
+      puts "Test email sent to #{EMAIL_RECIPIENTS.join(', ')}"
     rescue Exception => e
       puts "Problem sending email: #{e}"
     end
