@@ -6,6 +6,9 @@ def generate_config(file_path)
   begin
     open(file_path, 'w') do |file|
       file.puts <<END
+#see https://github.com/drsound/fault_tolerant_router for a complete parameter
+#description
+
 #add as many uplinks as needed
 uplinks:
 - interface: eth1
@@ -39,8 +42,10 @@ downlinks:
   dmz:
 
 tests:
-  #add as many ips as needed, make sure they are reliable ones, these are Google DNS, OpenDNS DNS, public DNS server
-  #list order is not important, because the list is shuffled before every test
+  #an array of IP addresses to ping to verify the uplinks state. You can add as
+  #many as you wish. Predefined ones are Google DNS, OpenDNS DNS, other public
+  #DNS. Every time an uplink is tested the IP addresses are shuffled, so listing
+  #order is not important.
   ips:
   - 8.8.8.8
   - 8.8.4.4
@@ -48,9 +53,10 @@ tests:
   - 208.67.220.220
   - 4.2.2.2
   - 4.2.2.3
-  #number of successful pinged addresses to consider an uplink to be functional
+  #number of successfully pinged IP addresses to consider an uplink to be
+  #functional
   required_successful: 4
-  #ping retries in case of ping error
+  #number of ping retries before giving up on an IP
   ping_retries: 1
   #seconds between a check of the uplinks and the next one
   interval: 60
@@ -58,9 +64,10 @@ tests:
 log:
   #file: "/var/log/fault_tolerant_router.log"
   file: "/tmp/fault_tolerant_router.log"
-  #max log file size (in bytes)
+  #maximum log file size (in bytes). Once reached this size, the log file will
+  #be rotated.
   max_size: 1024000
-  #number of old log files to keep
+  #number of old rotated files to keep
   old_files: 10
 
 email:
@@ -80,13 +87,17 @@ email:
     user_name: user@gmail.com
     password: secret-password
 
-#base ip route table
+#base IP route table number, just need to change if you are already using
+#multiple routing tables
 base_table: 1
 
-#base ip rule priority, must be higher than 32767 (default priority, see "ip rule")
+#just need to change if you are already using ip policy routing, to avoid
+#overlapping, must be higher than 32767 (default priority, see output of
+#"ip rule" command)
 base_priority: 40000
 
-#base fwmark
+#just need to change if you are already using packet marking, to avoid
+#overlapping
 base_fwmark: 1
 END
     end
