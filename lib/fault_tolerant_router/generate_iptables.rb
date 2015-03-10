@@ -23,8 +23,8 @@ def generate_iptables
 END
   UPLINKS.each_with_index do |uplink, i|
     puts "##{uplink[:description]}"
-    puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}"
-    puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}" if DMZ_INTERFACE
+    puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+    puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}" if DMZ_INTERFACE
   end
   puts <<END
 
@@ -49,7 +49,7 @@ END
 END
   UPLINKS.each_with_index do |uplink, i|
     puts "##{uplink[:description]}"
-    puts "[0:0] -A PREROUTING -i #{uplink[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+    puts "[0:0] -A PREROUTING -i #{uplink[:interface]} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
@@ -59,7 +59,7 @@ END
 END
   UPLINKS.each_with_index do |uplink, i|
     puts "##{uplink[:description]}"
-    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
@@ -135,9 +135,9 @@ END
 #This is just a very basic example, add your own rules for the INPUT chain.
 
 [0:0] -A INPUT -i lo -j ACCEPT
-[0:0] -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+[0:0] -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-[0:0] -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+[0:0] -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 END
   UPLINKS.each do |uplink|

@@ -62,6 +62,9 @@ def monitor
     command "ip route del table #{BASE_TABLE + i} &> /dev/null"
   end
 
+  #enable IP forwarding
+  command 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+
   #disable "reverse path filtering" on the uplink interfaces
   command 'echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter'
   UPLINKS.each do |uplink|

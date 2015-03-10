@@ -143,11 +143,11 @@ Documentation is included as comments in the output, here is a dump using the st
 #    --sport, etc.
 
 #Example Provider 1
-#[0:0] -A PREROUTING -i eth0 -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark 1
+#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 1
 #Example Provider 2
-#[0:0] -A PREROUTING -i eth0 -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark 2
+#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 2
 #Example Provider 3
-#[0:0] -A PREROUTING -i eth0 -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark 3
+#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 3
 
 #Mark packets with the outgoing interface:
 #
@@ -165,21 +165,21 @@ Documentation is included as comments in the output, here is a dump using the st
 #New inbound connections: mark the connection with the incoming interface.
 
 #Example Provider 1
-[0:0] -A PREROUTING -i eth1 -m state --state NEW -j CONNMARK --set-mark 1
+[0:0] -A PREROUTING -i eth1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 1
 #Example Provider 2
-[0:0] -A PREROUTING -i eth2 -m state --state NEW -j CONNMARK --set-mark 2
+[0:0] -A PREROUTING -i eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
 #Example Provider 3
-[0:0] -A PREROUTING -i eth3 -m state --state NEW -j CONNMARK --set-mark 3
+[0:0] -A PREROUTING -i eth3 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
 
 #New outbound connections: mark the connection with the outgoing interface
 #(chosen by the multipath routing).
 
 #Example Provider 1
-[0:0] -A POSTROUTING -o eth1 -m state --state NEW -j CONNMARK --set-mark 1
+[0:0] -A POSTROUTING -o eth1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 1
 #Example Provider 2
-[0:0] -A POSTROUTING -o eth2 -m state --state NEW -j CONNMARK --set-mark 2
+[0:0] -A POSTROUTING -o eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
 #Example Provider 3
-[0:0] -A POSTROUTING -o eth3 -m state --state NEW -j CONNMARK --set-mark 3
+[0:0] -A POSTROUTING -o eth3 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
 
 COMMIT
 
@@ -245,9 +245,9 @@ COMMIT
 #This is just a very basic example, add your own rules for the INPUT chain.
 
 [0:0] -A INPUT -i lo -j ACCEPT
-[0:0] -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+[0:0] -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-[0:0] -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+[0:0] -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 [0:0] -A FORWARD -i eth0 -o eth1 -j LAN_WAN
 [0:0] -A FORWARD -i eth0 -o eth2 -j LAN_WAN
