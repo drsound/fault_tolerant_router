@@ -25,11 +25,11 @@ parser = OptionParser.new do |opts|
   opts.separator '         email_test: send a test email to verify the correctness of smtp parameters'
   opts.separator '         monitor: monitor uplinks and change routing accordingly'
   opts.separator ''
+  opts.separator 'OPTIONS:'
   opts.on('--config=FILE', 'Configuration file (default /etc/fault_tolerant_router.conf)') do |configuration_file|
     options[:configuration_file] = configuration_file
   end
-  opts.separator ''
-  opts.separator '"monitor" specific options:'
+  opts.separator '        "monitor" specific options:'
   opts.on('--debug', 'Print debug output') do |debug|
     options[:debug] = debug
   end

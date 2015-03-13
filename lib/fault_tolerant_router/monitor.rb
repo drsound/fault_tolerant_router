@@ -86,9 +86,9 @@ def monitor
   loop do
     #for each uplink...
     UPLINKS.each do |uplink|
-      #set current "working" state as the previous one
+      #save current "working" state
       uplink[:previously_working] = uplink[:working]
-      #set current "enabled" state as the previous one
+      #save current "enabled" state
       uplink[:previously_enabled] = uplink[:enabled]
       uplink[:successful_tests] = 0
       uplink[:unsuccessful_tests] = 0
@@ -133,7 +133,7 @@ def monitor
     #only consider uplinks flagged as default route
     if UPLINKS.find_all { |uplink| uplink[:default_route] }.all? { |uplink| !uplink[:working] }
       UPLINKS.find_all { |uplink| uplink[:default_route] }.each { |uplink| uplink[:enabled] = true }
-      puts 'No uplink seems to be working, enabling all of them' if DEBUG
+      puts 'No default route uplink seems to be working: enabling all of them!' if DEBUG
     end
 
     UPLINKS.each do |uplink|
@@ -174,8 +174,10 @@ def monitor
       end
     end
 
-    if DEMO
-      puts "Waiting just 5 seconds because we are in demo mode, otherwise would wait #{TEST_INTERVAL} seconds..."
+    if UPLINKS.find_all { |uplink| uplink[:default_route] }.all? { |uplink| !uplink[:working] }
+      puts "No waiting, because all of the default route uplinks are down" if DEBUG
+    elsif DEMO
+      puts "Waiting just 5 seconds because in demo mode, otherwise would be #{TEST_INTERVAL} seconds..." if DEBUG
       sleep 5
     else
       puts "Waiting #{TEST_INTERVAL} seconds..." if DEBUG
