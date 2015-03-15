@@ -150,6 +150,7 @@ COMMIT
 #DNAT: WAN --> DMZ. Uncomment if needed.
 END
   UPLINKS.each do |connection|
+    puts "##{connection[:description]}"
     puts "#[0:0] -A PREROUTING -i #{connection[:interface]} -d #{connection[:ip]} -j DNAT --to-destination XXX.XXX.XXX.XXX"
   end
   puts <<END
@@ -157,6 +158,7 @@ END
 #SNAT: LAN/DMZ --> WAN: force the usage of a specific source address (for example for an SMTP server). Uncomment if needed.
 END
   UPLINKS.each do |connection|
+    puts "##{connection[:description]}"
     puts "#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o #{connection[:interface]} -j SNAT --to-source YYY.YYY.YYY.YYY"
   end
   puts <<END
@@ -164,6 +166,7 @@ END
 #SNAT: LAN --> WAN
 END
   UPLINKS.each do |connection|
+    puts "##{connection[:description]}"
     puts "[0:0] -A POSTROUTING -o #{connection[:interface]} -j SNAT --to-source #{connection[:ip]}"
   end
   puts <<END
@@ -180,8 +183,8 @@ COMMIT
 END
 
   if DMZ_INTERFACE
-    puts ":DMZ_WAN - [0:0]"
-    puts ":WAN_DMZ - [0:0]"
+    puts ':DMZ_WAN - [0:0]'
+    puts ':WAN_DMZ - [0:0]'
   end
 
   puts <<END
@@ -305,6 +308,8 @@ else
                         ', enabled'
                       when !connection[:enabled] && connection[:previously_enabled] then
                         ', disabled'
+                      else
+                        ''
                     end
       puts "Uplink #{connection[:description]}: #{connection[:successful_tests]} successful tests, #{connection[:unsuccessful_tests]} unsuccessful tests#{description}"
     end if DEBUG
