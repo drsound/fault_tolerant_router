@@ -94,6 +94,7 @@ EMAIL_RECIPIENTS = config[:email][:recipients]
 SMTP_PARAMETERS = config[:email][:smtp_parameters]
 BASE_TABLE = config[:base_table]
 BASE_PRIORITY = config[:base_priority]
+BASE_FWMARK = config[:base_fwmark]
 
 if ARGV[0] == 'generate_iptables'
   puts <<END
@@ -105,9 +106,12 @@ if ARGV[0] == 'generate_iptables'
 
 #new outbound connections: force connection to use a specific uplink instead of letting multipath routing decide (for
 #example for an SMTP server). Uncomment if needed.
-#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark YYY
 END
-  puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark YYY" if DMZ_INTERFACE
+  UPLINKS.each_with_index do |connection, i|
+    puts "##{connection[:description]}"
+    puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+    puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m state --state NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}" if DMZ_INTERFACE
+  end
   puts <<END
 
 #mark packets with the outgoing interface:
@@ -122,14 +126,16 @@ END
 #new inbound connections: mark with the incoming interface (decided by the connecting host)
 END
   UPLINKS.each_with_index do |connection, i|
-    puts "[0:0] -A PREROUTING -i #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{i + 1}"
+    puts "##{connection[:description]}"
+    puts "[0:0] -A PREROUTING -i #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
 #new outbound connections: mark with the outgoing interface (decided by the multipath routing)
 END
   UPLINKS.each_with_index do |connection, i|
-    puts "[0:0] -A POSTROUTING -o #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{i + 1}"
+    puts "##{connection[:description]}"
+    puts "[0:0] -A POSTROUTING -o #{connection[:interface]} -m state --state NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
   end
   puts <<END
 
@@ -234,7 +240,7 @@ else
   UPLINKS.each_with_index do |connection, i|
     command "ip route add table #{BASE_TABLE + i} default via #{connection[:gateway]} src #{connection[:ip]}"
     command "ip rule add priority #{BASE_PRIORITY + i} from #{connection[:ip]} lookup #{BASE_TABLE + i}"
-    command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size + i} fwmark #{1 + i} lookup #{BASE_TABLE + i}"
+    command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size + i} fwmark #{BASE_FWMARK + i} lookup #{BASE_TABLE + i}"
   end
   #first packet of outbound connections
   command "ip rule add priority #{BASE_PRIORITY + UPLINKS.size * 2} from all lookup #{BASE_TABLE + UPLINKS.size}"
