@@ -1,38 +1,40 @@
 def generate_config
   puts <<END
 #add as many uplinks as needed
-:uplinks:
-- :interface: eth1
-  :ip: 1.0.0.2
-  :gateway: 1.0.0.1
-  :description: Example Provider 1
+uplinks:
+- interface: eth1
+  ip: 1.0.0.2
+  gateway: 1.0.0.1
+  description: Example Provider 1
   #optional parameter
-  :weight: 1
+  weight: 1
   #optional parameter, default is true
-  #:default_route: true
-- :interface: eth2
-  :ip: 2.0.0.2
-  :gateway: 2.0.0.1
-  :description: Example Provider 2
+  default_route: true
+- interface: eth2
+  ip: 2.0.0.2
+  gateway: 2.0.0.1
+  description: Example Provider 2
   #optional parameter
-  :weight: 2
+  weight: 2
   #optional parameter, default is true
-  #:default_route: true
-- :interface: eth3
-  :ip: 3.0.0.2
-  :gateway: 3.0.0.1
-  :description: Example Provider 3
+  default_route: true
+- interface: eth3
+  ip: 3.0.0.2
+  gateway: 3.0.0.1
+  description: Example Provider 3
   #optional parameter
-  :weight: 1
+  weight: 1
   #optional parameter, default is true
-  #:default_route: true
-:downlinks:
-  :lan: eth0
+  default_route: true
+
+downlinks:
+  lan: eth0
   #leave blank if you have no DMZ
-  :dmz:
-:tests:
+  dmz:
+
+tests:
   #add as many ips as needed, make sure they are reliable ones, these are Google DNS, OpenDNS DNS, public DNS server
-  :ips:
+  ips:
   - 8.8.8.8
   - 8.8.4.4
   - 208.67.222.222
@@ -40,36 +42,44 @@ def generate_config
   - 4.2.2.2
   - 4.2.2.3
   #number of successful pinged addresses to consider an uplink to be functional
-  :required_successful: 4
+  required_successful: 4
   #ping retries in case of ping error
-  :ping_retries: 1
+  ping_retries: 1
   #seconds between a check of the uplinks and the next one
-  :interval: 60
-:log:
+  interval: 60
+
+log:
   #file: "/var/log/fault_tolerant_router.log"
-  :file: "/tmp/fault_tolerant_router.log"
+  file: "/tmp/fault_tolerant_router.log"
   #max log file size (in bytes)
-  :max_size: 1024000
+  max_size: 1024000
   #number of old log files to keep
-  :old_files: 10
-:email:
-  :send: false
-  :sender: router@domain.com
-  :recipients:
-  - user@domain.com
-  :smtp_parameters:
-    :address: smtp.domain.com
-    #:port: 25
-    #:domain: domain.com
-    #:authentication: :plain
-    #:enable_starttls_auto: false
-    :user_name: user@domain.com
-    :password: secret-password
+  old_files: 10
+
+email:
+  send: false
+  sender: router@domain.com
+  recipients:
+  - user1@domain.com
+  - user2@domain.com
+  - user3@domain.com
+  #see http://ruby-doc.org/stdlib-2.2.0/libdoc/net/smtp/rdoc/Net/SMTP.html
+  smtp_parameters:
+    address: smtp.domain.com
+    #port: 25
+    #domain: domain.com
+    #authentication: :plain
+    #enable_starttls_auto: false
+    user_name: user@domain.com
+    password: secret-password
+
 #base ip route table
-:base_table: 1
+base_table: 1
+
 #base ip rule priority, must be higher than 32767 (default priority, see "ip rule")
-:base_priority: 40000
+base_priority: 40000
+
 #base fwmark
-:base_fwmark: 1
+base_fwmark: 1
 END
 end

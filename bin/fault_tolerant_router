@@ -65,25 +65,24 @@ unless File.exists?(options[:config])
   exit 1
 end
 
-#todo: do not use symbols in yaml config file
 config = YAML.load_file(options[:config])
-UPLINKS = config[:uplinks]
-LAN_INTERFACE = config[:downlinks][:lan]
-DMZ_INTERFACE = config[:downlinks][:dmz]
-TEST_IPS = config[:tests][:ips]
-REQUIRED_SUCCESSFUL_TESTS = config[:tests][:required_successful]
-PING_RETRIES = config[:tests][:ping_retries]
-TEST_INTERVAL = config[:tests][:interval]
-LOG_FILE = config[:log][:log_file]
-LOG_MAX_SIZE = config[:log][:max_size]
-LOG_OLD_FILES = config[:log][:old_files]
-SEND_EMAIL = config[:email][:send]
-EMAIL_SENDER = config[:email][:sender]
-EMAIL_RECIPIENTS = config[:email][:recipients]
-SMTP_PARAMETERS = config[:email][:smtp_parameters]
-BASE_TABLE = config[:base_table]
-BASE_PRIORITY = config[:base_priority]
-BASE_FWMARK = config[:base_fwmark]
+UPLINKS = config['uplinks'].map { |uplink| Hash[uplink.map { |k, v| [k.to_sym, v] }] }
+LAN_INTERFACE = config['downlinks']['lan']
+DMZ_INTERFACE = config['downlinks']['dmz']
+TEST_IPS = config['tests']['ips']
+REQUIRED_SUCCESSFUL_TESTS = config['tests']['required_successful']
+PING_RETRIES = config['tests']['ping_retries']
+TEST_INTERVAL = config['tests']['interval']
+LOG_FILE = config['log']['log_file']
+LOG_MAX_SIZE = config['log']['max_size']
+LOG_OLD_FILES = config['log']['old_files']
+SEND_EMAIL = config['email']['send']
+EMAIL_SENDER = config['email']['sender']
+EMAIL_RECIPIENTS = config['email']['recipients']
+SMTP_PARAMETERS = Hash[config['email']['smtp_parameters'].map { |k, v| [k.to_sym, v] }]
+BASE_TABLE = config['base_table']
+BASE_PRIORITY = config['base_priority']
+BASE_FWMARK = config['base_fwmark']
 
 if ARGV[0] == 'generate_iptables'
   generate_iptables
