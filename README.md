@@ -14,12 +14,9 @@ And then execute:
 
 ## Usage
 
-TODO: Write usage instructions here
-
 ## To do
 - [ ] improve documentation
 - [ ] split monitor and iptables generation in external required files
-- [ ] gem package
 - [ ] option to send a test email
 
 ## License
