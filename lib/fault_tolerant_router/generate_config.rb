@@ -12,6 +12,7 @@ def generate_config(file_path)
 #add as many uplinks as needed
 uplinks:
 - interface: eth1
+  type: static
   ip: 1.0.0.2
   gateway: 1.0.0.1
   description: Example Provider 1
@@ -20,6 +21,7 @@ uplinks:
   #optional parameter, default is true
   default_route: true
 - interface: eth2
+  type: static
   ip: 2.0.0.2
   gateway: 2.0.0.1
   description: Example Provider 2
@@ -28,8 +30,7 @@ uplinks:
   #optional parameter, default is true
   default_route: true
 - interface: eth3
-  ip: 3.0.0.2
-  gateway: 3.0.0.1
+  type: ppp
   description: Example Provider 3
   #optional parameter
   weight: 1

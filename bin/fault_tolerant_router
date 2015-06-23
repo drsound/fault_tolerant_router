@@ -4,11 +4,14 @@ require 'optparse'
 require 'net/smtp'
 require 'mail'
 require 'logger'
+require 'socket'
 require 'yaml'
 require 'fault_tolerant_router/version'
 require 'fault_tolerant_router/generate_config'
 require 'fault_tolerant_router/generate_iptables'
 require 'fault_tolerant_router/monitor'
+require 'fault_tolerant_router/uplink'
+require 'fault_tolerant_router/uplinks'
 
 options = {
     configuration_file: '/etc/fault_tolerant_router.conf',
@@ -22,7 +25,7 @@ parser = OptionParser.new do |opts|
   opts.separator ''
   opts.separator '         generate_config: save an example configuration'
   opts.separator '         generate_iptables: generate an "iptables-save" configuration'
-  opts.separator '         email_test: send a test email to verify the correctness of smtp parameters'
+  opts.separator '         email_test: send a test email to verify the correctness of SMTP parameters'
   opts.separator '         monitor: monitor uplinks and change routing accordingly'
   opts.separator ''
   opts.separator 'OPTIONS:'
@@ -49,7 +52,7 @@ rescue OptionParser::ParseError
 end
 
 DEMO = options[:demo]
-#activate debug if we are in demo mode
+#activate debug if in demo mode
 DEBUG = options[:debug] || DEMO
 
 unless ARGV.size == 1 && %w(generate_config generate_iptables email_test monitor).include?(ARGV[0])
@@ -68,14 +71,13 @@ unless File.exists?(options[:configuration_file])
 end
 
 config = YAML.load_file(options[:configuration_file])
-UPLINKS = config['uplinks'].map { |uplink| Hash[uplink.map { |k, v| [k.to_sym, v] }] }
 LAN_INTERFACE = config['downlinks']['lan']
 DMZ_INTERFACE = config['downlinks']['dmz']
 TEST_IPS = config['tests']['ips']
 REQUIRED_SUCCESSFUL_TESTS = config['tests']['required_successful']
 PING_RETRIES = config['tests']['ping_retries']
 TEST_INTERVAL = config['tests']['interval']
-LOG_FILE = config['log']['log_file']
+LOG_FILE = config['log']['file']
 LOG_MAX_SIZE = config['log']['max_size']
 LOG_OLD_FILES = config['log']['old_files']
 SEND_EMAIL = config['email']['send']
@@ -85,6 +87,7 @@ SMTP_PARAMETERS = Hash[config['email']['smtp_parameters'].map { |k, v| [k.to_sym
 BASE_TABLE = config['base_table']
 BASE_PRIORITY = config['base_priority']
 BASE_FWMARK = config['base_fwmark']
+UPLINKS = Uplinks.new(config['uplinks'])
 
 case ARGV[0]
   when 'generate_iptables'
@@ -94,7 +97,7 @@ case ARGV[0]
       send_email('fault_tolerant_router test')
       puts "Test email sent to #{EMAIL_RECIPIENTS.join(', ')}"
     rescue Exception => e
-      puts "Problem sending email: #{e}"
+      puts "Error sending email: #{e}"
     end
   else
     monitor

@@ -21,10 +21,10 @@ def generate_iptables
 #    --sport, etc.
 
 END
-  UPLINKS.each_with_index do |uplink, i|
-    puts "##{uplink[:description]}"
-    puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}"
-    puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{BASE_FWMARK + i}" if DMZ_INTERFACE
+  UPLINKS.each do |uplink|
+    puts "##{uplink.description}"
+    puts "#[0:0] -A PREROUTING -i #{LAN_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{uplink.fwmark}"
+    puts "#[0:0] -A PREROUTING -i #{DMZ_INTERFACE} -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark #{uplink.fwmark}" if DMZ_INTERFACE
   end
   puts <<END
 
@@ -47,9 +47,9 @@ END
 #New inbound connections: mark the connection with the incoming interface.
 
 END
-  UPLINKS.each_with_index do |uplink, i|
-    puts "##{uplink[:description]}"
-    puts "[0:0] -A PREROUTING -i #{uplink[:interface]} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+  UPLINKS.each do |uplink|
+    puts "##{uplink.description}"
+    puts "[0:0] -A PREROUTING -i #{uplink.interface} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{uplink.fwmark}"
   end
   puts <<END
 
@@ -57,9 +57,9 @@ END
 #(chosen by the multipath routing).
 
 END
-  UPLINKS.each_with_index do |uplink, i|
-    puts "##{uplink[:description]}"
-    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{BASE_FWMARK + i}"
+  UPLINKS.each do |uplink|
+    puts "##{uplink.description}"
+    puts "[0:0] -A POSTROUTING -o #{uplink.interface} -m conntrack --ctstate NEW -j CONNMARK --set-mark #{uplink.fwmark}"
   end
   puts <<END
 
@@ -82,8 +82,12 @@ COMMIT
 
 END
   UPLINKS.each do |uplink|
-    puts "##{uplink[:description]}"
-    puts "#[0:0] -A PREROUTING -i #{uplink[:interface]} -d #{uplink[:ip]} -j DNAT --to-destination XXX.XXX.XXX.XXX"
+    puts "##{uplink.description}"
+    if uplink.type == :ppp
+      puts "#[0:0] -A PREROUTING -i #{uplink.interface} -j DNAT --to-destination XXX.XXX.XXX.XXX"
+    else
+      puts "#[0:0] -A PREROUTING -i #{uplink.interface} -d #{uplink.ip} -j DNAT --to-destination XXX.XXX.XXX.XXX"
+    end
   end
   puts <<END
 
@@ -99,8 +103,8 @@ END
 
 END
   UPLINKS.each do |uplink|
-    puts "##{uplink[:description]}"
-    puts "#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o #{uplink[:interface]} -j SNAT --to-source YYY.YYY.YYY.YYY"
+    puts "##{uplink.description}"
+    puts "#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o #{uplink.interface} -j SNAT --to-source YYY.YYY.YYY.YYY"
   end
   puts <<END
 
@@ -108,8 +112,12 @@ END
 
 END
   UPLINKS.each do |uplink|
-    puts "##{uplink[:description]}"
-    puts "[0:0] -A POSTROUTING -o #{uplink[:interface]} -j SNAT --to-source #{uplink[:ip]}"
+    puts "##{uplink.description}"
+    if uplink.type == :ppp
+      puts "[0:0] -A POSTROUTING -o #{uplink.interface} -j MASQUERADE"
+    else
+      puts "[0:0] -A POSTROUTING -o #{uplink.interface} -j SNAT --to-source #{uplink.ip}"
+    end
   end
   puts <<END
 
@@ -141,17 +149,17 @@ END
 
 END
   UPLINKS.each do |uplink|
-    puts "[0:0] -A FORWARD -i #{LAN_INTERFACE} -o #{uplink[:interface]} -j LAN_WAN"
+    puts "[0:0] -A FORWARD -i #{LAN_INTERFACE} -o #{uplink.interface} -j LAN_WAN"
   end
   UPLINKS.each do |uplink|
-    puts "[0:0] -A FORWARD -i #{uplink[:interface]} -o #{LAN_INTERFACE} -j WAN_LAN"
+    puts "[0:0] -A FORWARD -i #{uplink.interface} -o #{LAN_INTERFACE} -j WAN_LAN"
   end
   if DMZ_INTERFACE
     UPLINKS.each do |uplink|
-      puts "[0:0] -A FORWARD -i #{DMZ_INTERFACE} -o #{uplink[:interface]} -j DMZ_WAN"
+      puts "[0:0] -A FORWARD -i #{DMZ_INTERFACE} -o #{uplink.interface} -j DMZ_WAN"
     end
     UPLINKS.each do |uplink|
-      puts "[0:0] -A FORWARD -i #{uplink[:interface]} -o #{DMZ_INTERFACE} -j WAN_DMZ"
+      puts "[0:0] -A FORWARD -i #{uplink.interface} -o #{DMZ_INTERFACE} -j WAN_DMZ"
     end
   end
   puts <<END

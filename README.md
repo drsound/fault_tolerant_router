@@ -86,8 +86,9 @@ If you want a quick and dirty way to run the program in background, just add an 
 The fault_tolerant_router.conf configuration file is in [YAML](http://en.wikipedia.org/wiki/YAML) format. Here is the explanation of the options:
 * **uplinks**: Array of uplinks. The example configuration has 3 uplinks, but you can have from 2 to as many as you wish.
   * **interface**: The network interface where the uplink is connected. Until today Fault Tolerant Router has always been used with each uplink on it's own physical interface, never tried it with VLAN interfaces (it's in the to do list).
-  * **ip**: Primary IP address of the network interface. You can have more than one IP address assigned to the interface, just specify here the primary one that will be used as standard SNAT source.
-  * **gateway**: The uplink gateway, usually the provider's router IP address.
+  * **type**: Specify *static* for any kind of static IP interface or *ppp* for a PPP dynamic IP interface.
+  * **ip**: Primary IP address of the network interface. You can have more than one IP address assigned to the interface, just specify here the primary one that will be used as standard SNAT source. Omit this parameter in case of a PPP dynamic IP interface.
+  * **gateway**: The uplink gateway, usually the provider's router IP address. Omit this parameter in case of a PPP dynamic IP interface.
   * **description**: Uplink name, used in notifications.
   * **weight**: Optional parameter, it's the preference to assign to this uplink when choosing one for a new outgoing connection. Use when you have uplinks with different bandwidths. See http://www.policyrouting.org/PolicyRoutingBook/ONLINE/CH05.web.html
   * **default_route**: Optional parameter, default value is *true*. If set to *false* the uplink is excluded from the *multipath routing*, i.e. the uplink will never be selected when choosing one for a new outgoing connection. There's an exception to this if some kind of outgoing connection is forced to pass through this uplink, see [Iptables rules](#iptables-rules) section. Note this parameter only affects outgoing connections, even if set to *false* incoming connections are still possible. Use cases to set it to *false*:
