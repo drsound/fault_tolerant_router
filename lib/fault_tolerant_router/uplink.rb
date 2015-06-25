@@ -58,10 +58,6 @@ class Uplink
     BASE_FWMARK + @id
   end
 
-  def up_state_changed?
-    @up != @previously_up
-  end
-
   def active_state_changed?
     @active != @previously_active
   end
@@ -85,6 +81,7 @@ class Uplink
   end
 
   def detect_ip_changes!
+    #todo: log ip changes
     commands = []
     if @type == :ppp
       detect_ppp_ips!
@@ -173,7 +170,7 @@ class Uplink
 
   def log_description
     description = "Uplink #{@description}: #{@previously_up ? 'up' : 'down'}"
-    if up_state_changed?
+    if @up != @previously_up
       description += " --> #{@up ? 'up' : 'down'}"
     end
     description
