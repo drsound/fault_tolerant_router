@@ -1,11 +1,20 @@
 class Uplink
   attr_reader :interface, :weight, :gateway, :default_route, :up, :description, :type, :ip
   attr_accessor :active
-  #todo: get rid of class variable
-  @@count = 0
+  @instances_count = 0
+
+  def self.new_id
+    id = @instances_count
+    @instances_count += 1
+    id
+  end
+
+  def self.count
+    @instances_count
+  end
 
   def initialize(config)
-    @id = @@count
+    @id = self.class.new_id
     @interface = config['interface']
     raise "Uplink interface not specified: #{config}" unless @interface
     @type = case config['type']
@@ -35,12 +44,10 @@ class Uplink
       detect_ppp_ips!
       puts "Uplink #{@description}: initialized with [ip: #{@ip}, gateway: #{@gateway}]" if DEBUG
     end
-
-    @@count += 1
   end
 
   def priorities
-    [BASE_PRIORITY + @id, BASE_PRIORITY + @@count + @id]
+    [BASE_PRIORITY + @id, BASE_PRIORITY + self.class.count + @id]
   end
 
   def table
