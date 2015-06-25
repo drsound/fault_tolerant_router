@@ -18,18 +18,18 @@ end
 
 def monitor
   logger = Logger.new(LOG_FILE, LOG_OLD_FILES, LOG_MAX_SIZE)
-
   command UPLINKS.initialize_routing_commands
 
   loop do
     command UPLINKS.detect_ip_changes!
-    command UPLINKS.test_routing!
+    routing_commands, messages, all_default_route_uplinks_down = UPLINKS.test_routing!
+    command routing_commands
 
-    if UPLINKS.any_up_state_changes?
-      logger.warn(UPLINKS.log_description(:log))
+    if messages.any?
+      logger.warn(messages.join('; '))
       if SEND_EMAIL
         begin
-          send_email(UPLINKS.log_description(:email))
+          send_email(messages.join("\n"))
         rescue Exception => e
           puts "Problem sending email: #{e}" if DEBUG
           logger.error("Problem sending email: #{e}")
@@ -37,7 +37,7 @@ def monitor
       end
     end
 
-    if UPLINKS.all_default_route_uplinks_down?
+    if all_default_route_uplinks_down
       puts 'No waiting, because all of the default route uplinks are down' if DEBUG
     elsif DEMO
       puts "Waiting just 5 seconds because in demo mode, otherwise would be #{TEST_INTERVAL} seconds..." if DEBUG

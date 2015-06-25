@@ -20,15 +20,6 @@ class Uplinks
     @uplinks.any? { |uplink| uplink.up_state_changed? }
   end
 
-  def all_default_route_uplinks_down?
-    default_route_uplinks.all? { |uplink| !uplink.up }
-  end
-
-  def log_description(type)
-    separator = type == :log ? '; ' : "\n"
-    @uplinks.map { |uplink| uplink.log_description }.join(separator)
-  end
-
   def initialize_routing_commands
     commands = []
     priorities = @uplinks.map { |uplink| uplink.priorities }.flatten.minmax
@@ -91,21 +82,28 @@ class Uplinks
   def test_routing!
     @uplinks.each { |uplink| uplink.test_routing! }
 
-    if all_default_route_uplinks_down?
+    if default_route_uplinks.all? { |uplink| !uplink.up }
       default_route_uplinks.each { |uplink| uplink.active = true }
       puts 'No default route uplink seems to be up: enabling them all!' if DEBUG
+      all_default_route_uplinks_down = true
+    else
+      all_default_route_uplinks_down = false
     end
 
     @uplinks.each { |uplink| puts uplink.debug_description } if DEBUG
 
-    #change routing is any uplink changed its active state
+    #change routing if any uplink changed its active state
     if @uplinks.any? { |uplink| uplink.active_state_changed? }
       commands = default_route_commands
       #apply the routing changes
       commands += ['ip route flush cache']
     else
-      []
+      commands = []
     end
+
+    messages = @uplinks.map { |uplink| uplink.log_description }
+
+    [commands, messages, all_default_route_uplinks_down]
   end
 
 end
