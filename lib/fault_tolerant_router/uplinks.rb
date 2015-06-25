@@ -8,10 +8,6 @@ class Uplinks
     @uplinks.each { |uplink| yield uplink }
   end
 
-  def any_up_state_changes?
-    @uplinks.any? { |uplink| uplink.up_state_changed? }
-  end
-
   def initialize_routing_commands
     commands = []
     priorities = @uplinks.map { |uplink| uplink.priorities }.flatten.minmax
