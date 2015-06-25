@@ -20,10 +20,6 @@ class Uplinks
     @uplinks.any? { |uplink| uplink.up_state_changed? }
   end
 
-  def any_active_state_changes?
-    @uplinks.any? { |uplink| uplink.active_state_changed? }
-  end
-
   def all_default_route_uplinks_down?
     default_route_uplinks.all? { |uplink| !uplink.up }
   end
@@ -101,6 +97,15 @@ class Uplinks
     end
 
     @uplinks.each { |uplink| puts uplink.debug_description } if DEBUG
+
+    #change routing is any uplink changed its active state
+    if @uplinks.any? { |uplink| uplink.active_state_changed? }
+      commands = default_route_commands
+      #apply the routing changes
+      commands += ['ip route flush cache']
+    else
+      []
+    end
   end
 
 end

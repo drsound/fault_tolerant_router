@@ -23,14 +23,7 @@ def monitor
 
   loop do
     command UPLINKS.detect_ip_changes!
-
-    #todo: unify methods
-    UPLINKS.test_routing!
-    if UPLINKS.any_active_state_changes?
-      command UPLINKS.default_route_commands
-      #apply the routing changes
-      command 'ip route flush cache'
-    end
+    command UPLINKS.test_routing!
 
     if UPLINKS.any_up_state_changes?
       logger.warn(UPLINKS.log_description(:log))
