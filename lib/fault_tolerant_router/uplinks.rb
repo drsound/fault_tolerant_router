@@ -8,10 +8,6 @@ class Uplinks
     @uplinks.each { |uplink| yield uplink }
   end
 
-  def active_uplinks
-    @uplinks.find_all { |uplink| uplink.active }
-  end
-
   def default_route_uplinks
     @uplinks.find_all { |uplink| uplink.default_route }
   end
@@ -53,6 +49,8 @@ class Uplinks
   end
 
   def default_route_commands
+    active_uplinks = @uplinks.find_all { |uplink| uplink.active }
+
     #do not use balancing if there is just one active uplink
     if active_uplinks.size == 1
       nexthops = "via #{active_uplinks.first.gateway}"
