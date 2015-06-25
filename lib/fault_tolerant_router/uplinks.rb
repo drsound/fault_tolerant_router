@@ -8,10 +8,6 @@ class Uplinks
     @uplinks.each { |uplink| yield uplink }
   end
 
-  def default_route_uplinks
-    @uplinks.find_all { |uplink| uplink.default_route }
-  end
-
   def any_up_state_changes?
     @uplinks.any? { |uplink| uplink.up_state_changed? }
   end
@@ -80,6 +76,7 @@ class Uplinks
   def test_routing!
     @uplinks.each { |uplink| uplink.test_routing! }
 
+    default_route_uplinks = @uplinks.find_all { |uplink| uplink.default_route }
     if default_route_uplinks.all? { |uplink| !uplink.up }
       default_route_uplinks.each { |uplink| uplink.active = true }
       puts 'No default route uplink seems to be up: enabling them all!' if DEBUG
