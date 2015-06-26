@@ -67,8 +67,12 @@ class Uplinks
       commands += c
       need_default_route_update ||= n
     end
-    #todo: put some debug messages
-    commands += set_default_route_commands if need_default_route_update
+    if need_default_route_update
+      puts 'Will update default route because some of its gateways changed' if DEBUG
+      commands += set_default_route_commands
+    else
+      puts 'Will not update default route because none of its gateways changed' if DEBUG
+    end
     #apply the routing changes, in any
     commands += ['ip route flush cache'] if commands.any?
     commands
