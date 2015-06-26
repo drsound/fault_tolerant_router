@@ -62,42 +62,45 @@ class Uplinks
   def detect_ip_changes!
     commands = []
     need_default_route_update = false
+    messages = []
+
     @uplinks.each do |uplink|
-      c, n = uplink.detect_ip_changes!
-      commands += c
+      c, n, m = uplink.detect_ip_changes!
+      commands += c if c.any?
       need_default_route_update ||= n
+      messages << m if m
     end
+
     if need_default_route_update
       puts 'Will update default route because some of its gateways changed' if DEBUG
       commands += set_default_route_commands
-    else
-      puts 'Will not update default route because none of its gateways changed' if DEBUG
     end
+
     #apply the routing changes, in any
     commands += ['ip route flush cache'] if commands.any?
-    commands
+
+    [commands, messages]
   end
 
   def test_routing!
+    any_up_state_changed = false
     any_routing_state_changed = false
-    log_messages = []
-    debug_messages = []
-    @uplinks.each do |uplink|
-      routing_state_changed, log_message, debug_message = uplink.test_routing!
-      any_routing_state_changed ||= routing_state_changed
-      log_messages << log_message
-      debug_messages << debug_message
-    end
+    messages = []
+    all_default_route_uplinks_down = false
+    commands = []
 
-    debug_messages.each { |message| puts message } if DEBUG
+    @uplinks.each do |uplink|
+      up_state_changed, routing_state_changed, message = uplink.test_routing!
+      any_up_state_changed ||= up_state_changed
+      any_routing_state_changed ||= routing_state_changed
+      messages << message
+    end
 
     default_route_uplinks = @uplinks.find_all { |uplink| uplink.default_route }
     if default_route_uplinks.all? { |uplink| !uplink.up }
       default_route_uplinks.each { |uplink| uplink.routing = true }
       puts 'No default route uplink seems to be up: enabling them all!' if DEBUG
       all_default_route_uplinks_down = true
-    else
-      all_default_route_uplinks_down = false
     end
 
     #change default route if any uplink changed its routing state
@@ -105,11 +108,11 @@ class Uplinks
       commands = set_default_route_commands
       #apply the routing changes
       commands += ['ip route flush cache']
-    else
-      commands = []
     end
 
-    [commands, log_messages, all_default_route_uplinks_down]
+    messages = [] unless any_up_state_changed
+
+    [commands, messages, all_default_route_uplinks_down]
   end
 
 end

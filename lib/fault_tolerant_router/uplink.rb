@@ -57,12 +57,14 @@ class Uplink
   end
 
   def detect_ip_changes!
-    #todo: log ip changes
     commands = []
+    need_default_route_update = false
+    message = nil
     if @type == :ppp
       detect_ppp_ips!
-      if @previous_ip != @ip || @previous_gateway != @gateway
-        puts "Uplink #{@description}: IP change [ip: #{@previous_ip}, gateway: #{@previous_gateway}] --> [ip: #{@ip}, gateway: #{@gateway}]" if DEBUG
+      if (@previous_ip != @ip) || (@previous_gateway != @gateway)
+        message = "Uplink #{@description}: IP change [ip: #{@previous_ip}, gateway: #{@previous_gateway}] --> [ip: #{@ip}, gateway: #{@gateway}]"
+        puts message if DEBUG
         commands = [
             [
                 "ip rule del priority #{@priority1}",
@@ -71,9 +73,9 @@ class Uplink
             route_add_commands
         ].flatten
       end
+      need_default_route_update = @routing && (@previous_gateway != @gateway)
     end
-    need_default_route_update = @routing && (@previous_gateway != @gateway)
-    [commands, need_default_route_update]
+    [commands, need_default_route_update, message]
   end
 
   def ping(ip_address)
@@ -134,17 +136,18 @@ class Uplink
     end
 
     @up = @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
+    up_state_changed = @up != @previously_up
     @routing = @up && @default_route
     routing_state_changed = @routing != @previously_routing
 
     state = @previously_up ? 'up' : 'down'
-    state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
+    state += " --> #{@up ? 'up' : 'down'}" if up_state_changed
     routing = @previously_routing ? 'enabled' : 'disabled'
-    routing += " --> #{@routing ? 'enabled' : 'disabled'}" if @routing != @previously_routing
-    log_message="Uplink #{@description}: #{state}"
-    debug_message = "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}"
+    routing += " --> #{@routing ? 'enabled' : 'disabled'}" if routing_state_changed
+    message = "Uplink #{@description}: #{state}"
+    puts "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}" if DEBUG
 
-    [routing_state_changed, log_message, debug_message]
+    [up_state_changed, routing_state_changed, message]
   end
 
   def route_add_commands
