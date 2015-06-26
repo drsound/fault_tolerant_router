@@ -70,7 +70,17 @@ class Uplinks
   end
 
   def test_routing!
-    @uplinks.each { |uplink| uplink.test_routing! }
+    any_active_state_changed = false
+    log_messages = []
+        debug_messages = []
+    @uplinks.each do |uplink|
+      active_state_changed, log_message, debug_message = uplink.test_routing!
+      any_active_state_changed ||= active_state_changed
+      log_messages << log_message
+      debug_messages << debug_message
+    end
+
+    debug_messages.each { |message| puts message } if DEBUG
 
     default_route_uplinks = @uplinks.find_all { |uplink| uplink.default_route }
     if default_route_uplinks.all? { |uplink| !uplink.up }
@@ -81,11 +91,8 @@ class Uplinks
       all_default_route_uplinks_down = false
     end
 
-    @uplinks.each { |uplink| puts uplink.state_description(:debug) } if DEBUG
-    messages = @uplinks.map { |uplink| uplink.state_description(:log) }
-
     #change routing if any uplink changed its active state
-    if @uplinks.any? { |uplink| uplink.active_state_changed? }
+    if any_active_state_changed
       commands = default_route_commands
       #apply the routing changes
       commands += ['ip route flush cache']
@@ -93,7 +100,7 @@ class Uplinks
       commands = []
     end
 
-    [commands, messages, all_default_route_uplinks_down]
+    [commands, log_messages, all_default_route_uplinks_down]
   end
 
 end

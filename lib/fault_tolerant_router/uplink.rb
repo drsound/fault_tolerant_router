@@ -59,11 +59,6 @@ class Uplink
     BASE_FWMARK + @id
   end
 
-  #todo: eliminare facendo in modo che test_routing! restituisca questa informazione
-  def active_state_changed?
-    @active != @previously_active
-  end
-
   def detect_ppp_ips!
     @previous_ip = @ip
     @previous_gateway = @gateway
@@ -160,19 +155,16 @@ class Uplink
 
     @up = @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
     @active = @up && @default_route
-  end
+    active_state_changed = @active != @previously_active
 
-  #todo: eliminare facendo in modo che test_routing! restituisca questa informazione
-  def state_description(type)
     state = @previously_up ? 'up' : 'down'
     state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
     routing = @previously_active ? 'enabled' : 'disabled'
     routing += " --> #{@active ? 'enabled' : 'disabled'}" if @active != @previously_active
-    if type == :debug
-      "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}"
-    else
-      "Uplink #{@description}: #{state}"
-    end
+    log_message="Uplink #{@description}: #{state}"
+    debug_message = "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}"
+
+    [active_state_changed, log_message, debug_message]
   end
 
   def route_add_commands
