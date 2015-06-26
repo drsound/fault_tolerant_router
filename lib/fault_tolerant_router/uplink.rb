@@ -3,6 +3,7 @@ class Uplink
   attr_accessor :active
   @instances_count = 0
 
+  #todo: sostituire tutta questa roba di classe con l'impostazione di variabili di istanza da parte di uplinks dopo la creazione degli uplink
   def self.new_id
     id = @instances_count
     @instances_count += 1
@@ -58,6 +59,7 @@ class Uplink
     BASE_FWMARK + @id
   end
 
+  #todo: eliminare facendo in modo che test_routing! restituisca questa informazione
   def active_state_changed?
     @active != @previously_active
   end
@@ -87,7 +89,13 @@ class Uplink
       detect_ppp_ips!
       if @previous_ip != @ip || @previous_gateway != @gateway
         puts "Uplink #{@description}: IP change [ip: #{@previous_ip}, gateway: #{@previous_gateway}] --> [ip: #{@ip}, gateway: #{@gateway}]" if DEBUG
-        commands = [route_del_commands, route_add_commands].flatten
+        commands = [
+            [
+                "ip rule del priority #{priorities.min}",
+                "ip rule del priority #{priorities.max}"
+            ],
+            route_add_commands
+        ].flatten
       end
     end
     {commands: commands, active: @active, gateway_changed: @previous_gateway != @gateway}
@@ -154,6 +162,7 @@ class Uplink
     @active = @up && @default_route
   end
 
+  #todo: eliminare facendo in modo che test_routing! restituisca questa informazione
   def state_description(type)
     state = @previously_up ? 'up' : 'down'
     state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
@@ -164,13 +173,6 @@ class Uplink
     else
       "Uplink #{@description}: #{state}"
     end
-  end
-
-  def route_del_commands
-    [
-        "ip rule del priority #{priorities.min}",
-        "ip rule del priority #{priorities.max}"
-    ]
   end
 
   def route_add_commands
