@@ -81,7 +81,8 @@ class Uplinks
       all_default_route_uplinks_down = false
     end
 
-    @uplinks.each { |uplink| puts uplink.debug_description } if DEBUG
+    @uplinks.each { |uplink| puts uplink.state_description(:debug) } if DEBUG
+    messages = @uplinks.map { |uplink| uplink.state_description(:log) }
 
     #change routing if any uplink changed its active state
     if @uplinks.any? { |uplink| uplink.active_state_changed? }
@@ -91,8 +92,6 @@ class Uplinks
     else
       commands = []
     end
-
-    messages = @uplinks.map { |uplink| uplink.log_description }
 
     [commands, messages, all_default_route_uplinks_down]
   end

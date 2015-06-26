@@ -154,26 +154,16 @@ class Uplink
     @active = @up && @default_route
   end
 
-  def debug_description
-    tail = case
-             when @active && !@previously_active
-               'disabled --> enabled'
-             when !@active && @previously_active
-               'enabled --> disabled'
-             when @active && @previously_active
-               'enabled'
-             else
-               'disabled'
-           end
-    "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, routing #{tail}"
-  end
-
-  def log_description
-    description = "Uplink #{@description}: #{@previously_up ? 'up' : 'down'}"
-    if @up != @previously_up
-      description += " --> #{@up ? 'up' : 'down'}"
+  def state_description(type)
+    state = @previously_up ? 'up' : 'down'
+    state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
+    routing = @previously_active ? 'enabled' : 'disabled'
+    routing += " --> #{@active ? 'enabled' : 'disabled'}" if @active != @previously_active
+    if type == :debug
+      "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}"
+    else
+      "Uplink #{@description}: #{state}"
     end
-    description
   end
 
   def route_del_commands
