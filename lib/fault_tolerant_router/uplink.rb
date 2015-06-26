@@ -72,8 +72,8 @@ class Uplink
         ].flatten
       end
     end
-    #todo: return an array
-    {commands: commands, routing: @routing, gateway_changed: @previous_gateway != @gateway}
+    need_default_route_update = @routing && (@previous_gateway != @gateway)
+    [commands, need_default_route_update]
   end
 
   def ping(ip_address)

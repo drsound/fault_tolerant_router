@@ -60,12 +60,15 @@ class Uplinks
   end
 
   def detect_ip_changes!
-    results = @uplinks.map { |uplink| uplink.detect_ip_changes! }
-    commands = results.map { |result| result[:commands] }.flatten
-    #todo: put some debug messages
-    if results.any? { |result| result[:@routing] && result[:gateway_changed] }
-      commands += set_default_route_commands
+    commands = []
+    need_default_route_update = false
+    @uplinks.each do |uplink|
+      c, n = uplink.detect_ip_changes!
+      commands += c
+      need_default_route_update ||= n
     end
+    #todo: put some debug messages
+    commands += set_default_route_commands if need_default_route_update
     #apply the routing changes, in any
     commands += ['ip route flush cache'] if commands.any?
     commands
