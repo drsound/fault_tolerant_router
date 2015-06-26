@@ -29,7 +29,7 @@ uplinks:
   weight: 2
   #optional parameter, default is true
   default_route: true
-- interface: eth3
+- interface: ppp0
   type: ppp
   description: Example Provider 3
   #optional parameter

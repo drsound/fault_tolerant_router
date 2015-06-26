@@ -170,7 +170,7 @@ Documentation is included as comments in the output, here is a dump using the st
 #Example Provider 2
 [0:0] -A PREROUTING -i eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
 #Example Provider 3
-[0:0] -A PREROUTING -i eth3 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
+[0:0] -A PREROUTING -i ppp0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
 
 #New outbound connections: mark the connection with the outgoing interface
 #(chosen by the multipath routing).
@@ -180,7 +180,7 @@ Documentation is included as comments in the output, here is a dump using the st
 #Example Provider 2
 [0:0] -A POSTROUTING -o eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
 #Example Provider 3
-[0:0] -A POSTROUTING -o eth3 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
+[0:0] -A POSTROUTING -o ppp0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
 
 COMMIT
 
@@ -204,7 +204,7 @@ COMMIT
 #Example Provider 2
 #[0:0] -A PREROUTING -i eth2 -d 2.0.0.2 -j DNAT --to-destination XXX.XXX.XXX.XXX
 #Example Provider 3
-#[0:0] -A PREROUTING -i eth3 -d 3.0.0.2 -j DNAT --to-destination XXX.XXX.XXX.XXX
+#[0:0] -A PREROUTING -i ppp0 -j DNAT --to-destination XXX.XXX.XXX.XXX
 
 #SNAT: LAN/DMZ --> WAN. Force an outgoing connection to use a specific source
 #address instead of the default one of the outgoing interface. Of course this
@@ -221,7 +221,7 @@ COMMIT
 #Example Provider 2
 #[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o eth2 -j SNAT --to-source YYY.YYY.YYY.YYY
 #Example Provider 3
-#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o eth3 -j SNAT --to-source YYY.YYY.YYY.YYY
+#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o ppp0 -j SNAT --to-source YYY.YYY.YYY.YYY
 
 #SNAT: LAN --> WAN
 
@@ -230,7 +230,7 @@ COMMIT
 #Example Provider 2
 [0:0] -A POSTROUTING -o eth2 -j SNAT --to-source 2.0.0.2
 #Example Provider 3
-[0:0] -A POSTROUTING -o eth3 -j SNAT --to-source 3.0.0.2
+[0:0] -A POSTROUTING -o ppp0 -j MASQUERADE
 
 COMMIT
 
@@ -252,10 +252,10 @@ COMMIT
 
 [0:0] -A FORWARD -i eth0 -o eth1 -j LAN_WAN
 [0:0] -A FORWARD -i eth0 -o eth2 -j LAN_WAN
-[0:0] -A FORWARD -i eth0 -o eth3 -j LAN_WAN
+[0:0] -A FORWARD -i eth0 -o ppp0 -j LAN_WAN
 [0:0] -A FORWARD -i eth1 -o eth0 -j WAN_LAN
 [0:0] -A FORWARD -i eth2 -o eth0 -j WAN_LAN
-[0:0] -A FORWARD -i eth3 -o eth0 -j WAN_LAN
+[0:0] -A FORWARD -i ppp0 -o eth0 -j WAN_LAN
 
 #This is just a very basic example, add your own rules for the FORWARD chain.
 
