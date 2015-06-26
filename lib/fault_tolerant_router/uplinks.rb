@@ -1,7 +1,8 @@
 class Uplinks
 
   def initialize(config)
-    @uplinks = config.map { |uplink| Uplink.new(uplink) }
+    @uplinks = config.each_with_index.map { |uplink, i| Uplink.new(uplink, i) }
+    @uplinks.each { |uplink| uplink.priority2 = BASE_PRIORITY + @uplinks.size + uplink.id }
   end
 
   def each
@@ -10,7 +11,7 @@ class Uplinks
 
   def initialize_routing_commands
     commands = []
-    priorities = @uplinks.map { |uplink| uplink.priorities }.flatten.minmax
+    priorities = @uplinks.map { |uplink| [uplink.priority1, uplink.priority2] }.flatten.minmax
     tables = @uplinks.map { |uplink| uplink.table }.minmax
 
     #enable IP forwarding
@@ -61,6 +62,7 @@ class Uplinks
   def detect_ip_changes!
     results = @uplinks.map { |uplink| uplink.detect_ip_changes! }
     commands = results.map { |result| result[:commands] }.flatten
+    #todo: put some debug messages
     if results.any? { |result| result[:@routing] && result[:gateway_changed] }
       commands += set_default_route_commands
     end

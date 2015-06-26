@@ -1,21 +1,12 @@
 class Uplink
-  attr_reader :interface, :weight, :gateway, :default_route, :up, :description, :type, :ip
-  attr_accessor :routing
-  @instances_count = 0
+  attr_reader :default_route, :description, :fwmark, :gateway, :id, :interface, :ip, :priority1, :table, :type, :up, :weight
+  attr_accessor :priority2, :routing
 
-  #todo: sostituire tutta questa roba di classe con l'impostazione di variabili di istanza da parte di uplinks dopo la creazione degli uplink
-  def self.new_id
-    id = @instances_count
-    @instances_count += 1
-    id
-  end
-
-  def self.count
-    @instances_count
-  end
-
-  def initialize(config)
-    @id = self.class.new_id
+  def initialize(config, id)
+    @id = id
+    @priority1 = BASE_PRIORITY + @id
+    @table = BASE_TABLE + @id
+    @fwmark = BASE_FWMARK + @id
     @interface = config['interface']
     raise "Uplink interface not specified: #{config}" unless @interface
     @type = case config['type']
@@ -47,18 +38,6 @@ class Uplink
     end
   end
 
-  def priorities
-    [BASE_PRIORITY + @id, BASE_PRIORITY + self.class.count + @id]
-  end
-
-  def table
-    BASE_TABLE + @id
-  end
-
-  def fwmark
-    BASE_FWMARK + @id
-  end
-
   def detect_ppp_ips!
     @previous_ip = @ip
     @previous_gateway = @gateway
@@ -86,13 +65,14 @@ class Uplink
         puts "Uplink #{@description}: IP change [ip: #{@previous_ip}, gateway: #{@previous_gateway}] --> [ip: #{@ip}, gateway: #{@gateway}]" if DEBUG
         commands = [
             [
-                "ip rule del priority #{priorities.min}",
-                "ip rule del priority #{priorities.max}"
+                "ip rule del priority #{@priority1}",
+                "ip rule del priority #{@priority2}"
             ],
             route_add_commands
         ].flatten
       end
     end
+    #todo: return an array
     {commands: commands, routing: @routing, gateway_changed: @previous_gateway != @gateway}
   end
 
@@ -173,8 +153,8 @@ class Uplink
     #- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
     [
         "ip route replace table #{table} default via #{@gateway} src #{@ip}",
-        "ip rule add priority #{priorities.min} from #{@ip} lookup #{table}",
-        "ip rule add priority #{priorities.max} fwmark #{fwmark} lookup #{table}"
+        "ip rule add priority #{@priority1} from #{@ip} lookup #{table}",
+        "ip rule add priority #{@priority2} fwmark #{fwmark} lookup #{table}"
     ]
   end
 
