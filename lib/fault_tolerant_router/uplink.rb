@@ -1,6 +1,6 @@
 class Uplink
   attr_reader :interface, :weight, :gateway, :default_route, :up, :description, :type, :ip
-  attr_accessor :active
+  attr_accessor :routing
   @instances_count = 0
 
   #todo: sostituire tutta questa roba di classe con l'impostazione di variabili di istanza da parte di uplinks dopo la creazione degli uplink
@@ -33,8 +33,8 @@ class Uplink
 
     #a new uplink is supposed to be up
     @up = true
-    #a new uplink starts as active if it's marked as a default route
-    @active = @default_route
+    #a new uplink starts as routing if it's marked as a default route
+    @routing = @default_route
 
     if @type == :static
       @ip = config['ip']
@@ -93,7 +93,7 @@ class Uplink
         ].flatten
       end
     end
-    {commands: commands, active: @active, gateway_changed: @previous_gateway != @gateway}
+    {commands: commands, routing: @routing, gateway_changed: @previous_gateway != @gateway}
   end
 
   def ping(ip_address)
@@ -109,7 +109,7 @@ class Uplink
   def test_routing!
     #save current state
     @previously_up = @up
-    @previously_active = @active
+    @previously_routing = @routing
 
     @successful_tests = 0
     @unsuccessful_tests = 0
@@ -154,17 +154,17 @@ class Uplink
     end
 
     @up = @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
-    @active = @up && @default_route
-    active_state_changed = @active != @previously_active
+    @routing = @up && @default_route
+    routing_state_changed = @routing != @previously_routing
 
     state = @previously_up ? 'up' : 'down'
     state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
-    routing = @previously_active ? 'enabled' : 'disabled'
-    routing += " --> #{@active ? 'enabled' : 'disabled'}" if @active != @previously_active
+    routing = @previously_routing ? 'enabled' : 'disabled'
+    routing += " --> #{@routing ? 'enabled' : 'disabled'}" if @routing != @previously_routing
     log_message="Uplink #{@description}: #{state}"
     debug_message = "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}"
 
-    [active_state_changed, log_message, debug_message]
+    [routing_state_changed, log_message, debug_message]
   end
 
   def route_add_commands

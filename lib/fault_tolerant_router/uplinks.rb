@@ -32,7 +32,7 @@ class Uplinks
     commands += ["ip rule add priority #{priorities.max + 1} from all lookup #{tables.max + 1}"]
 
     #set default route
-    commands += default_route_commands
+    commands += set_default_route_commands
 
     #apply the routing changes
     commands += ['ip route flush cache']
@@ -40,14 +40,14 @@ class Uplinks
     commands.flatten
   end
 
-  def default_route_commands
-    active_uplinks = @uplinks.find_all { |uplink| uplink.active }
+  def set_default_route_commands
+    routing_uplinks = @uplinks.find_all { |uplink| uplink.routing }
 
-    #do not use balancing if there is just one active uplink
-    if active_uplinks.size == 1
-      nexthops = "via #{active_uplinks.first.gateway}"
+    #do not use balancing if there is just one routing uplink
+    if routing_uplinks.size == 1
+      nexthops = "via #{routing_uplinks.first.gateway}"
     else
-      nexthops = active_uplinks.map do |uplink|
+      nexthops = routing_uplinks.map do |uplink|
         #the "weight" parameter is optional
         tail = uplink.weight ? " weight #{uplink.weight}" : ''
         "nexthop via #{uplink.gateway}#{tail}"
@@ -61,8 +61,8 @@ class Uplinks
   def detect_ip_changes!
     results = @uplinks.map { |uplink| uplink.detect_ip_changes! }
     commands = results.map { |result| result[:commands] }.flatten
-    if results.any? { |result| result[:active] && result[:gateway_changed] }
-      commands += default_route_commands
+    if results.any? { |result| result[:@routing] && result[:gateway_changed] }
+      commands += set_default_route_commands
     end
     #apply the routing changes, in any
     commands += ['ip route flush cache'] if commands.any?
@@ -70,12 +70,12 @@ class Uplinks
   end
 
   def test_routing!
-    any_active_state_changed = false
+    any_routing_state_changed = false
     log_messages = []
-        debug_messages = []
+    debug_messages = []
     @uplinks.each do |uplink|
-      active_state_changed, log_message, debug_message = uplink.test_routing!
-      any_active_state_changed ||= active_state_changed
+      routing_state_changed, log_message, debug_message = uplink.test_routing!
+      any_routing_state_changed ||= routing_state_changed
       log_messages << log_message
       debug_messages << debug_message
     end
@@ -84,16 +84,16 @@ class Uplinks
 
     default_route_uplinks = @uplinks.find_all { |uplink| uplink.default_route }
     if default_route_uplinks.all? { |uplink| !uplink.up }
-      default_route_uplinks.each { |uplink| uplink.active = true }
+      default_route_uplinks.each { |uplink| uplink.routing = true }
       puts 'No default route uplink seems to be up: enabling them all!' if DEBUG
       all_default_route_uplinks_down = true
     else
       all_default_route_uplinks_down = false
     end
 
-    #change routing if any uplink changed its active state
-    if any_active_state_changed
-      commands = default_route_commands
+    #change default route if any uplink changed its routing state
+    if any_routing_state_changed
+      commands = set_default_route_commands
       #apply the routing changes
       commands += ['ip route flush cache']
     else
