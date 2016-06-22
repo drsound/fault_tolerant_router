@@ -1,10 +1,10 @@
 class Uplink
-  attr_reader :default_route, :description, :fwmark, :gateway, :id, :interface, :ip, :priority1, :table, :type, :up, :weight
-  attr_accessor :priority2, :routing
+  attr_reader :description, :fwmark, :gateway, :id, :interface, :ip, :previous_gateway, :previous_ip, :previously_up, :routing_priority, :rule_priority_1, :table, :type, :up, :weight
+  attr_accessor :default_route, :previously_default_route, :rule_priority_2
 
   def initialize(config, id)
     @id = id
-    @priority1 = BASE_PRIORITY + @id
+    @rule_priority_1 = BASE_PRIORITY + @id
     @table = BASE_TABLE + @id
     @fwmark = BASE_FWMARK + @id
     @interface = config['interface']
@@ -20,12 +20,8 @@ class Uplink
     @description = config['description']
     raise "Uplink description not specified: #{config}" unless @description
     @weight = config['weight']
-    @default_route = config['default_route'].nil? ? true : config['default_route']
-
-    #a new uplink is supposed to be up
-    @up = true
-    #a new uplink starts as routing if it's marked as a default route
-    @routing = @default_route
+    @routing_priority = config['routing_priority']
+    @default_route = false
 
     if @type == :static
       @ip = config['ip']
@@ -34,8 +30,13 @@ class Uplink
       raise "Uplink gateway not specified: #{config}" unless @gateway
     else
       detect_ppp_ips!
-      puts "Uplink #{@description}: initialized with [ip: #{@ip || 'none'}, gateway: #{@gateway} || 'none']" if DEBUG
     end
+
+    @previous_ip = @ip
+    @previous_gateway = @gateway
+    #a new uplink is supposed to be up
+    @up = true
+    @previously_up = true
   end
 
   def detect_ppp_ips!
@@ -54,31 +55,7 @@ class Uplink
         @gateway = nil
       end
     end
-  end
-
-  def detect_ip_changes!
-    commands = []
-    need_default_route_update = false
-    message = nil
-    if @type == :ppp
-      detect_ppp_ips!
-      if (@previous_ip != @ip) || (@previous_gateway != @gateway)
-        message = "Uplink #{@description}: IP change [ip: #{@previous_ip || 'none'}, gateway: #{@previous_gateway || 'none'}] --> [ip: #{@ip || 'none'}, gateway: #{@gateway || 'none'}]"
-        puts message if DEBUG
-        #only apply routing commands if there are an ip and gateway, else they will be applied on next checks whenever new ip and gateway will be available
-        if @ip && @gateway
-          commands = [
-              [
-                  "ip rule del priority #{@priority1}",
-                  "ip rule del priority #{@priority2}"
-              ],
-              route_add_commands
-          ].flatten
-        end
-      end
-      need_default_route_update = @routing && (@previous_gateway != @gateway)
-    end
-    [commands, need_default_route_update, message]
+    puts "Uplink #{@description}: detected ip #{@ip || 'none'}, gateway #{@gateway || 'none'}" if DEBUG
   end
 
   def ping(ip_address)
@@ -91,13 +68,25 @@ class Uplink
     end
   end
 
-  def test_routing!
+  def test!
     #save current state
     @previously_up = @up
-    @previously_routing = @routing
 
-    @successful_tests = 0
-    @unsuccessful_tests = 0
+    successful_tests = 0
+    unsuccessful_tests = 0
+    commands = []
+
+    if @type == :ppp
+      detect_ppp_ips!
+      if (@previous_ip != @ip) || (@previous_gateway != @gateway)
+        #only apply routing commands if there are an ip and gateway, else they will be applied on next checks, whenever new ip and gateway will be available
+        if @ip && @gateway
+          commands << "ip rule del priority #{@rule_priority_1}"
+          commands << "ip rule del priority #{@rule_priority_2}"
+          commands += route_add_commands
+        end
+      end
+    end
 
     #do not ping if there is no ip or gateway (for example in case of a PPP interface down)
     if @ip && @gateway
@@ -122,17 +111,17 @@ class Uplink
         end
 
         if successful_test
-          @successful_tests += 1
+          successful_tests += 1
         else
-          @unsuccessful_tests += 1
+          unsuccessful_tests += 1
         end
 
         #if not currently doing the last test...
         if i + 1 < TEST_IPS.size
-          if @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
+          if successful_tests >= REQUIRED_SUCCESSFUL_TESTS
             puts "Uplink #{@description}: avoiding more tests because there are enough positive ones" if DEBUG
             break
-          elsif TEST_IPS.size - @unsuccessful_tests < REQUIRED_SUCCESSFUL_TESTS
+          elsif TEST_IPS.size - unsuccessful_tests < REQUIRED_SUCCESSFUL_TESTS
             puts "Uplink #{@description}: avoiding more tests because too many have been failed" if DEBUG
             break
           end
@@ -140,19 +129,15 @@ class Uplink
       end
     end
 
-    @up = @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
-    up_state_changed = @up != @previously_up
-    @routing = @up && @default_route
-    routing_state_changed = @routing != @previously_routing
+    @up = successful_tests >= REQUIRED_SUCCESSFUL_TESTS
 
-    state = @previously_up ? 'up' : 'down'
-    state += " --> #{@up ? 'up' : 'down'}" if up_state_changed
-    routing = @previously_routing ? 'enabled' : 'disabled'
-    routing += " --> #{@routing ? 'enabled' : 'disabled'}" if routing_state_changed
-    message = "Uplink #{@description}: #{state}"
-    puts "Uplink #{@description}: #{@successful_tests} successful tests, #{@unsuccessful_tests} unsuccessful tests, state #{state}, routing #{routing}" if DEBUG
+    if DEBUG
+      state = @previously_up ? 'up' : 'down'
+      state += " --> #{@up ? 'up' : 'down'}" if @up != @previously_up
+      puts "Uplink #{@description}: #{successful_tests} successful tests, #{unsuccessful_tests} unsuccessful tests, state #{state}"
+    end
 
-    [up_state_changed, routing_state_changed, message]
+    commands
   end
 
   def route_add_commands
@@ -160,9 +145,9 @@ class Uplink
     #- returning packets of inbound connections coming from ethX
     #- non-first packets of outbound connections for which the first packet has been sent to ethX via multipath routing
     [
-        "ip route replace table #{table} default via #{@gateway} src #{@ip}",
-        "ip rule add priority #{@priority1} from #{@ip} lookup #{table}",
-        "ip rule add priority #{@priority2} fwmark #{fwmark} lookup #{table}"
+        "ip route replace table #{@table} default via #{@gateway} src #{@ip}",
+        "ip rule add priority #{@rule_priority_1} from #{@ip} lookup #{@table}",
+        "ip rule add priority #{@rule_priority_2} fwmark #{@fwmark} lookup #{@table}"
     ]
   end
 

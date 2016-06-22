@@ -9,33 +9,30 @@ def generate_config(file_path)
 #see https://github.com/drsound/fault_tolerant_router for a complete parameter
 #description
 
-#add as many uplinks as needed
+#add as many uplinks as needed, in this example ppp0 is used as default route only if both eth1 and eth2 are down
 uplinks:
 - interface: eth1
   type: static
   ip: 1.0.0.2
   gateway: 1.0.0.1
   description: Example Provider 1
+  routing_priority: 1
   #optional parameter
   weight: 1
-  #optional parameter, default is true
-  default_route: true
 - interface: eth2
   type: static
   ip: 2.0.0.2
   gateway: 2.0.0.1
   description: Example Provider 2
+  routing_priority: 1
   #optional parameter
   weight: 2
-  #optional parameter, default is true
-  default_route: true
 - interface: ppp0
   type: ppp
   description: Example Provider 3
+  routing_priority: 2
   #optional parameter
   weight: 1
-  #optional parameter, default is true
-  default_route: true
 
 downlinks:
   lan: eth0
@@ -93,8 +90,8 @@ email:
 base_table: 1
 
 #just need to change if you are already using ip policy routing, to avoid
-#overlapping, must be higher than 32767 (default priority, see output of
-#"ip rule" command)
+#overlapping, must be higher than 32767 (the default routing table priority,
+#see output of "ip rule" command)
 base_priority: 40000
 
 #just need to change if you are already using packet marking, to avoid

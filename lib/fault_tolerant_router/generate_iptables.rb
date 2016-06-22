@@ -140,13 +140,9 @@ END
 
   puts <<END
 
-#This is just a very basic example, add your own rules for the INPUT chain.
-
-[0:0] -A INPUT -i lo -j ACCEPT
-[0:0] -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+#This is just a very basic example, add your own rules for the FORWARD chain.
 
 [0:0] -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
 END
   UPLINKS.each do |uplink|
     puts "[0:0] -A FORWARD -i #{LAN_INTERFACE} -o #{uplink.interface} -j LAN_WAN"
@@ -163,8 +159,6 @@ END
     end
   end
   puts <<END
-
-#This is just a very basic example, add your own rules for the FORWARD chain.
 
 [0:0] -A LAN_WAN -j ACCEPT
 [0:0] -A WAN_LAN -j REJECT
