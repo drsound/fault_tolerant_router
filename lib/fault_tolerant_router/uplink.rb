@@ -34,7 +34,7 @@ class Uplink
       raise "Uplink gateway not specified: #{config}" unless @gateway
     else
       detect_ppp_ips!
-      puts "Uplink #{@description}: initialized with [ip: #{@ip}, gateway: #{@gateway}]" if DEBUG
+      puts "Uplink #{@description}: initialized with [ip: #{@ip || 'none'}, gateway: #{@gateway} || 'none']" if DEBUG
     end
   end
 
@@ -42,16 +42,16 @@ class Uplink
     @previous_ip = @ip
     @previous_gateway = @gateway
     if DEMO
-      @ip = %w(3.0.0.101 3.0.0.102).sample
-      @gateway = %w(3.0.0.1 3.0.0.2).sample
+      @ip = ['3.0.0.101', '3.0.0.102', nil].sample
+      @gateway = ['3.0.0.1', '3.0.0.2', nil].sample
     else
       ifaddr = Socket.getifaddrs.find { |i| i.name == @interface && i.addr && i.addr.ipv4? }
       if ifaddr
         @ip = ifaddr.addr.ip_address
         @gateway = ifaddr.dstaddr.ip_address
       else
-        #todo: what to do if it happens?
-        raise 'PPP IP address not found'
+        @ip = nil
+        @gateway = nil
       end
     end
   end
@@ -63,15 +63,18 @@ class Uplink
     if @type == :ppp
       detect_ppp_ips!
       if (@previous_ip != @ip) || (@previous_gateway != @gateway)
-        message = "Uplink #{@description}: IP change [ip: #{@previous_ip}, gateway: #{@previous_gateway}] --> [ip: #{@ip}, gateway: #{@gateway}]"
+        message = "Uplink #{@description}: IP change [ip: #{@previous_ip || 'none'}, gateway: #{@previous_gateway || 'none'}] --> [ip: #{@ip || 'none'}, gateway: #{@gateway || 'none'}]"
         puts message if DEBUG
-        commands = [
-            [
-                "ip rule del priority #{@priority1}",
-                "ip rule del priority #{@priority2}"
-            ],
-            route_add_commands
-        ].flatten
+        #only apply routing commands if there are an ip and gateway, else they will be applied on next checks whenever new ip and gateway will be available
+        if @ip && @gateway
+          commands = [
+              [
+                  "ip rule del priority #{@priority1}",
+                  "ip rule del priority #{@priority2}"
+              ],
+              route_add_commands
+          ].flatten
+        end
       end
       need_default_route_update = @routing && (@previous_gateway != @gateway)
     end
@@ -96,43 +99,45 @@ class Uplink
     @successful_tests = 0
     @unsuccessful_tests = 0
 
-    #for each test (in random order)...
-    TEST_IPS.shuffle.each_with_index do |test, i|
-      successful_test = false
+    #do not ping if there is no ip or gateway (for example in case of a PPP interface down)
+    if @ip && @gateway
+      #for each test (in random order)...
+      TEST_IPS.shuffle.each_with_index do |test, i|
+        successful_test = false
 
-      #retry for several times...
-      PING_RETRIES.times do
-        if DEBUG
-          print "Uplink #{@description}: ping #{test}... "
-          STDOUT.flush
+        #retry for several times...
+        PING_RETRIES.times do
+          if DEBUG
+            print "Uplink #{@description}: ping #{test}... "
+            STDOUT.flush
+          end
+          if ping(test)
+            successful_test = true
+            puts 'ok' if DEBUG
+            #avoid more pings to the same ip after a successful one
+            break
+          else
+            puts 'error' if DEBUG
+          end
         end
-        if ping(test)
-          successful_test = true
-          puts 'ok' if DEBUG
-          #avoid more pings to the same ip after a successful one
-          break
+
+        if successful_test
+          @successful_tests += 1
         else
-          puts 'error' if DEBUG
+          @unsuccessful_tests += 1
+        end
+
+        #if not currently doing the last test...
+        if i + 1 < TEST_IPS.size
+          if @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
+            puts "Uplink #{@description}: avoiding more tests because there are enough positive ones" if DEBUG
+            break
+          elsif TEST_IPS.size - @unsuccessful_tests < REQUIRED_SUCCESSFUL_TESTS
+            puts "Uplink #{@description}: avoiding more tests because too many have been failed" if DEBUG
+            break
+          end
         end
       end
-
-      if successful_test
-        @successful_tests += 1
-      else
-        @unsuccessful_tests += 1
-      end
-
-      #if not currently doing the last test...
-      if i + 1 < TEST_IPS.size
-        if @successful_tests >= REQUIRED_SUCCESSFUL_TESTS
-          puts "Uplink #{@description}: avoiding more tests because there are enough positive ones" if DEBUG
-          break
-        elsif TEST_IPS.size - @unsuccessful_tests < REQUIRED_SUCCESSFUL_TESTS
-          puts "Uplink #{@description}: avoiding more tests because too many have been failed" if DEBUG
-          break
-        end
-      end
-
     end
 
     @up = @successful_tests >= REQUIRED_SUCCESSFUL_TESTS

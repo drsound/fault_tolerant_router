@@ -42,7 +42,8 @@ class Uplinks
   end
 
   def set_default_route_commands
-    routing_uplinks = @uplinks.find_all { |uplink| uplink.routing }
+    #exclude uplinks with no ip or gateway (PPP uplinks down)
+    routing_uplinks = @uplinks.find_all { |uplink| uplink.routing && uplink.ip && uplink.gateway}
 
     #do not use balancing if there is just one routing uplink
     if routing_uplinks.size == 1
