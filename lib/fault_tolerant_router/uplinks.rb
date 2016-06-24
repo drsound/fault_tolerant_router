@@ -94,11 +94,6 @@ class Uplinks
   end
 
   def test!
-    # if need_default_route_update
-    #   puts 'Will update default route because some of its gateways changed' if DEBUG
-    #   commands += update_default_route!
-    # end
-
     commands = []
     messages = []
     @uplinks.each do |uplink|
