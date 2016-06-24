@@ -44,14 +44,14 @@ class Uplinks
   end
 
   def update_default_route!
-    #select uplinks that are up and with a routing priority value
-    selected = @uplinks.find_all { |uplink| uplink.up && uplink.routing_priority }
+    #select uplinks that are up and with a specified priority group value
+    selected = @uplinks.find_all { |uplink| uplink.up && uplink.priority_group }
     puts "Choosing default route, available uplinks: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
 
-    #restrict the selection to the highest priority ones
-    highest_available_priority = selected.map { |uplink| uplink.routing_priority }.min
-    selected = selected.find_all { |uplink| uplink.routing_priority == highest_available_priority }
-    puts "Choosing default route, selected uplinks based on priority: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
+    #restrict the selection to the members of highest priority group
+    highest_available_priority = selected.map { |uplink| uplink.priority_group }.min
+    selected = selected.find_all { |uplink| uplink.priority_group == highest_available_priority }
+    puts "Choosing default route, selected uplinks based on priority groups: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
 
     changes = false
     #assign default route status to the uplinks and detect changes from previous configuration

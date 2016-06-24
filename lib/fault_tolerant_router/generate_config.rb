@@ -16,7 +16,7 @@ uplinks:
   ip: 1.0.0.2
   gateway: 1.0.0.1
   description: Example Provider 1
-  routing_priority: 1
+  priority_group: 1
   #optional parameter
   weight: 1
 - interface: eth2
@@ -24,13 +24,13 @@ uplinks:
   ip: 2.0.0.2
   gateway: 2.0.0.1
   description: Example Provider 2
-  routing_priority: 1
+  priority_group: 1
   #optional parameter
   weight: 2
 - interface: ppp0
   type: ppp
   description: Example Provider 3
-  routing_priority: 2
+  priority_group: 2
   #optional parameter
   weight: 1
 

@@ -1,5 +1,5 @@
 class Uplink
-  attr_reader :description, :fwmark, :gateway, :id, :interface, :ip, :previous_gateway, :previous_ip, :previously_up, :routing_priority, :rule_priority_1, :table, :type, :up, :weight
+  attr_reader :description, :fwmark, :gateway, :id, :interface, :ip, :previous_gateway, :previous_ip, :previously_up, :priority_group, :rule_priority_1, :table, :type, :up, :weight
   attr_accessor :default_route, :previously_default_route, :rule_priority_2
 
   def initialize(config, id)
@@ -20,7 +20,7 @@ class Uplink
     @description = config['description']
     raise "Uplink description not specified: #{config}" unless @description
     @weight = config['weight']
-    @routing_priority = config['routing_priority']
+    @priority_group = config['priority_group']
     @default_route = false
 
     if @type == :static
