@@ -46,12 +46,12 @@ class Uplinks
   def update_default_route!
     #select uplinks that are up and with a specified priority group value
     selected = @uplinks.find_all { |uplink| uplink.up && uplink.priority_group }
-    puts "Choosing default route, available uplinks: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
+    puts "Choosing default route: available uplinks: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
 
     #restrict the selection to the members of highest priority group
     highest_available_priority = selected.map { |uplink| uplink.priority_group }.min
     selected = selected.find_all { |uplink| uplink.priority_group == highest_available_priority }
-    puts "Choosing default route, selected uplinks based on priority groups: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
+    puts "Choosing default route: highest priority group uplinks: #{selected.map { |uplink| uplink.description }.join(', ')}" if DEBUG
 
     changes = false
     #assign default route status to the uplinks and detect changes from previous configuration
@@ -69,11 +69,11 @@ class Uplinks
 
     commands = []
     if selected.size == 0
-      puts 'Choosing default route: no need for an update (no available uplinks)' if DEBUG
+      puts 'Choosing default route: no available uplinks, no need for an update' if DEBUG
     elsif !changes
-      puts 'Choosing default route: no need for an update (no changes)' if DEBUG
+      puts 'Choosing default route: no changes, no need for an update' if DEBUG
     else
-      puts 'Choosing default route: update needed (changes detected)' if DEBUG
+      puts 'Choosing default route: changes detected, update needed' if DEBUG
       #do not use balancing if there is just one routing uplink
       if selected.size == 1
         nexthops = "via #{selected.first.gateway}"
