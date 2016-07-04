@@ -38,8 +38,8 @@ def monitor
       end
     end
 
-    if UPLINKS.all? { |uplink| !uplink.up }
-      puts 'No waiting, because all of the default route uplinks are down' if DEBUG
+    if UPLINKS.all_priority_group_members_down?
+      puts 'No waiting, because all of the priority group members are down' if DEBUG
     elsif DEMO
       puts "Waiting just 5 seconds because in demo mode, otherwise would be #{TEST_INTERVAL} seconds..." if DEBUG
       sleep 5

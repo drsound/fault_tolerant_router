@@ -135,4 +135,8 @@ class Uplinks
     [commands, messages]
   end
 
+  def all_priority_group_members_down?
+    @uplinks.all? { |uplink| !uplink.priority_group || !uplink.up }
+  end
+
 end
