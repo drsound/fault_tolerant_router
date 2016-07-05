@@ -24,6 +24,9 @@ def monitor
   logger = Logger.new(LOG_FILE, LOG_OLD_FILES, LOG_MAX_SIZE)
   command(UPLINKS.initialize_routing!)
 
+  list = UPLINKS.select { |uplink| uplink.default_route }.map { |uplink| uplink.description }.join(', ')
+  log(logger, ["Monitor started, initial default route uplinks: #{list}"])
+
   loop do
     commands, messages = UPLINKS.test!
     command(commands)
