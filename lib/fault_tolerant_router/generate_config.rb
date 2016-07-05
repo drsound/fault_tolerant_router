@@ -75,7 +75,7 @@ email:
   - user1@domain.com
   - user2@domain.com
   - user3@domain.com
-  #see http://ruby-doc.org/stdlib-2.2.0/libdoc/net/smtp/rdoc/Net/SMTP.html
+  #see http://ruby-doc.org/stdlib-2.3.1/libdoc/net/smtp/rdoc/Net/SMTP.html
   smtp_parameters:
     address: smtp.gmail.com
     port: 587
