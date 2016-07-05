@@ -13,6 +13,64 @@ require 'fault_tolerant_router/monitor'
 require 'fault_tolerant_router/uplink'
 require 'fault_tolerant_router/uplinks'
 
+CONFIG_TEMPLATE = {
+    'uplinks' => {
+        'interface' => {},
+        'type' => {},
+        'ip' => {},
+        'gateway' => {},
+        'description' => {},
+        'weight' => {},
+        'priority_group' => {}
+    },
+    'downlinks' => {
+        'lan' => {},
+        'dmz' => {}
+    },
+    'tests' => {
+        'ips' => {},
+        'required_successful' => {},
+        'ping_retries' => {},
+        'interval' => {}
+    },
+    'log' => {
+        'file' => {},
+        'max_size' => {},
+        'old_files' => {}
+    },
+    'email' => {
+        'send' => {},
+        'sender' => {},
+        'recipients' => {},
+        'smtp_parameters' => {
+            'address' => {},
+            'port' => {},
+            'authentication' => {},
+            'enable_starttls_auto' => {},
+            'user_name' => {},
+            'password' => {}
+        }
+    },
+    'base_table' => {},
+    'base_priority' => {},
+    'base_fwmark' => {}
+}
+
+def check_config(config, template, path = [])
+  config.each do |k, v|
+    unless template.keys.include?(k)
+      puts "Error: unknown configuration parameter '#{(path + [k]).join('/')}'"
+      exit 1
+    end
+    case v
+      when Hash
+        check_config(v, template[k], path + [k])
+      when Array
+        v.each { |v2| check_config(v2, template[k], path + [k]) if v2.is_a?(Hash) }
+    end
+  end
+end
+
 options = {
     configuration_file: '/etc/fault_tolerant_router.conf',
     debug: false,
@@ -71,6 +129,8 @@ unless File.exists?(options[:configuration_file])
 end
 
 config = YAML.load_file(options[:configuration_file])
+check_config(config, CONFIG_TEMPLATE)
+
 LAN_INTERFACE = config['downlinks']['lan']
 DMZ_INTERFACE = config['downlinks']['dmz']
 TEST_IPS = config['tests']['ips']
