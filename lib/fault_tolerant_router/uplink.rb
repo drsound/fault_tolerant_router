@@ -8,26 +8,39 @@ class Uplink
     @table = BASE_TABLE + @id
     @fwmark = BASE_FWMARK + @id
     @interface = config['interface']
-    raise "Uplink interface not specified: #{config}" unless @interface
+    unless @interface
+      puts 'Error: uplink interface not specified'
+      exit 1
+    end
     @type = case config['type']
               when 'static'
                 :static
               when 'ppp'
                 :ppp
               else
-                raise "Uplink type not valid: #{config}"
+                puts "Error: '#{config['type']}' is not a valid uplink type"
+                exit 1
             end
     @description = config['description']
-    raise "Uplink description not specified: #{config}" unless @description
+    unless @description
+      puts 'Error: uplink description not specified'
+      exit 1
+    end
     @weight = config['weight']
     @priority_group = config['priority_group']
     @default_route = false
 
     if @type == :static
       @ip = config['ip']
-      raise "Uplink IP address not specified: #{config}" unless @ip
+      unless @ip
+        puts 'Error: uplink IP not specified'
+        exit 1
+      end
       @gateway = config['gateway']
-      raise "Uplink gateway not specified: #{config}" unless @gateway
+      unless @gateway
+        puts 'Error: uplink gateway not specified'
+        exit 1
+      end
     else
       detect_ppp_ips!
     end
