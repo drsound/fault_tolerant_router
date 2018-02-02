@@ -1,8 +1,10 @@
 def command(input)
   input = [input] if input.is_a?(String)
   input.each do |c|
-    `#{c}` unless DEMO
     puts "Command: #{c}" if DEBUG
+    if c
+      `#{c}` unless DEMO
+    end
   end
 end
 
