@@ -21,7 +21,9 @@ CONFIG_TEMPLATE = {
         'gateway' => {},
         'description' => {},
         'weight' => {},
-        'priority_group' => {}
+        'priority_group' => {},
+        'up_command' => {},
+        'down_command' => {}
     },
     'downlinks' => {
         'lan' => {},
@@ -53,7 +55,9 @@ CONFIG_TEMPLATE = {
     },
     'base_table' => {},
     'base_priority' => {},
-    'base_fwmark' => {}
+    'base_fwmark' => {},
+    'all_down_command' => {},
+    'all_up_command' => {}
 }
 
 def check_config(config, template, path = [])
@@ -147,7 +151,10 @@ SMTP_PARAMETERS = Hash[config['email']['smtp_parameters'].map { |k, v| [k.to_sym
 BASE_TABLE = config['base_table']
 BASE_PRIORITY = config['base_priority']
 BASE_FWMARK = config['base_fwmark']
+ALL_DOWN_COMMAND = config['all_down_command']
+ALL_UP_COMMAND = config['all_up_command']
 UPLINKS = Uplinks.new(config['uplinks'])
+
 
 case ARGV[0]
   when 'generate_iptables'

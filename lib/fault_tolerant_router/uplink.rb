@@ -1,5 +1,5 @@
 class Uplink
-  attr_reader :description, :fwmark, :gateway, :id, :interface, :ip, :previous_gateway, :previous_ip, :previously_up, :priority_group, :rule_priority_1, :table, :type, :up, :weight
+  attr_reader :description, :fwmark, :gateway, :id, :interface, :ip, :previous_gateway, :previous_ip, :previously_up, :priority_group, :rule_priority_1, :table, :type, :up, :weight, :down_command, :up_command
   attr_accessor :default_route, :previously_default_route, :rule_priority_2
 
   def initialize(config, id)
@@ -28,6 +28,8 @@ class Uplink
     end
     @weight = config['weight']
     @priority_group = config['priority_group']
+    @up_command = config['up_command']
+    @down_command = config['down_command']
     @default_route = false
 
     if @type == :static
@@ -143,6 +145,13 @@ class Uplink
     end
 
     @up = successful_tests >= REQUIRED_SUCCESSFUL_TESTS
+
+    # add user commands on state change
+    if @up && !@previously_up && @up_command  # We went from down to up, run up_command if we have one
+      commands << @up_command
+    elsif !@up && @previously_up && @down_command  # We went from up to down, run down_command if we have one
+      commands << @down_command
+    end
 
     if DEBUG
       state = @previously_up ? 'up' : 'down'
