@@ -5,6 +5,12 @@ class Uplinks
     @uplinks = config.each_with_index.map { |uplink, i| Uplink.new(uplink, i) }
     @uplinks.each { |uplink| uplink.rule_priority_2 = BASE_PRIORITY + @uplinks.size + uplink.id }
     @default_route_table = @uplinks.map { |uplink| uplink.table }.max + 1
+
+    # track changes to all-up or all-down; assume all-up to start
+    @all_up = true
+    @all_down = false
+    @previously_all_up = true
+    @previously_all_down = false
   end
 
   def each
@@ -131,6 +137,21 @@ class Uplinks
       messages << "Uplink #{uplink.description}: ip #{ip}, gateway #{gateway}, #{up}, #{default_route}"
     end
     messages = [] unless changes
+
+    # add user-specified commands if all just became up/down
+    @all_up = @uplinks.all? {|uplink| uplink.up}
+    @all_down = @uplinks.all? {|uplink| !uplink.up}
+
+    if @all_up && !@previously_all_up && ALL_UP_COMMAND
+      messages << "All links now up, adding user command: #{ALL_UP_COMMAND}"
+      commands << @all_up_command
+    elsif @all_down && !@previously_all_down && ALL_DOWN_COMMAND
+      messages << "All links now down, adding user command: #{ALL_DOWN_COMMAND}"
+      commands << @all_down_command
+    end
+
+    @previously_all_up = @all_up
+    @previously_all_down = @all_down
 
     [commands, messages]
   end

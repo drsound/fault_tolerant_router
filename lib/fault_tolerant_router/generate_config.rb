@@ -19,6 +19,9 @@ uplinks:
   priority_group: 1
   #optional parameter
   weight: 1
+  #trigger scripts on up/down
+  #up_command: /usr/local/bin/fault_tolerant_router/reset_mail.sh eth1
+  #down_command: ifdown eth1; ifup eth1
 - interface: eth2
   type: static
   ip: 2.0.0.2
@@ -27,12 +30,18 @@ uplinks:
   priority_group: 1
   #optional parameter
   weight: 2
+  #trigger scripts on up/down
+  #up_command: /usr/local/bin/fault_tolerant_router/reset_mail.sh eth2
+  #down_command: ifdown eth2; ifup eth2
 - interface: ppp0
   type: ppp
   description: Example Provider 3
   priority_group: 2
   #optional parameter
   weight: 1
+  #trigger scripts on up/down
+  #up_command: /usr/local/bin/fault_tolerant_router/reset_mail.sh ppp0
+  #down_command: killall pppd; poff my-ppp-provider; pon my-ppp-provider
 
 downlinks:
   lan: eth0
@@ -97,6 +106,11 @@ base_priority: 40000
 #just need to change if you are already using packet marking, to avoid
 #overlapping
 base_fwmark: 1
+
+#run these when every link goes down, or all links are up
+#all_down_command: service networking restart
+#all_up_command: /usr/local/bin/fault_tolerant_router/all_up.sh
+
 END
     end
     puts "Example configuration saved to #{file_path}"
