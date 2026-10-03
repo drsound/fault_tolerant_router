@@ -1,0 +1,24 @@
+[package]
+name = "testbed"
+description = "Network namespace test harness for Fault Tolerant Router 2.0"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ftr-testbed"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+nix.workspace = true
+
+[lints]
+workspace = true

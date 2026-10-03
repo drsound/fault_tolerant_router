@@ -21,3 +21,5 @@ tmp
 *.a
 mkmf.log
 .idea/
+# Rust (2.0)
+/target

@@ -1,0 +1,366 @@
+//! Test agents, run inside namespaces as `ftr-testbed agent ...`.
+//!
+//! - `serve` (internet node): TCP on [`TCP_PORT`] and [`TCP_PORT_HTTPS`]
+//!   writes the peer address as the first line, then echoes; UDP on
+//!   [`UDP_PORT`] answers each datagram with the peer address; UDP on
+//!   [`UDP_SINK_PORT`] only logs. Every accepted connection and datagram is
+//!   appended to a JSON-lines log, so one-way flows can be attributed too.
+//! - `connect` (client): opens many connections and prints one
+//!   [`ConnResult`] per connection as a JSON array.
+//! - `flow` (client): one long-lived TCP connection exchanging a counter at
+//!   a fixed interval until standard input closes; prints a [`FlowReport`].
+//! - `udp-send` (client): a one-way UDP flow from a fixed local port.
+//!
+//! The agents use the standard library only and blocking threads, which
+//! keeps them independent of the daemon's runtime.
+
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IoSlice, IoSliceMut, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use nix::libc;
+use nix::sys::socket::{
+    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrIn, SockaddrIn6,
+    SockaddrStorage, bind, recvmsg, sendmsg, setsockopt, socket, sockopt,
+};
+use serde::Serialize;
+
+use crate::plan::{TCP_PORT, TCP_PORT_HTTPS, UDP_PORT, UDP_SINK_PORT, canonical};
+use crate::traffic::{ConnResult, FlowReport, Outcome, ServerEvent};
+
+fn canon(sa: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical(sa.ip()), sa.port())
+}
+
+struct Log(Option<Mutex<File>>);
+
+impl Log {
+    fn write<T: Serialize>(&self, ev: &T) {
+        if let Some(f) = &self.0 {
+            if let (Ok(mut f), Ok(line)) = (f.lock(), serde_json::to_string(ev)) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+}
+
+/// Runs the servers forever.
+pub fn serve(log_path: Option<&str>) -> Result<()> {
+    let log = Arc::new(Log(match log_path {
+        Some(p) => Some(Mutex::new(File::options().create(true).append(true).open(p)?)),
+        None => None,
+    }));
+    let any = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+    let mut handles = Vec::new();
+    for port in [TCP_PORT, TCP_PORT_HTTPS] {
+        // Dual-stack: IPv4 clients appear as IPv4-mapped addresses.
+        let l = TcpListener::bind(SocketAddr::new(any, port)).with_context(|| format!("binding TCP {port}"))?;
+        let log = log.clone();
+        handles.push(thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let log = log.clone();
+                thread::spawn(move || tcp_session(s, &log));
+            }
+        }));
+    }
+    for (port, reply) in [(UDP_PORT, true), (UDP_SINK_PORT, false)] {
+        for v6 in [false, true] {
+            let s = udp_socket(v6, port).with_context(|| format!("binding UDP {port}"))?;
+            let log = log.clone();
+            handles.push(thread::spawn(move || udp_loop(&s, port, reply, &log)));
+        }
+    }
+    eprintln!("ftr-testbed agent: serving");
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(())
+}
+
+/// A UDP socket of one family that reports the destination address of each
+/// datagram, so that answers leave from the address the client used (the
+/// servers answer on every address of a prefix, see [`crate::plan::SERVERS_V4`]).
+fn udp_socket(v6: bool, port: u16) -> Result<UdpSocket> {
+    let fd = if v6 {
+        let fd = socket(AddressFamily::Inet6, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)?;
+        setsockopt(&fd, sockopt::Ipv6V6Only, &true)?;
+        setsockopt(&fd, sockopt::Ipv6RecvPacketInfo, &true)?;
+        bind(
+            fd.as_raw_fd(),
+            &SockaddrIn6::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)),
+        )?;
+        fd
+    } else {
+        let fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)?;
+        setsockopt(&fd, sockopt::Ipv4PacketInfo, &true)?;
+        bind(
+            fd.as_raw_fd(),
+            &SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)),
+        )?;
+        fd
+    };
+    Ok(UdpSocket::from(fd))
+}
+
+fn udp_loop(s: &UdpSocket, port: u16, reply: bool, log: &Log) {
+    let fd = s.as_raw_fd();
+    let mut buf = [0u8; 2048];
+    loop {
+        let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
+        let (bytes, peer, dst) = {
+            let mut iov = [IoSliceMut::new(&mut buf)];
+            let Ok(msg) = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty()) else {
+                continue;
+            };
+            let mut dst = None;
+            for c in msg.cmsgs().into_iter().flatten() {
+                match c {
+                    ControlMessageOwned::Ipv4PacketInfo(pi) => {
+                        dst = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(pi.ipi_addr.s_addr))));
+                    }
+                    ControlMessageOwned::Ipv6PacketInfo(pi) => {
+                        dst = Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)))
+                    }
+                    _ => {}
+                }
+            }
+            let peer = msg.address.and_then(|a| {
+                a.as_sockaddr_in()
+                    .map(|v4| SocketAddr::V4(SocketAddrV4::from(*v4)))
+                    .or_else(|| a.as_sockaddr_in6().map(|v6| SocketAddr::V6(SocketAddrV6::from(*v6))))
+            });
+            (msg.bytes, peer, dst)
+        };
+        let Some(peer) = peer else { continue };
+        log.write(&ServerEvent {
+            proto: "udp".into(),
+            port,
+            peer,
+            local: dst.map(|d| SocketAddr::new(d, port)),
+            bytes,
+        });
+        if !reply {
+            continue;
+        }
+        let text = format!("{peer}\n");
+        let iov = [IoSlice::new(text.as_bytes())];
+        let _ = match (peer, dst) {
+            (SocketAddr::V4(p), Some(IpAddr::V4(d))) => {
+                let pi = libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_spec_dst: libc::in_addr {
+                        s_addr: u32::from(d).to_be(),
+                    },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                };
+                sendmsg(
+                    fd,
+                    &iov,
+                    &[ControlMessage::Ipv4PacketInfo(&pi)],
+                    MsgFlags::empty(),
+                    Some(&SockaddrIn::from(p)),
+                )
+            }
+            (SocketAddr::V6(p), Some(IpAddr::V6(d))) => {
+                let pi = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr { s6_addr: d.octets() },
+                    ipi6_ifindex: 0,
+                };
+                sendmsg(
+                    fd,
+                    &iov,
+                    &[ControlMessage::Ipv6PacketInfo(&pi)],
+                    MsgFlags::empty(),
+                    Some(&SockaddrIn6::from(p)),
+                )
+            }
+            (SocketAddr::V4(p), _) => sendmsg(fd, &iov, &[], MsgFlags::empty(), Some(&SockaddrIn::from(p))),
+            (SocketAddr::V6(p), _) => sendmsg(fd, &iov, &[], MsgFlags::empty(), Some(&SockaddrIn6::from(p))),
+        };
+    }
+}
+
+fn tcp_session(mut s: TcpStream, log: &Log) {
+    let (Ok(peer), Ok(local)) = (s.peer_addr(), s.local_addr()) else {
+        return;
+    };
+    log.write(&ServerEvent {
+        proto: "tcp".into(),
+        port: local.port(),
+        peer: canon(peer),
+        local: Some(canon(local)),
+        bytes: 0,
+    });
+    if s.write_all(format!("{}\n", canon(peer)).as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if s.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn classify(e: &io::Error) -> Outcome {
+    match e.raw_os_error() {
+        Some(101) | Some(113) => Outcome::Unreachable,
+        Some(111) => Outcome::Refused,
+        _ if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => Outcome::Timeout,
+        _ => Outcome::Error,
+    }
+}
+
+/// Opens one connection (TCP) or exchange (UDP) and reports what happened.
+fn one(dst: SocketAddr, udp: bool, timeout: Duration) -> ConnResult {
+    let start = Instant::now();
+    let mut r = ConnResult {
+        dst,
+        local: None,
+        observed: None,
+        outcome: Outcome::Ok,
+        errno: None,
+        millis: 0,
+    };
+    let res: io::Result<String> = (|| {
+        if udp {
+            let bind = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let s = UdpSocket::bind(bind)?;
+            s.connect(dst)?;
+            r.local = s.local_addr().ok();
+            s.set_read_timeout(Some(timeout))?;
+            s.send(b"ftr-testbed")?;
+            let mut buf = [0u8; 256];
+            let n = s.recv(&mut buf)?;
+            Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+        } else {
+            let s = TcpStream::connect_timeout(&dst, timeout)?;
+            r.local = s.local_addr().ok();
+            s.set_read_timeout(Some(timeout))?;
+            let mut line = String::new();
+            BufReader::new(&s).read_line(&mut line)?;
+            Ok(line)
+        }
+    })();
+    match res {
+        Ok(line) => r.observed = line.trim().parse().ok(),
+        Err(e) => {
+            r.outcome = classify(&e);
+            r.errno = e.raw_os_error();
+        }
+    }
+    r.millis = start.elapsed().as_millis() as u64;
+    r
+}
+
+/// Opens `count` connections, cycling over `dsts`, with up to `parallel` in flight.
+pub fn connect(dsts: &[SocketAddr], count: usize, udp: bool, timeout: Duration, parallel: usize) -> Vec<ConnResult> {
+    let next = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(Vec::with_capacity(count)));
+    let dsts: Arc<Vec<SocketAddr>> = Arc::new(dsts.to_vec());
+    let workers: Vec<_> = (0..parallel.clamp(1, count.max(1)))
+        .map(|_| {
+            let (next, results, dsts) = (next.clone(), results.clone(), dsts.clone());
+            thread::spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= count {
+                        return;
+                    }
+                    let r = one(dsts[i % dsts.len()], udp, timeout);
+                    if let Ok(mut v) = results.lock() {
+                        v.push((i, r));
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        let _ = w.join();
+    }
+    let mut v = Arc::try_unwrap(results)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
+    v.sort_by_key(|(i, _)| *i);
+    v.into_iter().map(|(_, r)| r).collect()
+}
+
+/// A long-lived TCP flow; stops when standard input closes or after `duration`.
+pub fn flow(dst: SocketAddr, interval: Duration, duration: Option<Duration>) -> FlowReport {
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = io::stdin().read_to_end(&mut sink);
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+    let mut rep = FlowReport::default();
+    let start = Instant::now();
+    let res: io::Result<()> = (|| {
+        let mut s = TcpStream::connect_timeout(&dst, Duration::from_secs(3))?;
+        rep.local = s.local_addr().ok();
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        s.set_nodelay(true)?;
+        let mut first = Vec::new();
+        let mut b = [0u8; 1];
+        while s.read(&mut b)? == 1 && b[0] != b'\n' {
+            first.push(b[0]);
+        }
+        rep.observed = String::from_utf8_lossy(&first).trim().parse().ok();
+        let mut last_ok = Instant::now();
+        let mut seq: u64 = 0;
+        while !stop.load(Ordering::SeqCst) && duration.is_none_or(|d| start.elapsed() < d) {
+            s.write_all(&seq.to_be_bytes())?;
+            rep.sent += 1;
+            let mut echo = [0u8; 8];
+            s.read_exact(&mut echo)?;
+            if u64::from_be_bytes(echo) != seq {
+                return Err(io::Error::other("echo out of sequence"));
+            }
+            rep.received += 1;
+            let gap = last_ok.elapsed().as_millis() as u64;
+            rep.max_gap_ms = rep.max_gap_ms.max(gap);
+            last_ok = Instant::now();
+            seq += 1;
+            thread::sleep(interval);
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        rep.error = Some(e.to_string());
+        rep.errno = e.raw_os_error();
+    }
+    rep.millis = start.elapsed().as_millis() as u64;
+    rep
+}
+
+/// Sends `count` datagrams from `src_port` to `dst` (UDP sink), one per `interval`.
+pub fn udp_send(dst: SocketAddr, src_port: u16, count: u32, interval: Duration) -> Result<u32> {
+    let bind = if dst.is_ipv4() {
+        format!("0.0.0.0:{src_port}")
+    } else {
+        format!("[::]:{src_port}")
+    };
+    let s = UdpSocket::bind(&bind).with_context(|| format!("binding {bind}"))?;
+    let mut sent = 0;
+    for i in 0..count {
+        if s.send_to(format!("ftr-testbed {i}").as_bytes(), dst).is_ok() {
+            sent += 1;
+        }
+        thread::sleep(interval);
+    }
+    Ok(sent)
+}

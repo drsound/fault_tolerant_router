@@ -1,0 +1,108 @@
+# Quality gates of SPEC.md §14.4.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  checks:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  netns-current:
+    name: namespace suite (runner kernel, current nftables)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools jq iproute2 nftables dnsmasq-base ppp pppoe udhcpc iputils-ping conntrack tcpdump
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+      - name: Let dnsmasq write its files in the harness directory
+        # Ubuntu confines dnsmasq with AppArmor; the harness keeps leases,
+        # pid and log files in its own run directory.
+        run: |
+          if [ -e /etc/apparmor.d/usr.sbin.dnsmasq ]; then
+            sudo ln -sf /etc/apparmor.d/usr.sbin.dnsmasq /etc/apparmor.d/disable/
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.dnsmasq || true
+          fi
+      - run: uname -r && nft --version
+      - run: tests/vm/run-suite.sh --host
+
+  netns-minimum:
+    name: namespace suite (Linux 6.1, nftables 1.0.6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install virtme-ng and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools jq mmdebstrap debian-archive-keyring qemu-system-x86 busybox-static
+          pipx install virtme-ng==1.35
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build the Debian 12 root filesystem
+        run: sudo tests/vm/build-rootfs.sh "$RUNNER_TEMP/rootfs-bookworm"
+      - run: tests/vm/run-suite.sh --vm "$RUNNER_TEMP/rootfs-bookworm"
+
+  release-targets:
+    # Placeholder until the daemon crate exists: checks that the workspace
+    # compiles for every PLAT-3 target. Static release builds replace it in M1.
+    name: build check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --workspace --release --target ${{ matrix.target }}
