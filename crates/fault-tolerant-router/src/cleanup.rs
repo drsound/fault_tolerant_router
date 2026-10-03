@@ -4,8 +4,8 @@
 //! source guard before its source rule), class guards, routes, sysctls, and
 //! the manifest last.
 
-use anyhow::{Context, Result, anyhow};
-use tracing::{info, warn};
+use anyhow::{Context, Result, anyhow, bail};
+use tracing::info;
 
 use crate::config::{Config, FirewallMode};
 use crate::model::{Family, FwMask};
@@ -73,11 +73,20 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
     info!(operations = n, "removed FTR's rules and routes");
     test_hooks::step("restore sysctls").map_err(|e| anyhow!(e))?;
     if let Some(m) = &manifest {
-        for (key, result) in sysctl::restore(m, |_| true) {
+        let mut failed = Vec::new();
+        for (key, result) in sysctl::restore(m, |_| true, sysctl::read, sysctl::write) {
             match result {
                 Ok(()) => info!("restored {}", sysctl::dotted(key)),
-                Err(e) => warn!("restoring {}: {e}", sysctl::dotted(key)),
+                Err(e) => failed.push(format!("{}: {e}", sysctl::dotted(key))),
             }
+        }
+        // The manifest holds the baselines: it stays until every one is
+        // restored, so that cleanup can run again.
+        if !failed.is_empty() {
+            bail!(
+                "restoring sysctls (the manifest is kept; run cleanup again): {}",
+                failed.join("; ")
+            );
         }
     }
     test_hooks::step("remove the state files and the manifest").map_err(|e| anyhow!(e))?;

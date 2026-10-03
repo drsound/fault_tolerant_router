@@ -138,8 +138,15 @@ pub fn record(manifest: &mut Manifest, diffs: &[Difference]) {
 }
 
 /// Restores the baselines of the given keys whose current value is still
-/// the one FTR set (§4.6, FR-REC-4). Returns the keys restored.
-pub fn restore(manifest: &Manifest, keys: impl Fn(&str) -> bool) -> Vec<(String, io::Result<()>)> {
+/// the one FTR set (§4.6, FR-REC-4). Returns the keys restored or that
+/// could not be read or written; a key of an interface that is gone has
+/// nothing left to restore.
+pub fn restore(
+    manifest: &Manifest,
+    keys: impl Fn(&str) -> bool,
+    read: impl Fn(&str) -> io::Result<String>,
+    write: impl Fn(&str, &str) -> io::Result<()>,
+) -> Vec<(String, io::Result<()>)> {
     let mut v = Vec::new();
     for (key, set) in &manifest.sysctl_set {
         if !keys(key) {
@@ -148,8 +155,11 @@ pub fn restore(manifest: &Manifest, keys: impl Fn(&str) -> bool) -> Vec<(String,
         let Some(baseline) = manifest.sysctl_baseline.get(key) else {
             continue;
         };
-        if read(key).ok().as_deref() == Some(set.as_str()) && baseline != set {
-            v.push((key.clone(), write(key, baseline)));
+        match read(key) {
+            Ok(current) if current == *set && baseline != set => v.push((key.clone(), write(key, baseline))),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => v.push((key.clone(), Err(e))),
         }
     }
     v
@@ -284,6 +294,42 @@ interface = "wan0.100"
         record(&mut m, &d);
         assert_eq!(m.sysctl_baseline["net/ipv4/ip_forward"], "0");
         assert_eq!(family_of("net/ipv6/conf/all/forwarding"), Some(Family::V6));
+    }
+
+    #[test]
+    fn restore_reports_read_and_write_failures_but_not_vanished_interfaces() {
+        let cfg = config::parse(CONFIG).unwrap();
+        let mut m = Manifest::new(&cfg);
+        m.record_sysctl("net/ipv4/ip_forward", "0", "1");
+        m.record_sysctl("net/ipv4/conf/gone/rp_filter", "2", "0");
+        m.record_sysctl("net/ipv4/conf/wana/src_valid_mark", "0", "1");
+        m.record_sysctl("net/ipv4/fib_multipath_hash_policy", "0", "1");
+        m.record_sysctl("net/ipv4/conf/wanb/rp_filter", "2", "0");
+        let read = |k: &str| match k {
+            "net/ipv4/conf/gone/rp_filter" => Err(io::Error::from(io::ErrorKind::NotFound)),
+            "net/ipv4/fib_multipath_hash_policy" => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            // Changed by the administrator since FTR set it.
+            "net/ipv4/conf/wanb/rp_filter" => Ok("1".to_owned()),
+            _ => Ok("1".to_owned()),
+        };
+        let write = |k: &str, _: &str| {
+            if k.contains("src_valid_mark") {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            Ok(())
+        };
+        let r = restore(&m, |_| true, read, write);
+        let ok: Vec<&str> = r.iter().filter(|(_, e)| e.is_ok()).map(|(k, _)| k.as_str()).collect();
+        let mut failed: Vec<&str> = r.iter().filter(|(_, e)| e.is_err()).map(|(k, _)| k.as_str()).collect();
+        failed.sort_unstable();
+        assert_eq!(ok, ["net/ipv4/ip_forward"]);
+        assert_eq!(
+            failed,
+            [
+                "net/ipv4/conf/wana/src_valid_mark",
+                "net/ipv4/fib_multipath_hash_policy"
+            ]
+        );
     }
 
     #[test]
