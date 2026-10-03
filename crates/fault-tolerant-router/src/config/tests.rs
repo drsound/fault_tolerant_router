@@ -128,6 +128,15 @@ fn spec_example_is_valid() {
 }
 
 #[test]
+fn digest_is_the_sha256_of_the_text() {
+    assert_eq!(
+        digest(""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(parse(MINIMAL).unwrap().digest, digest(MINIMAL));
+}
+
+#[test]
 fn generated_example_is_valid_and_supported() {
     let c = parse(EXAMPLE).unwrap();
     assert_eq!(c.uplinks.len(), 3);

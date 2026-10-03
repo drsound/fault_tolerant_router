@@ -565,7 +565,7 @@ impl Daemon {
             version: 1,
             boot_id: self.boot_id.clone(),
             boottime_ms: now_ms(),
-            config_digest: String::new(),
+            config_digest: self.cfg.digest.clone(),
             structure: self.cfg.structural().into(),
             paths: self
                 .paths

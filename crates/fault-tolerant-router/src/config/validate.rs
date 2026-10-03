@@ -335,6 +335,7 @@ pub fn validate(text: &str, raw: raw::Config) -> Result<Config, Vec<Diagnostic>>
             api,
             metrics_listen,
             state_dir,
+            digest: String::new(),
         })
     } else {
         cx.diags.sort_by_key(|d| (d.line, d.key.clone()));

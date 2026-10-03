@@ -32,6 +32,8 @@ pub struct Config {
     pub api: Api,
     pub metrics_listen: Option<SocketAddr>,
     pub state_dir: PathBuf,
+    /// SHA-256 of the configuration text, in hexadecimal (IMPL-5, FR-API-2).
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,7 +327,18 @@ pub fn parse(text: &str) -> Result<Config, Vec<Diagnostic>> {
             message: e.message().trim_end().to_owned(),
         }]
     })?;
-    validate::validate(text, raw)
+    let mut config = validate::validate(text, raw)?;
+    config.digest = digest(text);
+    Ok(config)
+}
+
+/// SHA-256 of a text, in hexadecimal.
+pub fn digest(text: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// FR-CFG-1: the file starts with `version = 2`.

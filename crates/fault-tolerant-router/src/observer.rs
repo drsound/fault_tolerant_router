@@ -19,14 +19,40 @@ use crate::system::{Scope, System};
 
 const INTERRUPTED_RETRIES: usize = 5;
 
+/// A dump that takes longer is abandoned and retried on a new socket: an
+/// IPv6 table dump can restart over and over while routes are added (S3).
+pub const DUMP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const DEADLINE_RETRIES: usize = 3;
+
+/// One dump within the deadline, on `c` first and then on new sockets.
+async fn bounded(c: &Client, filter: &RouteNetlinkMessage) -> Result<Dump, KernelError> {
+    match tokio::time::timeout(DUMP_DEADLINE, c.dump(filter.clone())).await {
+        Ok(r) => return r,
+        Err(_) => tracing::warn!(
+            "a netlink dump exceeded {} s; retrying on a new socket",
+            DUMP_DEADLINE.as_secs()
+        ),
+    }
+    for _ in 0..DEADLINE_RETRIES {
+        let fresh = Client::new().map_err(KernelError::transport)?;
+        if let Ok(r) = tokio::time::timeout(DUMP_DEADLINE, fresh.dump(filter.clone())).await {
+            return r;
+        }
+    }
+    Err(KernelError::transport(format!(
+        "dump not completed within {} attempts",
+        DEADLINE_RETRIES + 1
+    )))
+}
+
 /// A dump, retried while the kernel flags it as interrupted.
 async fn dump(c: &Client, filter: RouteNetlinkMessage) -> Result<Dump, KernelError> {
-    let mut last = c.dump(filter.clone()).await?;
+    let mut last = bounded(c, &filter).await?;
     for _ in 0..INTERRUPTED_RETRIES {
         if !last.interrupted {
             break;
         }
-        last = c.dump(filter.clone()).await?;
+        last = bounded(c, &filter).await?;
     }
     Ok(last)
 }

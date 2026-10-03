@@ -29,6 +29,7 @@ netlink-proto = { version = "=0.13.0", default-features = false, features = ["to
 netlink-sys = { version = "=0.9.0", features = ["tokio_socket"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "process", "signal", "io-util"] }
 toml.workspace = true
