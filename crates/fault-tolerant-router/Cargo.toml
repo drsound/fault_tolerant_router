@@ -18,8 +18,16 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ipnet.workspace = true
+# Pre-1.0 netlink crates are pinned exactly (IMPL-2).
+netlink-packet-core = "=0.9.0"
+netlink-packet-route = "=0.33.0"
+netlink-proto = { version = "=0.13.0", default-features = false, features = ["tokio_socket"] }
+netlink-sys = { version = "=0.9.0", features = ["tokio_socket"] }
 serde.workspace = true
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "process", "signal", "io-util"] }
 toml.workspace = true
 
 [lints]

@@ -8,6 +8,7 @@ pub mod config;
 pub mod duration;
 pub mod health;
 pub mod model;
+pub mod netlink;
 pub mod nft;
 pub mod plan;
 pub mod select;
