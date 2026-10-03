@@ -32,17 +32,21 @@ Spike findings that remain to be covered, with the milestone where they belong. 
 | DHCPv6 server-unicast Renew to a global off-link server | S4 | M2, AS-44 |
 | systemd 253–256 not tested; compatibility matrix rows for them come from NEWS and the 257 source | S4 | M4 documentation (FR-COEX-1 matrix) |
 | Resolution of single nexthop objects and nexthop notifications; `netlink-packet-route` nexthop messages not yet validated | S3, S4 | M2, AS-49 |
-| Postrouting assignment only in the original direction (design amendment, not tested) | S2 | M1, AS-50 |
 | Simulated IPv6 multipath failure after the first insertion (kernel failure needs an allocation failure) | S1 | M1 (IPv4 part), M2, AS-36 |
 | Rejection checks by egress counters; ICMP errors of `unreachable` rules are rate-limited by host-wide sysctls (`net.ipv4.route.error_cost`, `error_burst`) that a namespace cannot change | S2, harness | M1, every rejection scenario (AS-14, AS-15, AS-16, AS-27) |
 | IPv6 client misses the first ICMPv6 error of a rejected connection (cause not established; lock-drop counter suggests the IPv4 cause) | S2 | M2 |
-| Multicast and broadcast skip (`meta pkttype`) exercised only indirectly | S2 | M1 |
-| Flowtable bypass behind FR-CT-2 known from documentation only | S2 | M1, AS-33 |
-| Whether interrupted route or rule dumps can silently skip entries (the design relies on reconciliation either way) | S3 | M1, observer tests |
 | Upstream contributions to offer, none blocking: `netlink-proto` reply matching by port id, extended-ack parsing in `netlink-packet-core`, `rtnetlink` `RuleAddRequest::replace()` documentation | S3 | any time |
-| Probe result tagging by path generation and cancellation (FR-PROBE-3); quality gates (FR-PROBE-5) barely exercised | S5 | M1 (generations), M3 (quality gates, AS-06, AS-39) |
 | IPv6 leak detection in the harness: no route realms for IPv6, so leaks are detected with egress counters and route lookups only | harness | M2 |
+| Software flowtables: S2 (t10) found that they keep pinning but leave offloaded packets without FTR's packet mark, and that a flowtable listing only downlinks also offloads one direction of uplink traffic; FR-CT-2 (refusal for uplinks) needs a decision | S2 | M1, AS-33 |
+| Deterministic observer tests for interrupted dumps (forced small batches, a change injected after the first batch), as proposed by S3 `dumpskip` | S3 | M1 |
+| Quality gates (FR-PROBE-5) barely exercised | S5 | M3, AS-06, AS-39 |
 | Harness scaffolding `route_lan_via` (rule priority 90, table 90) to remove once the daemon routes the LAN | harness | M1 |
-| Root `Cargo.toml` workspace to extend with the daemon crate | harness | M1 |
-| `LICENSE` is still the GPL-2.0 text of 1.x while the workspace declares MIT (DIST-2 replaces it on `v2`) | review of the repository | M1 or earlier |
-| nftables 1.1.3 is the newest version tested (latest available in Debian backports), not the newest upstream release | environments | M1 CI (the runner's nftables) |
+
+## Resolved at the start of M1
+
+- Postrouting assignment only in the original direction (AS-50): verified by S2 `t8` on both environments; without the condition, replies of connections arriving on unmanaged interfaces are pinned to the uplink they leave through and die with it.
+- Multicast and broadcast skips: exercised directly by S2 `t9`; non-unicast traffic arriving through tunnels has packet type `host` and subnet-directed broadcasts reach postrouting, so the generator now also skips them by destination address.
+- Interrupted dumps: S3 `dumpskip` shows that rule and route dumps can omit or repeat entries without `NLM_F_DUMP_INTR` on both kernels; the observer merges by identity and confirms absences before acting on them, and the reconciler treats `EEXIST`, `ENOENT` and `ESRCH` as the wanted state.
+- Probe results are tagged with the path generation; the daemon discards rounds of older generations and aborts a prober as soon as its path changes or stops being ready.
+- The root workspace contains the daemon crate `crates/fault-tolerant-router`; `LICENSE` is the MIT text.
+- The current-environment CI job builds the newest upstream nftables (1.1.7, `tests/ci/build-nftables.sh`); the generated ruleset also loads with 1.0.6 and 1.1.3.
