@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod discover;
 pub mod duration;
 pub mod health;
 pub mod model;
@@ -12,3 +13,4 @@ pub mod netlink;
 pub mod nft;
 pub mod plan;
 pub mod select;
+pub mod system;
