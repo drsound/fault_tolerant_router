@@ -87,6 +87,9 @@ struct Daemon {
     held_routes: BTreeSet<(Family, u32)>,
     /// The next pass is part of a full reconciliation: no repair is held.
     full_pass: bool,
+    /// A view was built from a dump still flagged as interrupted after its
+    /// retries: a full resynchronisation is due soon (§12.2).
+    resync_due: bool,
     /// Sysctls to apply before the next routes and rules (FR-REC-3), by
     /// interface (`None`: every setting); a failure is retried (FR-REC-5).
     sysctls_pending: BTreeSet<Option<String>>,
@@ -101,6 +104,11 @@ struct Daemon {
 }
 
 const RECEIVE_BUFFER: usize = 4 << 20;
+
+/// Delay of the full resynchronisation that follows a dump still flagged as
+/// interrupted after its retries; it also bounds how often a kernel that
+/// keeps interrupting dumps makes the daemon resynchronise.
+const RESYNC_AFTER_INTERRUPTED: Duration = Duration::from_secs(1);
 
 fn now_ms() -> u64 {
     state::boottime_ms().unwrap_or(0)
@@ -163,7 +171,7 @@ pub async fn run(opts: Options) -> Result<()> {
         ftr_tables: layout.tables(),
         discovery_tables: cfg.routing.discovery_tables.clone(),
     };
-    let system = observer::full(&dumper, &scope)
+    let observer::View { system, interrupted } = observer::full(&dumper, &scope)
         .await
         .map_err(|e| anyhow::anyhow!("initial dump: {e}"))?;
 
@@ -189,6 +197,7 @@ pub async fn run(opts: Options) -> Result<()> {
         client,
         dumper,
         system,
+        resync_due: interrupted,
         state_dir,
         manifest,
         paths: BTreeMap::new(),
@@ -254,7 +263,8 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     let client = Client::new().context("netlink socket")?;
     let system = observer::full(&client, &scope)
         .await
-        .map_err(|e| anyhow::anyhow!("dump: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("dump: {e}"))?
+        .system;
     let families: Vec<Family> = Family::ALL.into_iter().filter(|x| cfg.manages(*x)).collect();
     f.extend(checks::routing(&system, layout, cfg.routing.route_protocol, &families));
     f.extend(checks::downlinks(&system, cfg));
@@ -981,7 +991,10 @@ impl Daemon {
 
     async fn full_reconciliation(&mut self) {
         match observer::resync(&self.dumper, &self.scope, &self.system).await {
-            Ok(s) => self.system = s,
+            Ok(v) => {
+                self.system = v.system;
+                self.resync_due |= v.interrupted;
+            }
             Err(e) => warn!("full reconciliation dump failed: {e}"),
         }
         self.check_nft().await;
@@ -1086,6 +1099,10 @@ impl Daemon {
             if self.dirty {
                 self.dirty = false;
                 self.step().await;
+            }
+            if std::mem::take(&mut self.resync_due) {
+                info!("a netlink dump was still interrupted after its retries: full resynchronisation");
+                next_full = next_full.min(Instant::now() + RESYNC_AFTER_INTERRUPTED);
             }
             let wake = self.retry.as_ref().map(|r| r.at).unwrap_or(next_full).min(next_full);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);

@@ -52,7 +52,8 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
     };
     let mut system = observer::full(&client, &scope)
         .await
-        .map_err(|e| anyhow!("dump: {e}"))?;
+        .map_err(|e| anyhow!("dump: {e}"))?
+        .system;
     let empty = Desired::default();
     let ops = reconcile::diff(
         &system,

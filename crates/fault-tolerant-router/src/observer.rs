@@ -76,9 +76,21 @@ async fn dump<D: Dumper>(c: &D, filter: RouteNetlinkMessage) -> Result<Dump, Ker
     Ok(last)
 }
 
+/// A view built from dumps.
+#[derive(Debug)]
+pub struct View {
+    pub system: System,
+    /// A dump still flagged as interrupted after its retries was used: a
+    /// full resynchronisation is due (§12.2).
+    pub interrupted: bool,
+}
+
 /// The complete view: links, addresses, rules and routes of both families.
-pub async fn full<D: Dumper>(c: &D, scope: &Scope) -> Result<System, KernelError> {
-    let mut s = System::default();
+pub async fn full<D: Dumper>(c: &D, scope: &Scope) -> Result<View, KernelError> {
+    let mut v = View {
+        system: System::default(),
+        interrupted: false,
+    };
     let mut filters = vec![msg::link_dump()];
     for f in Family::ALL {
         filters.push(msg::address_dump(f));
@@ -86,17 +98,22 @@ pub async fn full<D: Dumper>(c: &D, scope: &Scope) -> Result<System, KernelError
         filters.push(msg::route_dump(f, None));
     }
     for filter in filters {
-        for m in dump(c, filter).await?.messages {
-            s.apply(scope, &m);
+        let d = dump(c, filter).await?;
+        v.interrupted |= d.interrupted;
+        for m in d.messages {
+            v.system.apply(scope, &m);
         }
     }
-    Ok(s)
+    Ok(v)
 }
 
 /// A full resynchronisation: a new full dump, with every route, rule and
 /// address of the old view that the dump lacks confirmed by a second read.
-pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<System, KernelError> {
-    let mut new = full(c, scope).await?;
+pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<View, KernelError> {
+    let View {
+        system: mut new,
+        mut interrupted,
+    } = full(c, scope).await?;
     let missing_tables: std::collections::BTreeSet<(Family, u32)> = old
         .routes
         .keys()
@@ -126,37 +143,44 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Sys
     let addresses_missing = old.addresses.keys().any(|k| !new.addresses.contains_key(k));
     if addresses_missing {
         for f in Family::ALL {
-            for m in dump(c, msg::address_dump(f)).await?.messages {
+            let d = dump(c, msg::address_dump(f)).await?;
+            interrupted |= d.interrupted;
+            for m in d.messages {
                 new.apply(scope, &m);
             }
         }
     }
-    Ok(new)
+    Ok(View {
+        system: new,
+        interrupted,
+    })
 }
 
 /// Re-reads tables after a link or address event of an uplink: the kernel
 /// removes IPv4 routes and changes nexthop flags without notification (S3).
-/// A route missing from the re-read is removed only when a second read
-/// agrees.
+/// A route of the view missing from the re-read is removed only when a
+/// second read also lacks it; a route either read saw stays, with the
+/// attributes of the later read.
 pub async fn reread<D: Dumper>(
     c: &D,
     scope: &Scope,
     system: &mut System,
     tables: &[(Family, u32)],
 ) -> Result<(), KernelError> {
-    for (f, t) in tables {
-        let first = dump(c, msg::route_dump(*f, Some(*t))).await?.messages;
-        let had = system.routes_in(*f, *t).count();
-        let got = first
-            .iter()
-            .filter(|m| matches!(m, RouteNetlinkMessage::NewRoute(_)))
-            .count();
-        let messages = if got < had {
-            dump(c, msg::route_dump(*f, Some(*t))).await?.messages
-        } else {
-            first
-        };
-        system.replace_table(scope, *f, *t, &messages);
+    for &(f, t) in tables {
+        let mut messages = dump(c, msg::route_dump(f, Some(t))).await?.messages;
+        // Identities, not counts: a dump can repeat one entry and omit
+        // another (S3).
+        let mut seen = System::default();
+        seen.replace_table(scope, f, t, &messages);
+        let missing = system
+            .routes
+            .keys()
+            .any(|k| k.0 == f && k.1 == t && !seen.routes.contains_key(k));
+        if missing {
+            messages.extend(dump(c, msg::route_dump(f, Some(t))).await?.messages);
+        }
+        system.replace_table(scope, f, t, &messages);
     }
     Ok(())
 }

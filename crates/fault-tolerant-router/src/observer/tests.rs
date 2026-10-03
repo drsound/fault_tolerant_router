@@ -181,7 +181,7 @@ fn faithful() -> Fake {
 }
 
 async fn baseline() -> System {
-    full(&faithful(), &scope()).await.unwrap()
+    full(&faithful(), &scope()).await.unwrap().system
 }
 
 const CONFIG: &str = r#"version = 2
@@ -226,7 +226,7 @@ async fn a_rule_omitted_by_one_dump_is_kept_after_confirmation() {
         }
         Some((v, false))
     });
-    let new = resync(&f, &scope(), &old).await.unwrap();
+    let new = resync(&f, &scope(), &old).await.unwrap().system;
     assert_eq!(new.rules.len(), 2);
     assert_eq!(f.calls(Kind::Rules(Family::V4)), 2, "one confirming dump");
 }
@@ -242,7 +242,7 @@ async fn a_rule_absent_from_both_dumps_is_gone() {
         }
         Some((v, false))
     });
-    let new = resync(&f, &scope(), &old).await.unwrap();
+    let new = resync(&f, &scope(), &old).await.unwrap().system;
     assert_eq!(new.rules.len(), 1);
 }
 
@@ -255,7 +255,7 @@ async fn repeated_entries_are_merged() {
         v.extend(again);
         Some((v, false))
     });
-    let s = full(&f, &scope()).await.unwrap();
+    let s = full(&f, &scope()).await.unwrap().system;
     assert_eq!(s.rules.len(), 2);
     assert_eq!(s.addresses.len(), 2);
     assert_eq!(s.routes.len(), 3);
@@ -276,7 +276,7 @@ async fn default_routes_missing_from_a_full_dump_keep_the_path_ready() {
         }
         Some((v, false))
     });
-    let new = resync(&f, &scope(), &old).await.unwrap();
+    let new = resync(&f, &scope(), &old).await.unwrap().system;
     assert_eq!(new.routes.len(), 3);
     assert_eq!(
         gateway(&new, 2),
@@ -301,7 +301,7 @@ async fn an_address_omitted_without_a_flag_is_confirmed() {
         }
         Some((v, false))
     });
-    let new = resync(&f, &scope(), &old).await.unwrap();
+    let new = resync(&f, &scope(), &old).await.unwrap().system;
     assert_eq!(new.addresses.len(), 2);
 }
 
@@ -318,13 +318,15 @@ async fn flagged_dumps_are_retried_a_bounded_number_of_times() {
         }
         Some((v, flagged))
     });
-    let s = full(&f, &scope()).await.unwrap();
+    let s = full(&f, &scope()).await.unwrap().system;
     assert_eq!(s.addresses.len(), 2);
     assert_eq!(f.calls(Kind::Addresses(Family::V4)), 3);
-    // Always flagged: used after the bounded retries.
+    // Always flagged: used after the bounded retries, with a full
+    // resynchronisation due.
     let f = Fake::new(move |k, _| Some((answer(&w, k), k == Kind::Addresses(Family::V4))));
-    assert!(full(&f, &scope()).await.is_ok());
+    assert!(full(&f, &scope()).await.unwrap().interrupted);
     assert_eq!(f.calls(Kind::Addresses(Family::V4)), 1 + INTERRUPTED_RETRIES);
+    assert!(!full(&faithful(), &scope()).await.unwrap().interrupted);
 }
 
 #[tokio::test(start_paused = true)]
@@ -333,7 +335,7 @@ async fn a_dump_past_its_deadline_is_retried_on_a_new_socket() {
     // The first route dump never completes (an IPv6 node that keeps
     // restarting, S3); the retry answers.
     let f = Fake::new(move |k, n| (k != Kind::Routes(Family::V4, None) || n > 0).then(|| (answer(&w, k), false)));
-    let s = full(&f, &scope()).await.unwrap();
+    let s = full(&f, &scope()).await.unwrap().system;
     assert_eq!(s.routes.len(), 3);
     // A dump that never completes fails after the bounded attempts.
     let f = Fake::new(move |k, _| (k != Kind::Links).then(|| (Vec::new(), false)));
@@ -369,4 +371,34 @@ async fn a_reread_removes_a_route_only_when_two_reads_agree() {
     });
     reread(&f, &scope(), &mut s, &[(Family::V4, 254)]).await.unwrap();
     assert_eq!(s.routes_in(Family::V4, 254).count(), 1, "confirmed removal");
+}
+
+#[tokio::test]
+async fn a_reread_confirms_by_identity_and_merges_both_reads() {
+    let mut s = baseline().await;
+    let w = world();
+    // The first read repeats one route and omits another (as many messages
+    // as routes); the confirming read has them all.
+    let f = Fake::new(move |k, n| {
+        let mut v = answer(&w, k);
+        if matches!(k, Kind::Routes(_, Some(254))) && n == 0 {
+            v[2] = v[0].clone();
+        }
+        Some((v, false))
+    });
+    reread(&f, &scope(), &mut s, &[(Family::V4, 254)]).await.unwrap();
+    assert_eq!(f.calls(Kind::Routes(Family::V4, Some(254))), 2, "confirmed");
+    assert_eq!(s.routes_in(Family::V4, 254).count(), 3);
+    // Each read omits a different route: both were seen, both stay.
+    let w = world();
+    let f = Fake::new(move |k, n| {
+        let mut v = answer(&w, k);
+        if matches!(k, Kind::Routes(_, Some(254))) {
+            v.remove(if n == 0 { 1 } else { 2 });
+        }
+        Some((v, false))
+    });
+    reread(&f, &scope(), &mut s, &[(Family::V4, 254)]).await.unwrap();
+    assert_eq!(s.routes_in(Family::V4, 254).count(), 3);
+    assert_eq!(gateway(&s, 2), Some("100.64.0.1".parse().unwrap()));
 }

@@ -86,7 +86,7 @@ async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pen
         discovery_tables: cfg.routing.discovery_tables.clone(),
     };
     let client = Client::new().unwrap();
-    let mut system = observer::full(&client, &scope).await.unwrap();
+    let mut system = observer::full(&client, &scope).await.unwrap().system;
     let discovered = discover::discover(cfg, &system, &BTreeMap::new(), cfg.routing.route_protocol);
     let mut input = Input::default();
     for (key, d) in &discovered {
