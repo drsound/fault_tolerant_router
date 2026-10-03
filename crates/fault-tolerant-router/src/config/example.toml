@@ -1,0 +1,99 @@
+version = 2
+
+# Fault Tolerant Router configuration. Every key and its default is described
+# in the configuration reference; durations are written like "5s" or "500ms".
+
+[routing]
+# What to do when no uplink passes its health checks: "ready" uses the best
+# priority group anyway, "keep" keeps the previous active set.
+all_down_policy = "ready"
+# Structural settings (they cannot change on reload):
+# table_base = 1000
+# rule_priority_base = 1000
+# route_protocol = 249
+# fwmark_mask = 0x00ff0000
+
+# Internal networks whose traffic is routed through the uplinks.
+[[downlink]]
+interface = "lan0"
+
+[[downlink]]
+interface = "dmz0"
+
+# Each uplink has a stable id (1-63) that must never be reused for another
+# uplink; lower priority numbers are preferred, weights split new connections.
+[[uplink]]
+id = 1
+name = "fiber"
+description = "Fiber 1 Gbps (provider A)"
+interface = "wan0"
+priority = 1
+weight = 10
+
+[uplink.ipv4]
+nat = "masquerade"
+
+# IPv6 paths are not supported yet by this development build.
+# [uplink.ipv6]
+# nat = "masquerade"
+
+[[uplink]]
+id = 2
+name = "fwa5g"
+description = "5G FWA (provider B, CGNAT)"
+interface = "wan1"
+priority = 1
+weight = 3
+
+[uplink.ipv4]
+nat = "masquerade"
+
+[[uplink]]
+id = 3
+name = "metered"
+description = "Metered LTE, last resort"
+interface = "ppp0"
+priority = 2
+
+[uplink.ipv4]
+nat = "masquerade"
+
+[health]
+interval = "5s"
+timeout = "1s"
+attempts = 2
+required_reachable = 2
+
+[health.ipv4]
+targets = ["icmp:1.1.1.1", "icmp:8.8.8.8", "icmp:9.9.9.9", "icmp:208.67.222.222"]
+
+# [health.ipv6]
+# targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:fe::fe"]
+
+# Policies, notifications and metrics are not supported yet by this
+# development build.
+#
+# [[policy]]
+# name = "smtp-via-fiber"
+# family = "ipv4"
+# source = "192.168.1.25/32"
+# protocol = "tcp"
+# destination_port = 25
+# uplink = "fiber"
+# fallback = "block"
+#
+# [notify.email]
+# from = "router@example.com"
+# to = ["admin@example.com"]
+# host = "smtp.example.com"
+# port = 587
+# security = "starttls"
+# username = "router@example.com"
+# password_file = "/etc/fault-tolerant-router/smtp-password"
+#
+# [[notify.hook]]
+# command = ["/usr/local/bin/ftr-to-ntfy"]
+# events = ["path_state_changed", "active_set_changed"]
+#
+# [metrics]
+# listen = "127.0.0.1:9750"

@@ -1,0 +1,27 @@
+version = 2
+[firewall]
+nat_priority = 110
+[[downlink]]
+interface = "lan"
+[[downlink]]
+interface = "dnat"
+[[uplink]]
+id = 1
+name = "a"
+interface = "wana"
+priority = 1
+[uplink.ipv4]
+[[uplink]]
+id = 3
+name = "c"
+interface = "ppp0"
+[uplink.ipv4]
+source = "203.0.113.10"
+nat = "snat"
+[[uplink]]
+id = 2
+name = "b"
+interface = "wanb"
+priority = 1
+[uplink.ipv4]
+nat = "none"

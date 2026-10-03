@@ -1,0 +1,26 @@
+[package]
+name = "fault-tolerant-router"
+description = "Multi-uplink policy routing daemon for Linux routers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "fault_tolerant_router"
+
+[[bin]]
+name = "fault-tolerant-router"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

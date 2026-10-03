@@ -1,0 +1,13 @@
+//! Fault Tolerant Router 2.0: a multi-uplink policy routing daemon for Linux
+//! routers. The behaviour is specified in SPEC.md; requirement identifiers
+//! (for example FR-ROUTE-3) in comments refer to it.
+
+#![forbid(unsafe_code)]
+
+pub mod config;
+pub mod duration;
+pub mod health;
+pub mod model;
+pub mod nft;
+pub mod plan;
+pub mod select;
