@@ -566,6 +566,26 @@ fn foreign_objects(t: &Topology) -> Result<String> {
     Ok(format!("{}\n{tables}", rules.join("\n")))
 }
 
+/// An `nft` wrapper for `firewall.nft_path` whose invocations containing one
+/// of `failing` (for example `list flowtables`) fail while the returned flag
+/// file exists.
+fn nft_wrapper(t: &Topology, f: &ftr::Ftr, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
+    let nft = t.router().sh("command -v nft")?.trim().to_owned();
+    let flag = f.dir.join("nft-fails");
+    let wrapper = t.exec_dir()?.join("nft");
+    let patterns: Vec<String> = failing.iter().map(|p| format!("*\" {p} \"*")).collect();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in {}) echo 'injected nft failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
+            patterns.join("|"),
+            flag = flag.display()
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    Ok((wrapper, flag))
+}
+
 /// AS-33, systemd-networkd (FR-COEX-1): a networkd in the router's namespace
 /// with foreign-rule or foreign-route management enabled (both default to
 /// yes) makes online `check-config` fail and startup be refused, naming each
@@ -677,19 +697,7 @@ fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
         )
     };
     let mut f = t.prepare_ftr(&only_a(""))?;
-    // An nft wrapper whose ruleset and flowtable listings fail while a flag
-    // file exists.
-    let nft = r.sh("command -v nft")?.trim().to_owned();
-    let flag = f.dir.join("fail-inspection");
-    let wrapper = t.exec_dir()?.join("nft");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in *\" list ruleset \"*|*\" list flowtables \"*) echo 'injected inspection failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
-            flag = flag.display()
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["list ruleset", "list flowtables"])?;
     let managed = only_a(&format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display()));
     f.write_config(&managed)?;
     f.start(&t)?;
@@ -1849,6 +1857,41 @@ fn as47_startup_with_existing_artifacts() -> Result<()> {
     f.wait_installed(&t)?;
     std::thread::sleep(Duration::from_secs(1));
     assert!(!f.log().contains("external_ruleset_missing"), "{}", f.log());
+    Ok(())
+}
+
+/// AS-47, an uplink added while FTR was stopped: at the warm restart, its
+/// assignments are not in the adopted table yet, so it joins the balancing
+/// route only after the replacement installs them, also while that
+/// replacement fails (FR-REC-8, FR-REC-3).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as47_warm_restart_adding_an_uplink() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
+    let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
+    f.write_config(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", &firewall))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    f.stop()?;
+    f.write_config(&ftr::ipv4_config(&abc(), &HealthSpec::fast(), "", &firewall))?;
+    std::fs::write(&flag, "")?;
+    f.start(&t)?;
+    f.wait_log(&t, "apply_failed", 1, Duration::from_secs(15))?;
+    for _ in 0..3 {
+        assert_eq!(
+            balancing_members(&t)?,
+            ["wana", "wanb"],
+            "C stays out while its assignments are missing"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::fs::remove_file(&flag)?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(70))?;
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(10))?;
+    f.stop()?;
     Ok(())
 }
 

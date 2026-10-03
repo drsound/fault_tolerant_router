@@ -34,6 +34,10 @@ pub struct Spec {
     pub path: PathKey,
     pub generation: u64,
     pub interface: String,
+    /// The interface's index when the prober starts: an interface recreated
+    /// under the same name is a new generation (FR-PROBE-3), since sockets
+    /// bound to the old one never see the new one.
+    pub ifindex: u32,
     pub source: IpAddr,
     /// Encoded probe value of the uplink (FR-MARK-2, FR-MARK-3).
     pub mark: u32,

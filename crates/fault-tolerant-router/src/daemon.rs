@@ -50,7 +50,14 @@ struct PathRuntime {
 struct Retry {
     at: Instant,
     backoff: Duration,
+    /// What failed: the pending sysctls, or the operations of the pass.
+    /// Only the same attempt waits for the backoff; a newer desired state
+    /// supersedes it at once (FR-REC-5).
+    attempt: String,
 }
+
+/// The attempt of a failed sysctl application.
+const SYSCTL_ATTEMPT: &str = "sysctls";
 
 /// FR-COEX-4 bookkeeping for one kind of artifact.
 #[derive(Default)]
@@ -77,6 +84,12 @@ struct Daemon {
     nft_applied: Option<(String, BTreeSet<UplinkId>)>,
     nft_listing: Option<serde_json::Value>,
     nft_missing: bool,
+    /// Configured uplinks that FTR's table found at startup already assigns
+    /// (warm adoption, FR-REC-8); `None` without such a table. The others
+    /// were added while FTR was stopped: like an addition by reload, they
+    /// join the balancing and policy routes only after the replacement
+    /// installs their assignments (FR-REC-3).
+    nft_adopted: Option<BTreeSet<UplinkId>>,
     retry: Option<Retry>,
     degraded: BTreeSet<&'static str>,
     ownership: BTreeMap<&'static str, Ownership>,
@@ -121,10 +134,10 @@ pub async fn run(opts: Options) -> Result<()> {
     if !unsupported.is_empty() {
         bail!("not supported by this development build: {}", unsupported.join(", "));
     }
+    // FR-CFG-5: nothing configured runs before its ownership is verified.
+    report(&checks::trusted(&opts.config, &cfg))?;
     let mut findings = checks::kernel(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
-    findings.extend(checks::ownership(&opts.config, "configuration"));
     if cfg.firewall.mode == FirewallMode::Managed {
-        findings.extend(checks::ownership(&cfg.firewall.nft_path, "firewall.nft_path"));
         let v = nftctl::run(&cfg.firewall.nft_path, &["--version"], None)
             .await
             .unwrap_or_default();
@@ -147,7 +160,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.reset_state && !opts.dry_run {
         state_dir.reset().context("--reset-state")?;
     }
-    let manifest = match state_dir.manifest().context("manifest")? {
+    let (manifest, without_manifest) = match state_dir.manifest().context("manifest")? {
         Some(m) => {
             let conflicts = m.check(&cfg);
             if !conflicts.is_empty() {
@@ -156,9 +169,9 @@ pub async fn run(opts: Options) -> Result<()> {
                     conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
                 );
             }
-            m
+            (m, false)
         }
-        None => Manifest::new(&cfg),
+        None => (Manifest::new(&cfg), true),
     };
 
     // Subscribe before the first dump; notifications received meanwhile
@@ -177,6 +190,9 @@ pub async fn run(opts: Options) -> Result<()> {
 
     let families: Vec<Family> = Family::ALL.into_iter().filter(|f| cfg.manages(*f)).collect();
     let mut findings = checks::routing(&system, layout, cfg.routing.route_protocol, &families);
+    if without_manifest {
+        findings.extend(checks::adoptable(&system, layout, cfg.routing.route_protocol));
+    }
     findings.extend(checks::downlinks(&system, &cfg));
     if checks::networkd_running() {
         findings.extend(checks::networkd(Path::new("/")));
@@ -207,6 +223,7 @@ pub async fn run(opts: Options) -> Result<()> {
         nft_applied: None,
         nft_listing: None,
         nft_missing: false,
+        nft_adopted: None,
         retry: None,
         degraded: BTreeSet::new(),
         ownership: BTreeMap::new(),
@@ -231,6 +248,20 @@ pub async fn run(opts: Options) -> Result<()> {
         .context("writing the manifest")?;
     d.apply_sysctls(None).context("sysctls")?;
     d.load_drain_and_checkpoint();
+    if d.cfg.firewall.mode == FirewallMode::Managed
+        && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
+    {
+        // An uplink's interface name appears in the rules of its assignments.
+        let text = listing.to_string();
+        d.nft_adopted = Some(
+            d.cfg
+                .uplinks
+                .iter()
+                .filter(|u| serde_json::to_string(&u.interface).is_ok_and(|name| text.contains(&name)))
+                .map(|u| u.id)
+                .collect(),
+        );
+    }
     d.check_nft().await;
     info!(
         uplinks = d.cfg.uplinks.len(),
@@ -246,10 +277,15 @@ pub async fn run(opts: Options) -> Result<()> {
 
 /// The system checks of `check-config` without `--offline` (§9).
 pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings> {
-    let mut f = checks::kernel(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
-    f.extend(checks::ownership(path, "configuration"));
+    // FR-CFG-5: nothing configured runs before its ownership is verified.
+    let mut f = checks::trusted(path, cfg);
+    if !f.errors.is_empty() {
+        return Ok(f);
+    }
+    f.extend(checks::kernel(
+        &std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default(),
+    ));
     if cfg.firewall.mode == FirewallMode::Managed {
-        f.extend(checks::ownership(&cfg.firewall.nft_path, "firewall.nft_path"));
         let v = nftctl::run(&cfg.firewall.nft_path, &["--version"], None)
             .await
             .unwrap_or_default();
@@ -759,6 +795,7 @@ impl Daemon {
                 path: *key,
                 generation: 0,
                 interface: u.interface.clone(),
+                ifindex: r.ifindex,
                 source: r.source,
                 mark: mask.encode(FieldValue::probe(key.uplink)),
                 targets: u.health.targets(key.family).to_vec(),
@@ -824,15 +861,23 @@ impl Daemon {
 
     /// One reconciliation pass.
     async fn step(&mut self) {
-        if let Some(r) = &self.retry
-            && Instant::now() < r.at
-        {
-            return;
-        }
+        // A failed attempt waits for its backoff; evaluation does not.
+        let waiting = self
+            .retry
+            .as_ref()
+            .filter(|r| Instant::now() < r.at)
+            .map(|r| r.attempt.clone());
         // FR-REC-3: sysctls before the routes and rules that rely on them.
-        if let Err(f) = self.apply_pending_sysctls() {
-            self.failed(f);
-            return;
+        if !self.sysctls_pending.is_empty() {
+            if waiting.as_deref() == Some(SYSCTL_ATTEMPT) {
+                self.evaluate();
+                return;
+            }
+            if let Err(f) = self.apply_pending_sysctls() {
+                self.failed(f, SYSCTL_ATTEMPT.to_owned());
+                self.evaluate();
+                return;
+            }
         }
         if !self.reread.is_empty() {
             let tables: Vec<_> = std::mem::take(&mut self.reread).into_iter().collect();
@@ -846,8 +891,9 @@ impl Daemon {
         let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
         let nft_pending =
             managed && (self.nft_missing || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
-        let new_uplinks: BTreeSet<UplinkId> = match (&self.nft_applied, managed) {
-            (Some((_, applied)), true) => configured.difference(applied).copied().collect(),
+        let new_uplinks: BTreeSet<UplinkId> = match (&self.nft_applied, &self.nft_adopted, managed) {
+            (Some((_, applied)), _, true) => configured.difference(applied).copied().collect(),
+            (None, Some(adopted), true) => configured.difference(adopted).copied().collect(),
             _ => BTreeSet::new(),
         };
         let desired = self.desired(&input, &BTreeSet::new());
@@ -887,11 +933,16 @@ impl Daemon {
                 "repairs held until the next full reconciliation (FR-COEX-4)"
             );
         }
+        let attempt = format!("{ops:?}");
+        if waiting.as_ref() == Some(&attempt) {
+            self.full_pass |= full;
+            return;
+        }
         if ops.is_empty() {
             // Routing and nftables no longer hold a departed family's
             // artifacts: its settings go back last (FR-REC-9 step 4).
             if let Err(f) = self.hand_back_families() {
-                self.failed(f);
+                self.failed(f, attempt);
                 return;
             }
             self.applied();
@@ -922,7 +973,7 @@ impl Daemon {
                 // and paths whose routes failed are reconsidered.
                 self.dirty = true;
             }
-            Err(f) => self.failed(f),
+            Err(f) => self.failed(f, attempt),
         }
     }
 
@@ -966,7 +1017,7 @@ impl Daemon {
     }
 
     /// FR-REC-5: report, count, retry with exponential backoff (1 s to 60 s).
-    fn failed(&mut self, f: Failure) {
+    fn failed(&mut self, f: Failure, attempt: String) {
         error!(operation = %f.op, "apply_failed: {}", f.error);
         self.degrade("apply_failed");
         if let Some((family, table)) = f.route
@@ -978,13 +1029,15 @@ impl Daemon {
             // FR-DISC-7: the path is not ready until discovery changes.
             self.route_failed.insert(*key, f.error.clone());
         }
-        let backoff = self
-            .retry
-            .as_ref()
-            .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
+        // The backoff grows while the same attempt keeps failing.
+        let backoff = match &self.retry {
+            Some(r) if r.attempt == attempt => (r.backoff * 2).min(Duration::from_secs(60)),
+            _ => Duration::from_secs(1),
+        };
         self.retry = Some(Retry {
             at: Instant::now() + backoff,
             backoff,
+            attempt,
         });
         self.dirty = true;
     }
@@ -1034,6 +1087,19 @@ impl Daemon {
         }
         if new.structural() != self.cfg.structural() {
             error!("reload_failed: structural settings cannot change on reload (FR-CFG-4)");
+            return;
+        }
+        // The state directory holds the bindings and the sysctl baselines.
+        if new.state_dir != self.cfg.state_dir {
+            error!("reload_failed: state_dir cannot change on reload; stop, move the state directory, then start");
+            return;
+        }
+        // FR-CFG-5: nothing configured runs before its ownership is verified.
+        let trust = checks::trusted(path, &new);
+        if !trust.errors.is_empty() {
+            for e in trust.errors {
+                error!("reload_failed: {e}");
+            }
             return;
         }
         // FR-CT-2: inspect against the running configuration, and refuse a

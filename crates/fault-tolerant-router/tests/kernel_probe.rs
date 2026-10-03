@@ -74,6 +74,7 @@ fn spec(family: Family, targets: &[&str], run_to_completion: bool) -> Spec {
         path: PathKey { uplink: id, family },
         generation: 7,
         interface: "p0".into(),
+        ifindex: 0,
         source,
         mark: FwMask::DEFAULT.encode(FieldValue::probe(id)),
         targets: targets

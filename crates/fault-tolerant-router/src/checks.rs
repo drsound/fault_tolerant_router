@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::model::{Family, UplinkId};
 use crate::netlink::msg::{ObservedAction, TABLE_MAIN};
 use crate::nftctl;
-use crate::plan::Layout;
+use crate::plan::{Layout, RuleKind};
 use crate::system::System;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,6 +68,14 @@ pub fn nftables(version_output: &str) -> Findings {
     f
 }
 
+/// FR-CFG-5 for the configuration file and `firewall.nft_path`, which FTR
+/// runs as root: checked before anything configured runs.
+pub fn trusted(config_path: &Path, config: &Config) -> Findings {
+    let mut f = ownership(config_path, "configuration");
+    f.extend(ownership(&config.firewall.nft_path, "firewall.nft_path"));
+    f
+}
+
 /// FR-CFG-5 and `firewall.nft_path`: owned by root, not writable by group or
 /// others, for the file and every parent directory.
 pub fn ownership(path: &Path, what: &str) -> Findings {
@@ -86,6 +95,40 @@ pub fn ownership(path: &Path, what: &str) -> Findings {
             Err(e) => f.errors.push(format!("{what}: {}: {e}", cur.display())),
         }
         p = cur.parent().filter(|x| !x.as_os_str().is_empty());
+    }
+    f
+}
+
+/// IMPL-6 without a manifest: FTR-tagged rules in the configured range are
+/// adopted only if this configuration's layout produces them (same marks,
+/// masks and tables); a different `fwmark_mask` or `table_base` installed
+/// them otherwise.
+pub fn adoptable(system: &System, layout: Layout, protocol: u8) -> Findings {
+    let mut f = Findings::default();
+    let ids: Vec<UplinkId> = (1..=63).filter_map(UplinkId::new).collect();
+    for family in Family::ALL {
+        let planned = layout.static_rules(family, &ids);
+        for r in system
+            .rules
+            .iter()
+            .filter(|r| r.family == family && r.protocol == protocol && layout.priorities().contains(&r.priority))
+        {
+            let consistent = match (r.source, crate::reconcile::classify(layout, r.priority)) {
+                (Some((a, _)), Some(RuleKind::SourceLookup(id))) => {
+                    r.is(&layout.source_rules(family, id, a)[0], protocol)
+                }
+                (Some((a, _)), Some(RuleKind::SourceGuard)) => {
+                    r.is(&layout.source_rules(family, ids[0], a)[1], protocol)
+                }
+                _ => planned.iter().any(|p| r.is(p, protocol)),
+            };
+            if !consistent {
+                f.errors.push(format!(
+                    "{family}: FTR's rule at priority {} does not match this configuration (another fwmark_mask or table_base installed it?) and there is no manifest to clean it up with: run `cleanup` with this configuration, then start (IMPL-6)",
+                    r.priority
+                ));
+            }
+        }
     }
     f
 }
@@ -327,6 +370,42 @@ pub fn networkd_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adoption_without_a_manifest_needs_the_same_layout() {
+        use netlink_packet_route::RouteNetlinkMessage;
+
+        let layout = Layout {
+            table_base: 1000,
+            priority_base: 1000,
+            mask: crate::model::FwMask::DEFAULT,
+        };
+        let id = UplinkId::new(2).unwrap();
+        let mut rules = layout.static_rules(Family::V4, &[id]);
+        rules.extend(layout.source_rules(Family::V4, id, "192.0.2.2".parse().unwrap()));
+        let scope = crate::system::Scope {
+            ftr_tables: layout.tables(),
+            discovery_tables: Vec::new(),
+        };
+        let mut s = System::default();
+        for r in &rules {
+            s.apply(
+                &scope,
+                &RouteNetlinkMessage::NewRule(crate::netlink::msg::rule_message(r, 249)),
+            );
+        }
+        assert!(adoptable(&s, layout, 249).errors.is_empty());
+        let other_mask = Layout {
+            mask: crate::model::FwMask::new(0xff).unwrap(),
+            ..layout
+        };
+        assert!(!adoptable(&s, other_mask, 249).errors.is_empty());
+        let other_tables = Layout {
+            table_base: 2000,
+            ..layout
+        };
+        assert!(!adoptable(&s, other_tables, 249).errors.is_empty());
+    }
 
     #[test]
     fn versions() {
