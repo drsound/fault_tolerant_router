@@ -1,0 +1,259 @@
+kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5), ip utility, iproute2-6.1.0, libbpf 1.1.2
+  listener: LISTEN 0      10     0.0.0.0:443 0.0.0.0:*
+  listener: LISTEN 0      10        [::]:443    [::]:*
+
+=== IPv4 T1: ICMP probes of path 1; balancing table empty; competing main default and main routes covering targets; foreign ping on the same path
+PASS socket options set before the first packet
+PASS both rounds pass
+PASS foreign echo replies ignored
+PASS echo requests on uplink 1 (6 probes + 6 foreign pings) (12)
+PASS echo requests on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+PASS echo request frames captured on up1 (12)
+PASS echo request frames not addressed to the uplink 1 gateway MAC (0)
+  capture: 11:35:59.360419 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 98: 192.0.2.2 > 1.1.1.1: ICMP echo request, id 38109, seq 1, length 64
+  capture: 11:35:59.361623 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 58: 192.0.2.2 > 1.1.1.1: ICMP echo request, id 9920, seq 48514, length 24
+  capture: 11:35:59.361651 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 58: 192.0.2.2 > 8.8.8.8: ICMP echo request, id 9920, seq 48515, length 24
+
+=== IPv4 T2: balancing table holds only path 2; probes of path 1 and of path 2
+PASS path 1 round passes
+PASS path 1 probes on uplink 1 (3)
+PASS path 1 probes on uplink 2 (0)
+PASS path 2 round passes
+PASS path 2 probes on uplink 2 (3)
+PASS path 2 probes on uplink 1 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv4 T3: TCP probes of path 1: open port, closed port (RST), blackholed target
+PASS SYN-ACK counts as a reply
+PASS RST counts as a reply
+PASS blackholed target lost on attempt 2
+PASS round passes with 2 of 3
+PASS SYNs on uplink 1 within 4..6 (got 4) (1)
+PASS SYNs on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv4 T4: reply validation with forged replies (kernel replies of the target dropped upstream)
+  forge: first request seq=23714: wrong token, wrong source, bad checksum, late reply in 1.3 s
+  forge: second request seq=23715: correct reply in 0.8 s
+PASS wrong token rejected
+PASS wrong source rejected
+PASS bad checksum rejected in user space
+PASS attempt 1 lost despite forged replies
+PASS reply after the deadline ignored as late
+PASS attempt 2 accepted
+
+=== IPv4 T5: early end of a round and canceled attempts (echo replies of target 3 dropped upstream)
+PASS early end leaves the attempt of target 3 canceled
+PASS without early end, both attempts of target 3 are samples
+
+=== IPv4 T6: reverse-path filtering of probe replies (rp_filter=2, src_valid_mark=1 on uplinks) without source rules
+PASS target 1 (no covering route) lost without source rules
+PASS target 2 (covered by a main route) still replies
+PASS TCP SYN-ACK of target 1 dropped as well
+PASS replies dropped by reverse-path filtering (3)
+PASS with a non-empty balancing table, loose mode accepts target 1 again
+PASS with source rules every reply is accepted
+
+=== IPv4 T7: termination of device-bound probes: path table empty (not ready), unconfigured probe value
+  [v4, path table empty, no proxy ARP upstream] icmp target=1.1.1.1 attempt=1 seq=43033 result=lost 
+  [v4, path table empty, no proxy ARP upstream] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 1
+  capture: 11:36:09.906153 0a:ea:72:40:fc:7a > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 1.1.1.1 tell 192.0.2.2, length 28
+  capture: 11:36:10.912752 0a:ea:72:40:fc:7a > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 1.1.1.1 tell 192.0.2.2, length 28
+PASS [v4, path table empty, no proxy ARP upstream] outcome
+PASS [v4, path table empty, no proxy ARP upstream] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+PASS [v4, path table empty] kernel treats the target as on-link and sends ARP on up1
+  [v4, path table empty, proxy ARP upstream] icmp target=1.1.1.1 attempt=1 seq=40462 result=lost 
+  [v4, path table empty, proxy ARP upstream] upstream received 1 echo request(s) on uplink 1; reverse-path drops: 2
+  capture: 11:36:11.897498 0a:ea:72:40:fc:7a > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 1.1.1.1 tell 192.0.2.2, length 28
+  capture: 11:36:11.897515 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype ARP (0x0806), length 42: Reply 1.1.1.1 is-at d2:c8:c3:3c:a8:db, length 28
+  capture: 11:36:11.897517 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 58: 192.0.2.2 > 1.1.1.1: ICMP echo request, id 53108, seq 40462, length 24
+  capture: 11:36:11.897542 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype IPv4 (0x0800), length 58: 1.1.1.1 > 192.0.2.2: ICMP echo reply, id 53108, seq 40462, length 24
+PASS [v4, path table empty, proxy ARP upstream] outcome
+PASS [v4, path table empty, proxy ARP upstream] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+PASS [v4, path table empty, proxy ARP] echo request leaves on up1 directly to the target
+  [v4, path table empty, without SO_BINDTODEVICE] icmp target=1.1.1.1 attempt=1 seq=64932 send_error="Network unreachable (os error 101)" icmp target=1.1.1.1 attempt=1 seq=64932 result=lost 
+  [v4, path table empty, without SO_BINDTODEVICE] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v4, path table empty, without SO_BINDTODEVICE] outcome
+PASS [v4, path table empty, without SO_BINDTODEVICE] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+  [v4, unconfigured probe value (id 5), proxy ARP upstream] icmp target=1.1.1.1 attempt=1 seq=48542 result=reply rtt_us=75 
+  [v4, unconfigured probe value (id 5), proxy ARP upstream] upstream received 1 echo request(s) on uplink 1; reverse-path drops: 0
+  capture: 11:36:15.879474 0a:ea:72:40:fc:7a > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806), length 42: Request who-has 1.1.1.1 tell 192.0.2.2, length 28
+  capture: 11:36:15.879489 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype ARP (0x0806), length 42: Reply 1.1.1.1 is-at d2:c8:c3:3c:a8:db, length 28
+  capture: 11:36:15.879491 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 58: 192.0.2.2 > 1.1.1.1: ICMP echo request, id 4067, seq 48542, length 24
+  capture: 11:36:15.879513 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype IPv4 (0x0800), length 58: 1.1.1.1 > 192.0.2.2: ICMP echo reply, id 4067, seq 48542, length 24
+PASS [v4, unconfigured probe value (id 5), proxy ARP upstream] outcome
+PASS [v4, unconfigured probe value (id 5), proxy ARP upstream] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+  [v4, unconfigured probe value (id 5), without SO_BINDTODEVICE] icmp target=1.1.1.1 attempt=1 seq=8088 send_error="Network unreachable (os error 101)" icmp target=1.1.1.1 attempt=1 seq=8088 result=lost 
+  [v4, unconfigured probe value (id 5), without SO_BINDTODEVICE] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v4, unconfigured probe value (id 5), without SO_BINDTODEVICE] outcome
+PASS [v4, unconfigured probe value (id 5), without SO_BINDTODEVICE] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv4 T8: unprivileged ICMP sockets (SOCK_DGRAM) for comparison
+PASS default ping_group_range of a new namespace refuses ping sockets, also to root
+  capture: 11:36:18.797050 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv4 (0x0800), length 58: 192.0.2.2 > 1.1.1.1: ICMP echo request, id 4660, seq 7, length 24
+  capture: 11:36:18.797063 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype IPv4 (0x0800), length 58: 1.1.1.1 > 192.0.2.2: ICMP echo reply, id 4660, seq 7, length 24
+PASS kernel replaced the identifier with the bound port on the wire
+PASS reply delivered with the bound identifier
+
+=== IPv6 T1: ICMP probes of path 1; balancing table empty; competing main default and main routes covering targets; foreign ping on the same path
+PASS socket options set before the first packet
+PASS both rounds pass
+PASS foreign echo replies ignored
+PASS echo requests on uplink 1 (6 probes + 6 foreign pings) (12)
+PASS echo requests on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+PASS echo request frames captured on up1 (12)
+PASS echo request frames not addressed to the uplink 1 gateway MAC (0)
+  capture: 11:36:19.705718 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv6 (0x86dd), length 118: 2001:db8:1::2 > 2606:4700:4700::1111: ICMP6, echo request, id 38808, seq 1, length 64
+  capture: 11:36:19.707062 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv6 (0x86dd), length 78: 2001:db8:1::2 > 2606:4700:4700::1111: ICMP6, echo request, id 53768, seq 47125, length 24
+  capture: 11:36:19.707094 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv6 (0x86dd), length 78: 2001:db8:1::2 > 2001:4860:4860::8888: ICMP6, echo request, id 53768, seq 47126, length 24
+
+=== IPv6 T2: balancing table holds only path 2; probes of path 1 and of path 2
+PASS path 1 round passes
+PASS path 1 probes on uplink 1 (3)
+PASS path 1 probes on uplink 2 (0)
+PASS path 2 round passes
+PASS path 2 probes on uplink 2 (3)
+PASS path 2 probes on uplink 1 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv6 T3: TCP probes of path 1: open port, closed port (RST), blackholed target
+PASS SYN-ACK counts as a reply
+PASS RST counts as a reply
+PASS blackholed target lost on attempt 2
+PASS round passes with 2 of 3
+PASS SYNs on uplink 1 within 4..6 (got 4) (1)
+PASS SYNs on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv6 T4: reply validation with forged replies (kernel replies of the target dropped upstream)
+  forge: first request seq=2746: wrong token, wrong source, bad checksum, late reply in 1.3 s
+  forge: second request seq=2747: correct reply in 0.8 s
+PASS wrong token rejected
+PASS wrong source rejected
+PASS bad checksum never delivered to the socket
+PASS kernel counted the ICMPv6 checksum error (1)
+PASS attempt 1 lost despite forged replies
+PASS reply after the deadline ignored as late
+PASS attempt 2 accepted
+
+=== IPv6 T5: early end of a round and canceled attempts (echo replies of target 3 dropped upstream)
+PASS early end leaves the attempt of target 3 canceled
+PASS without early end, both attempts of target 3 are samples
+
+=== IPv6 T6: reverse-path filtering of probe replies (rp_filter=2, src_valid_mark=1 on uplinks) without source rules
+PASS IPv6 has no rp_filter: all replies accepted
+PASS IPv6 TCP SYN-ACK accepted
+PASS with source rules every reply is accepted
+
+=== IPv6 T7: termination of device-bound probes: path table empty (not ready), unconfigured probe value
+  [v6, path table empty] icmp target=2606:4700:4700::1111 attempt=1 seq=31358 send_error="Network unreachable (os error 101)" icmp target=2606:4700:4700::1111 attempt=1 seq=31358 result=lost 
+  [v6, path table empty] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v6, path table empty] outcome
+PASS [v6, path table empty] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+  [v6, path table empty, without SO_BINDTODEVICE] icmp target=2606:4700:4700::1111 attempt=1 seq=7499 send_error="Network unreachable (os error 101)" icmp target=2606:4700:4700::1111 attempt=1 seq=7499 result=lost 
+  [v6, path table empty, without SO_BINDTODEVICE] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v6, path table empty, without SO_BINDTODEVICE] outcome
+PASS [v6, path table empty, without SO_BINDTODEVICE] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+  [v6, unconfigured probe value (id 5)] icmp target=2606:4700:4700::1111 attempt=1 seq=35331 send_error="Network unreachable (os error 101)" icmp target=2606:4700:4700::1111 attempt=1 seq=35331 result=lost 
+  [v6, unconfigured probe value (id 5)] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v6, unconfigured probe value (id 5)] outcome
+PASS [v6, unconfigured probe value (id 5)] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+  [v6, unconfigured probe value (id 5), without SO_BINDTODEVICE] icmp target=2606:4700:4700::1111 attempt=1 seq=52870 send_error="Network unreachable (os error 101)" icmp target=2606:4700:4700::1111 attempt=1 seq=52870 result=lost 
+  [v6, unconfigured probe value (id 5), without SO_BINDTODEVICE] upstream received 0 echo request(s) on uplink 1; reverse-path drops: 0
+PASS [v6, unconfigured probe value (id 5), without SO_BINDTODEVICE] outcome
+PASS [v6, unconfigured probe value (id 5), without SO_BINDTODEVICE] nothing on uplink 2 (0)
+PASS no packet on d1_v4 (0)
+PASS no packet on d1_v6 (0)
+PASS no packet on u1_v4_badsrc (0)
+PASS no packet on u1_v6_badsrc (0)
+PASS no packet on u2_v4_badsrc (0)
+PASS no packet on u2_v6_badsrc (0)
+
+=== IPv6 T8: unprivileged ICMP sockets (SOCK_DGRAM) for comparison
+PASS default ping_group_range of a new namespace refuses ping sockets, also to root
+  capture: 11:36:36.641634 0a:ea:72:40:fc:7a > d2:c8:c3:3c:a8:db, ethertype IPv6 (0x86dd), length 78: 2001:db8:1::2 > 2606:4700:4700::1111: ICMP6, echo request, id 4660, seq 7, length 24
+  capture: 11:36:36.641643 d2:c8:c3:3c:a8:db > 0a:ea:72:40:fc:7a, ethertype IPv6 (0x86dd), length 78: 2606:4700:4700::1111 > 2001:db8:1::2: ICMP6, echo reply, id 4660, seq 7, length 24
+PASS kernel replaced the identifier with the bound port on the wire
+PASS reply delivered with the bound identifier
+
+failures: 0

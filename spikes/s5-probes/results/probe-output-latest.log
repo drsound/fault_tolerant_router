@@ -1,0 +1,258 @@
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 3 --no-early --rounds 2 --interval-ms 1500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=19833 first_seq=65118
+icmp target=1.1.1.1 attempt=1 seq=65119 result=reply rtt_us=89
+icmp target=8.8.8.8 attempt=1 seq=65120 result=reply rtt_us=47
+icmp target=9.9.9.9 attempt=1 seq=65121 result=reply rtt_us=40
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+icmp ignored reason=foreign_id from=1.1.1.1 seq=2
+icmp ignored reason=foreign_id from=1.1.1.1 seq=3
+icmp ignored reason=foreign_id from=1.1.1.1 seq=4
+icmp ignored reason=foreign_id from=1.1.1.1 seq=5
+icmp ignored reason=foreign_id from=1.1.1.1 seq=6
+icmp target=1.1.1.1 attempt=1 seq=65122 result=reply rtt_us=117
+icmp target=8.8.8.8 attempt=1 seq=65123 result=reply rtt_us=61
+icmp target=9.9.9.9 attempt=1 seq=65124 result=reply rtt_us=53
+round=2 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=2 passed=2
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 3
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=52815 first_seq=10867
+icmp target=1.1.1.1 attempt=1 seq=10868 result=reply rtt_us=71
+icmp target=8.8.8.8 attempt=1 seq=10869 result=reply rtt_us=32
+icmp target=9.9.9.9 attempt=1 seq=10870 result=reply rtt_us=24
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up2 --src 198.51.100.2 --mark 0x00420000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 3
+socket kind=icmp-raw dev=up2 mark=0x00420000 local=198.51.100.2:1
+icmp path id=1115 first_seq=2764
+icmp target=1.1.1.1 attempt=1 seq=2765 result=reply rtt_us=125
+icmp target=8.8.8.8 attempt=1 seq=2766 result=reply rtt_us=32
+icmp target=9.9.9.9 attempt=1 seq=2767 result=reply rtt_us=23
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes tcp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1:443,8.8.8.8:444,9.9.9.9:443 --required 2 --timeout-ms 1000
+tcp target=1.1.1.1:443 attempt=1 result=reply kind=syn-ack rtt_us=172
+tcp target=8.8.8.8:444 attempt=1 result=reply kind=rst rtt_us=108
+tcp target=9.9.9.9:443 attempt=1 result=lost
+tcp target=9.9.9.9:443 attempt=2 result=lost
+round=1 reachable=2/3 required=2 result=pass duration_ms=2003
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1 --required 1 --attempts 2 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=9251 first_seq=10517
+icmp ignored reason=wrong_token from=1.1.1.1 seq=10518
+icmp ignored reason=wrong_source from=1.0.0.1 seq=10518
+icmp ignored reason=bad_checksum from=1.1.1.1 seq=
+icmp target=1.1.1.1 attempt=1 seq=10518 result=lost
+icmp ignored reason=late from=1.1.1.1 seq=10518
+icmp target=1.1.1.1 attempt=2 seq=10519 result=reply rtt_us=800705
+round=1 reachable=1/1 required=1 result=pass duration_ms=1802
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 2 --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=48179 first_seq=33068
+icmp target=1.1.1.1 attempt=1 seq=33069 result=reply rtt_us=64
+icmp target=8.8.8.8 attempt=1 seq=33070 result=reply rtt_us=29
+icmp target=9.9.9.9 attempt=1 seq=33071 result=canceled
+round=1 reachable=2/3 required=2 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 2 --timeout-ms 500 --no-early
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=17335 first_seq=63051
+icmp target=1.1.1.1 attempt=1 seq=63052 result=reply rtt_us=61
+icmp target=8.8.8.8 attempt=1 seq=63053 result=reply rtt_us=27
+icmp target=9.9.9.9 attempt=1 seq=63054 result=lost
+icmp target=9.9.9.9 attempt=2 seq=63055 result=lost
+round=1 reachable=2/3 required=2 result=pass duration_ms=1003
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 3 --no-early --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=21432 first_seq=10099
+icmp target=8.8.8.8 attempt=1 seq=10101 result=reply rtt_us=26
+icmp target=9.9.9.9 attempt=1 seq=10102 result=reply rtt_us=21
+icmp target=1.1.1.1 attempt=1 seq=10100 result=lost
+icmp target=1.1.1.1 attempt=2 seq=10103 result=lost
+round=1 reachable=2/3 required=3 result=fail duration_ms=1003
+summary rounds=1 passed=0
+$ s5-probes tcp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1:443 --required 1 --timeout-ms 500 --attempts 1
+tcp target=1.1.1.1:443 attempt=1 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=501
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1 --required 1 --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=9530 first_seq=16856
+icmp target=1.1.1.1 attempt=1 seq=16857 result=reply rtt_us=57
+round=1 reachable=1/1 required=1 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1,8.8.8.8,9.9.9.9 --required 3 --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=55888 first_seq=25799
+icmp target=1.1.1.1 attempt=1 seq=25800 result=reply rtt_us=87
+icmp target=8.8.8.8 attempt=1 seq=25801 result=reply rtt_us=64
+icmp target=9.9.9.9 attempt=1 seq=25802 result=reply rtt_us=69
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=43409 first_seq=53655
+icmp target=1.1.1.1 attempt=1 seq=53656 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --targets 1.1.1.1 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=192.0.2.2:1
+icmp path id=19335 first_seq=39436
+icmp target=1.1.1.1 attempt=1 seq=39437 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1002
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00410000 --no-device --targets 1.1.1.1 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev= mark=0x00410000 local=192.0.2.2:1
+icmp path id=44742 first_seq=17883
+icmp target=1.1.1.1 attempt=1 seq=17884 send_error="Network unreachable (os error 101)"
+icmp target=1.1.1.1 attempt=1 seq=17884 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00450000 --targets 1.1.1.1 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00450000 local=192.0.2.2:1
+icmp path id=8051 first_seq=41291
+icmp target=1.1.1.1 attempt=1 seq=41292 result=reply rtt_us=118
+round=1 reachable=1/1 required=1 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 192.0.2.2 --mark 0x00450000 --no-device --targets 1.1.1.1 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev= mark=0x00450000 local=192.0.2.2:1
+icmp path id=64240 first_seq=5338
+icmp target=1.1.1.1 attempt=1 seq=5339 send_error="Network unreachable (os error 101)"
+icmp target=1.1.1.1 attempt=1 seq=5339 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes dgram-check --src 192.0.2.2 --target 1.1.1.1 --dev up1
+dgram ping_group_range="1 0"
+dgram socket_error="Permission denied (os error 13)"
+$ s5-probes dgram-check --src 192.0.2.2 --target 1.1.1.1 --dev up1 --id 0x1234
+dgram ping_group_range="0 0"
+dgram sent requested_id=0xbeef bound_port=0x1234
+dgram reply from=1.1.1.1 type=0 id=0x1234 seq=7 token_ok=true
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 3 --no-early --rounds 2 --interval-ms 1500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=62934 first_seq=48736
+icmp target=2606:4700:4700::1111 attempt=1 seq=48737 result=reply rtt_us=91
+icmp target=2001:4860:4860::8888 attempt=1 seq=48738 result=reply rtt_us=41
+icmp target=2620:fe::fe attempt=1 seq=48739 result=reply rtt_us=29
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+icmp ignored reason=foreign_id from=2606:4700:4700::1111 seq=2
+icmp ignored reason=foreign_id from=2606:4700:4700::1111 seq=3
+icmp ignored reason=foreign_id from=2606:4700:4700::1111 seq=4
+icmp ignored reason=foreign_id from=2606:4700:4700::1111 seq=5
+icmp ignored reason=foreign_id from=2606:4700:4700::1111 seq=6
+icmp target=2606:4700:4700::1111 attempt=1 seq=48740 result=reply rtt_us=146
+icmp target=2001:4860:4860::8888 attempt=1 seq=48741 result=reply rtt_us=78
+icmp target=2620:fe::fe attempt=1 seq=48742 result=reply rtt_us=65
+round=2 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=2 passed=2
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 3
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=10554 first_seq=40105
+icmp target=2606:4700:4700::1111 attempt=1 seq=40106 result=reply rtt_us=85
+icmp target=2001:4860:4860::8888 attempt=1 seq=40107 result=reply rtt_us=35
+icmp target=2620:fe::fe attempt=1 seq=40108 result=reply rtt_us=28
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up2 --src 2001:db8:2::2 --mark 0x00420000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 3
+socket kind=icmp-raw dev=up2 mark=0x00420000 local=[2001:db8:2::2]:58
+icmp path id=16120 first_seq=65031
+icmp ignored reason=type_136 from=fe80::1 seq=
+icmp target=2606:4700:4700::1111 attempt=1 seq=65032 result=reply rtt_us=110
+icmp target=2001:4860:4860::8888 attempt=1 seq=65033 result=reply rtt_us=32
+icmp target=2620:fe::fe attempt=1 seq=65034 result=reply rtt_us=25
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes tcp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets [2606:4700:4700::1111]:443,[2001:4860:4860::8888]:444,[2620:fe::fe]:443 --required 2 --timeout-ms 1000
+tcp target=[2606:4700:4700::1111]:443 attempt=1 result=reply kind=syn-ack rtt_us=157
+tcp target=[2001:4860:4860::8888]:444 attempt=1 result=reply kind=rst rtt_us=94
+tcp target=[2620:fe::fe]:443 attempt=1 result=lost
+tcp target=[2620:fe::fe]:443 attempt=2 result=lost
+round=1 reachable=2/3 required=2 result=pass duration_ms=2002
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111 --required 1 --attempts 2 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=16458 first_seq=43414
+icmp ignored reason=wrong_token from=2606:4700:4700::1111 seq=43415
+icmp ignored reason=wrong_source from=2606:4700:4700::1001 seq=43415
+icmp ignored reason=type_135 from=fe80::1 seq=
+icmp target=2606:4700:4700::1111 attempt=1 seq=43415 result=lost
+icmp ignored reason=late from=2606:4700:4700::1111 seq=43415
+icmp target=2606:4700:4700::1111 attempt=2 seq=43416 result=reply rtt_us=800481
+round=1 reachable=1/1 required=1 result=pass duration_ms=1802
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 2 --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=26540 first_seq=22688
+icmp target=2606:4700:4700::1111 attempt=1 seq=22689 result=reply rtt_us=75
+icmp target=2001:4860:4860::8888 attempt=1 seq=22690 result=reply rtt_us=29
+icmp target=2620:fe::fe attempt=1 seq=22691 result=canceled
+round=1 reachable=2/3 required=2 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 2 --timeout-ms 500 --no-early
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=32666 first_seq=59821
+icmp target=2606:4700:4700::1111 attempt=1 seq=59822 result=reply rtt_us=64
+icmp target=2001:4860:4860::8888 attempt=1 seq=59823 result=reply rtt_us=29
+icmp target=2620:fe::fe attempt=1 seq=59824 result=lost
+icmp target=2620:fe::fe attempt=2 seq=59825 result=lost
+round=1 reachable=2/3 required=2 result=pass duration_ms=1003
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 3 --no-early --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=43944 first_seq=11386
+icmp target=2606:4700:4700::1111 attempt=1 seq=11387 result=reply rtt_us=68
+icmp target=2001:4860:4860::8888 attempt=1 seq=11388 result=reply rtt_us=62
+icmp target=2620:fe::fe attempt=1 seq=11389 result=reply rtt_us=206
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes tcp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets [2606:4700:4700::1111]:443 --required 1 --timeout-ms 500 --attempts 1
+tcp target=[2606:4700:4700::1111]:443 attempt=1 result=reply kind=syn-ack rtt_us=99
+round=1 reachable=1/1 required=1 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111,2001:4860:4860::8888,2620:fe::fe --required 3 --timeout-ms 500
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=22208 first_seq=49016
+icmp target=2606:4700:4700::1111 attempt=1 seq=49017 result=reply rtt_us=85
+icmp target=2001:4860:4860::8888 attempt=1 seq=49018 result=reply rtt_us=43
+icmp target=2620:fe::fe attempt=1 seq=49019 result=reply rtt_us=35
+round=1 reachable=3/3 required=3 result=pass duration_ms=0
+summary rounds=1 passed=1
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --targets 2606:4700:4700::1111 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=43663 first_seq=47262
+icmp target=2606:4700:4700::1111 attempt=1 seq=47263 send_error="Network unreachable (os error 101)"
+icmp target=2606:4700:4700::1111 attempt=1 seq=47263 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00410000 --no-device --targets 2606:4700:4700::1111 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev= mark=0x00410000 local=[2001:db8:1::2]:58
+icmp path id=46541 first_seq=45996
+icmp target=2606:4700:4700::1111 attempt=1 seq=45997 send_error="Network unreachable (os error 101)"
+icmp target=2606:4700:4700::1111 attempt=1 seq=45997 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00450000 --targets 2606:4700:4700::1111 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev=up1 mark=0x00450000 local=[2001:db8:1::2]:58
+icmp path id=30084 first_seq=10452
+icmp target=2606:4700:4700::1111 attempt=1 seq=10453 send_error="Network unreachable (os error 101)"
+icmp target=2606:4700:4700::1111 attempt=1 seq=10453 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes icmp --dev up1 --src 2001:db8:1::2 --mark 0x00450000 --no-device --targets 2606:4700:4700::1111 --required 1 --attempts 1 --timeout-ms 1000
+socket kind=icmp-raw dev= mark=0x00450000 local=[2001:db8:1::2]:58
+icmp path id=40193 first_seq=45738
+icmp target=2606:4700:4700::1111 attempt=1 seq=45739 send_error="Network unreachable (os error 101)"
+icmp target=2606:4700:4700::1111 attempt=1 seq=45739 result=lost
+round=1 reachable=0/1 required=1 result=fail duration_ms=1001
+summary rounds=1 passed=0
+$ s5-probes dgram-check --src 2001:db8:1::2 --target 2606:4700:4700::1111 --dev up1
+dgram ping_group_range="1 0"
+dgram socket_error="Permission denied (os error 13)"
+$ s5-probes dgram-check --src 2001:db8:1::2 --target 2606:4700:4700::1111 --dev up1 --id 0x1234
+dgram ping_group_range="0 0"
+dgram sent requested_id=0xbeef bound_port=0x1234
+dgram reply from=2606:4700:4700::1111 type=129 id=0x1234 seq=7 token_ok=true

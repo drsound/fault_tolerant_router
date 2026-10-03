@@ -1,0 +1,17 @@
+[package]
+name = "s3-netlink"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
+netlink-packet-core = "0.9"
+netlink-proto = "0.13"
+netlink-sys = { version = "0.9", features = ["tokio_socket"] }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[profile.release]
+opt-level = 1

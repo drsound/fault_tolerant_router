@@ -1,0 +1,19 @@
+[package]
+name = "s5-probes"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike S5: probe sockets with SO_BINDTODEVICE, SO_MARK and a bound source (throw-away)"
+license = "MIT"
+
+[dependencies]
+getrandom = "0.4.3"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53.2", features = ["rt", "net", "time", "macros"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,218 @@
+## 6.1.0-53-amd64, ip utility, iproute2-6.1.0, libbpf 1.1.2
+== rules
+PASS Inet: add 23 FR-ROUTE-3 rules with NLM_F_CREATE|NLM_F_EXCL
+PASS Inet: dump returns 23 rules tagged proto 249 (expected 23)
+INFO   1001: fwmark 0x410000/0xff0000 lookup 1001 suppress_prefixlength 4294967295 proto 249
+INFO   1002: fwmark 0x420000/0xff0000 lookup 1002 suppress_prefixlength 4294967295 proto 249
+INFO   1064: fwmark 0x400000/0xc00000 Unreachable (hdr table 0) suppress_prefixlength 4294967295 proto 249
+INFO   1501: from 192.0.2.2/32 fwmark 0x0/0xff0000 lookup 1001 suppress_prefixlength 4294967295 proto 249
+INFO   1502: from 198.51.100.2/32 fwmark 0x0/0xff0000 lookup 1002 suppress_prefixlength 4294967295 proto 249
+INFO Inet: zero-field selector dumped with FRA_FWMARK=false FRA_FWMASK=true
+INFO Inet: unreachable rule dumped with header table 0 FRA_TABLE Some(0)
+PASS Inet: duplicate rule with EXCL rejected: Some("errno 17 (File exists (os error 17)), no extack")
+INFO Inet: same rule, proto static, EXCL -> None
+INFO Inet: NLM_F_CREATE|NLM_F_REPLACE on an existing rule -> None, rules 23 -> 24
+PASS Inet: delete `from` rule by constructed key: None
+INFO Inet: delete again -> Some("errno 2 (No such file or directory (os error 2)), no extack")
+PASS Inet: delete one of six same-priority guards by mark/mask, 5 left
+PASS Inet: deleted 21 rules from their dumps, 0 left
+PASS Inet6: add 23 FR-ROUTE-3 rules with NLM_F_CREATE|NLM_F_EXCL
+PASS Inet6: dump returns 23 rules tagged proto 249 (expected 23)
+INFO   1001: fwmark 0x410000/0xff0000 lookup 1001 suppress_prefixlength 4294967295 proto 249
+INFO   1002: fwmark 0x420000/0xff0000 lookup 1002 suppress_prefixlength 4294967295 proto 249
+INFO   1064: fwmark 0x400000/0xc00000 Unreachable (hdr table 0) suppress_prefixlength 4294967295 proto 249
+INFO   1501: from 2001:db8:1::2/128 fwmark 0x0/0xff0000 lookup 1001 suppress_prefixlength 4294967295 proto 249
+INFO   1502: from 2001:db8:2::2/128 fwmark 0x0/0xff0000 lookup 1002 suppress_prefixlength 4294967295 proto 249
+INFO Inet6: zero-field selector dumped with FRA_FWMARK=false FRA_FWMASK=true
+INFO Inet6: unreachable rule dumped with header table 0 FRA_TABLE Some(0)
+PASS Inet6: duplicate rule with EXCL rejected: Some("errno 17 (File exists (os error 17)), no extack")
+INFO Inet6: same rule, proto static, EXCL -> None
+INFO Inet6: NLM_F_CREATE|NLM_F_REPLACE on an existing rule -> None, rules 23 -> 24
+PASS Inet6: delete `from` rule by constructed key: None
+INFO Inet6: delete again -> Some("errno 2 (No such file or directory (os error 2)), no extack")
+PASS Inet6: delete one of six same-priority guards by mark/mask, 5 left
+PASS Inet6: deleted 21 rules from their dumps, 0 left
+== routes
+PASS v4 multipath (2 gateways + device-only ptp member) in table 1000 with CREATE|REPLACE: None
+PASS v4 dump of table 1000: 1 route(s), 3 hops
+INFO   table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 10 flags RouteNextHopFlags(0x0)] [nexthop via 198.51.100.1 oif 7 weight 3 flags RouteNextHopFlags(0x0)] [nexthop via - oif 8 weight 1 flags RouteNextHopFlags(0x0)]
+PASS v4 replace multipath -> single nexthop: 1 route(s) Some("table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via 198.51.100.1 oif 7")
+PASS v4 replace single -> multipath weights 1/256: Some("table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 198.51.100.1 oif 7 weight 256 flags RouteNextHopFlags(0x0)]")
+PASS v4 path routes `via gw dev d1 src` and `dev p0 src`: None None
+INFO v4 off-subnet gateway without onlink -> Some("errno 101 (Network unreachable (os error 101)), extack \"Nexthop has invalid gateway\"")
+PASS v4 off-subnet gateway with onlink: Some("table 1002 proto 249 type Unicast flags RouteFlags(Onlink) metric 100 via 10.99.0.1 oif 6")
+PASS v4 multipath with an onlink member: Some("table 1066 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 10.99.0.1 oif 6 weight 1 flags RouteNextHopFlags(Onlink)] [nexthop via 198.51.100.1 oif 7 weight 1 flags RouteNextHopFlags(0x0)]")
+PASS v4 strict dump filtered by RTA_TABLE+protocol: 1 route(s), NLM_F_DUMP_FILTERED=true
+INFO v4 strict dump filtered by protocol 249 only: 5 route(s)
+INFO v4 rtnetlink route().get(RouteMessageBuilder::new().table_id(1000)) on a strict socket returns 0 route(s) (builder sets protocol=static)
+PASS v4 delete multipath by exact key (no nexthops given): None
+INFO v4 delete with protocol=static (rtnetlink builder default) on a proto 249 route -> Some("errno 3 (No such process (os error 3)), no extack")
+INFO v4 delete with a different metric -> Some("errno 3 (No such process (os error 3)), no extack")
+PASS v4 delete path route by exact key: None
+PASS v6 multipath fe80::1 dev d1 + fe80::1 dev d2: 1 message(s) ["table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 10 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 7 weight 3 flags RouteNextHopFlags(0x0)] pref Medium"]
+PASS v6 replace with 3 members incl. ptp g6 via fe80::1: ["table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 7 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 9 weight 1 flags RouteNextHopFlags(0x0)] pref Medium"]
+PASS v6 replace 3 members -> single ptp member: ["table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 9 pref Medium"]
+INFO v6 replace single -> single-member RTA_MULTIPATH: None -> ["table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 6 pref Medium"]
+INFO v6 multipath with a device-only member -> Some("errno 22 (Invalid argument (os error 22)), extack \"Device only routes can not be added for IPv6 using the multipath API.\"")
+PASS v6 path route via fe80::1 dev d1 src 2001:db8:1::2: None
+PASS v6 delete 2-member multipath by exact key: None, 0 left []
+INFO v6 delete of a missing route -> Some("errno 3 (No such process (os error 3)), no extack")
+PASS Inet: delete all proto 249 routes from their dumps, 0 left
+PASS Inet6: delete all proto 249 routes from their dumps, 0 left
+== extack
+INFO EXT_ACK=false CAP_ACK=false:
+INFO   off-subnet gateway: errno 101 (Network unreachable (os error 101)), no extack
+INFO   iifname too long: errno 34 (Result not representable (os error 34)), no extack
+INFO   delete missing v6 route: errno 3 (No such process (os error 3)), no extack
+INFO EXT_ACK=true CAP_ACK=false:
+INFO   off-subnet gateway: errno 101 (Network unreachable (os error 101)), extack "Nexthop has invalid gateway"
+INFO   iifname too long: errno 34 (Result not representable (os error 34)), extack "Error parsing msg"
+INFO   delete missing v6 route: errno 3 (No such process (os error 3)), extack "FIB table does not exist"
+INFO EXT_ACK=true CAP_ACK=true:
+INFO   off-subnet gateway: errno 101 (Network unreachable (os error 101)), extack "Nexthop has invalid gateway"
+INFO   iifname too long: errno 34 (Result not representable (os error 34)), extack "Error parsing msg"
+INFO   delete missing v6 route: errno 3 (No such process (os error 3)), extack "FIB table does not exist"
+INFO rtnetlink high-level error: code Some(-101), Display "Network unreachable (os error 101)", payload 52 bytes (extack only if the caller enabled NETLINK_EXT_ACK and parses the payload)
+== notify
+INFO dump after subscribe: 11 links, 16 addresses
+INFO notifications for changes made on another socket (4):
+INFO   seq 168 portid 27247 flags 0x600: NewRoute table 1009 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via 192.0.2.1 oif 6
+INFO   seq 169 portid 27247 flags 0x0: NewRule 1699: Unreachable (hdr table 0) suppress_prefixlength 4294967295 proto 249
+INFO   seq 170 portid 27247 flags 0x400: NewRoute table 1009 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 7 weight 1 flags RouteNextHopFlags(0x0)] pref Medium
+INFO   seq 171 portid 27247 flags 0x100: NewRoute table 1009 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 7 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 6 weight 2 flags RouteNextHopFlags(0x0)] pref Medium
+PASS rule and route notifications received for changes made on another socket
+INFO notifications for ip link/addr changes (24):
+INFO   seq 0 portid 0 flags 0x0: NewLink d2 idx 7 up=false lower_up=false ptp=false carrier=Some(1)
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 254 proto 2 type Unicast flags RouteFlags(0x0) metric 256 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 254 proto 2 type Unicast flags RouteFlags(0x0) metric 256 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Anycast flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Local flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Anycast flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Local flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Multicast flags RouteFlags(0x0) metric 256 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: DelAddress Some(2001:db8:2::2)/64 idx 7 scope Universe flags Some(AddressFlags(Nodad | Permanent))
+INFO   seq 0 portid 0 flags 0x0: DelAddress Some(fe80::94ce:caff:fe64:461b)/64 idx 7 scope Link flags Some(AddressFlags(Permanent))
+INFO   seq 0 portid 0 flags 0x0: NewLink d2 idx 7 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   seq 0 portid 0 flags 0x600: NewRoute table 254 proto 2 type Unicast flags RouteFlags(0x0) src 198.51.100.2 oif 7
+INFO   seq 0 portid 0 flags 0x600: NewRoute table 255 proto 2 type Broadcast flags RouteFlags(0x0) src 198.51.100.2 oif 7
+INFO   seq 0 portid 0 flags 0x400: NewRoute table 255 proto 2 type Multicast flags RouteFlags(0x0) metric 256 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x400: NewRoute table 254 proto 2 type Unicast flags RouteFlags(0x0) metric 256 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x0: NewAddress Some(fe80::94ce:caff:fe64:461b)/64 idx 7 scope Link flags Some(AddressFlags(Permanent))
+INFO   seq 0 portid 0 flags 0x600: NewRoute table 255 proto 2 type Local flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 0 portid 0 flags 0x400: NewRoute table 255 proto 2 type Anycast flags RouteFlags(0x0) metric 0 oif 7 pref Medium
+INFO   seq 1791027130 portid 27251 flags 0x0: NewAddress Some(192.0.2.77)/24 idx 6 scope Universe flags Some(AddressFlags(Secondary | Permanent))
+INFO   seq 0 portid 0 flags 0x600: NewRoute table 255 proto 2 type Local flags RouteFlags(0x0) src 192.0.2.2 oif 6
+INFO   seq 0 portid 0 flags 0x0: NewAddress Some(2001:db8:1::77)/64 idx 6 scope Universe flags Some(AddressFlags(Nodad | Deprecated | Permanent))
+INFO   seq 0 portid 0 flags 0x600: NewRoute table 255 proto 2 type Local flags RouteFlags(0x0) metric 0 oif 6 pref Medium
+INFO   seq 1791027130 portid 27253 flags 0x0: DelAddress Some(192.0.2.77)/24 idx 6 scope Universe flags Some(AddressFlags(Secondary | Permanent))
+INFO   seq 0 portid 0 flags 0x0: DelRoute table 255 proto 2 type Local flags RouteFlags(0x0) src 192.0.2.2 oif 6
+PASS link and address notifications received
+INFO change made on the subscribed socket itself: 1 message(s) in the request's reply stream (["seq 1 portid 2873970434 flags 0x600: NewRoute table 1010 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via 192.0.2.1 oif 6"]), 0 on the notification stream
+INFO   in dump stream: seq 1 portid 2803970156 flags 0x600: NewRoute table 3003 proto 249 type Unicast flags RouteFlags(0x0) via 192.0.2.1 oif 6
+INFO cross-socket seq collision: dump stream ended after 1 message(s) of ~20318 (1 notification(s) inside it); notification stream got 20593 message(s), 20319 of them dump replies
+FAIL observer dump not corrupted by a notification with a colliding sequence number
+== inspect
+INFO   link lo idx 1 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   link gre0 idx 2 up=false lower_up=false ptp=false carrier=Some(1)
+INFO   link gretap0 idx 3 up=false lower_up=false ptp=false carrier=Some(1)
+INFO   link erspan0 idx 4 up=false lower_up=false ptp=false carrier=Some(1)
+INFO   link tunl0 idx 5 up=false lower_up=false ptp=false carrier=Some(1)
+INFO   link d1 idx 6 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   link d2 idx 7 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   link p0 idx 8 up=true lower_up=true ptp=true carrier=Some(1)
+INFO   link g6 idx 9 up=true lower_up=true ptp=true carrier=Some(1)
+INFO   link v1p idx 10 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   link v1 idx 11 up=true lower_up=true ptp=false carrier=Some(1)
+INFO   addr Some(192.0.2.2)/24 idx 6 scope Universe flags Some(AddressFlags(Permanent))
+INFO   addr Some(198.51.100.2)/24 idx 7 scope Universe flags Some(AddressFlags(Permanent))
+INFO   addr Some(203.0.113.2)/32 idx 8 scope Universe flags Some(AddressFlags(Permanent))
+INFO   addr Some(100.64.0.2)/24 idx 11 scope Universe flags Some(AddressFlags(Permanent))
+INFO   addr Some(2001:db8:1::2)/64 idx 6 scope Universe flags Some(AddressFlags(Nodad | Permanent))
+INFO   addr Some(2001:db8:3::2)/64 idx 11 scope Universe flags Some(AddressFlags(Nodad | Permanent))
+INFO   default in table 254 Inet: table 254 proto 16 type Unicast flags RouteFlags(0x0) metric 100 via 192.0.2.1 oif 6
+INFO   default in table 3005 Inet: table 3005 proto 3 type Unicast flags RouteFlags(0x0) metric 50 nhid 7 via 192.0.2.1 oif 6
+INFO   default in table 254 Inet6: table 254 proto 9 type Unicast flags RouteFlags(0x0) metric 1024 via fe80::1 oif 6 pref High
+== implicit
+INFO carrier loss on v1 (peer down): 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(Linkdown)]", "Inet table 1001 proto 249 type Unicast flags RouteFlags(Linkdown) metric 100 src 100.64.0.2 via 100.64.0.1 oif 11", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(Linkdown)] pref Medium", "Inet6 table 1001 proto 249 type Unicast flags RouteFlags(Linkdown) metric 100 via fe80::1 oif 11 pref Medium"]
+INFO carrier back: 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(0x0)]", "Inet table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 src 100.64.0.2 via 100.64.0.1 oif 11", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(0x0)] pref Medium", "Inet6 table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 11 pref Medium"]
+INFO admin down v1: 1 notification(s) for proto 249 routes ["seq 0 portid 0 flags 0x0: DelRoute table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 11 pref Medium"]
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(Dead | Linkdown)]", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(Dead | Linkdown)] pref Medium"]
+INFO admin up v1: 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(0x0)]", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(0x0)] pref Medium"]
+INFO IPv4 address 100.64.0.2/24 removed from v1: 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(Dead | Linkdown)]", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(0x0)] pref Medium", "Inet6 table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 11 pref Medium"]
+INFO IPv4 address restored: 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(0x0)]", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(0x0)] pref Medium", "Inet6 table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 11 pref Medium"]
+INFO IPv6 link-local removed from v1: 0 notification(s) for proto 249 routes []
+INFO   FTR routes now: ["Inet table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via 192.0.2.1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via 100.64.0.1 oif 11 weight 1 flags RouteNextHopFlags(0x0)]", "Inet table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 src 100.64.0.2 via 100.64.0.1 oif 11", "Inet6 table 1000 proto 249 type Unicast flags RouteFlags(0x0) metric 100 [nexthop via fe80::1 oif 6 weight 1 flags RouteNextHopFlags(0x0)] [nexthop via fe80::1 oif 11 weight 1 flags RouteNextHopFlags(0x0)] pref Medium", "Inet6 table 1001 proto 249 type Unicast flags RouteFlags(0x0) metric 100 via fe80::1 oif 11 pref Medium"]
+== dump_intr
+INFO dumps with NLM_F_DUMP_INTR on a data message over 40 rounds while churning: addresses 32, v4 routes 0, v6 routes 0, rules 0, links 0
+INFO note: netlink-proto drops NLMSG_DONE unless Connection::set_forward_done(true); the flag can also be on DONE
+INFO address dumps with forward_done: DUMP_INTR on a data message in 40/40, on NLMSG_DONE in 0/40
+== enobufs
+INFO after a 2000-route burst into a 4 KiB receive buffer: 11 message(s) delivered, 1 overrun marker(s)
+PASS ENOBUFS surfaces as NetlinkPayload::Overrun on the notification stream
+PASS notifications continue after the overrun
+0:	from all lookup local
+1001:	from all fwmark 0x410000/0xff0000 lookup 1001 proto 249
+1002:	from all fwmark 0x420000/0xff0000 lookup 1002 proto 249
+1064:	from all fwmark 0x400000/0xc00000 unreachable proto 249
+1100:	from all lookup main suppress_prefixlength 0 proto 249
+1201:	from all fwmark 0x10000/0xff0000 lookup 1001 proto 249
+1202:	from all fwmark 0x20000/0xff0000 lookup 1002 proto 249
+1264:	from all fwmark 0x10000/0xc10000 unreachable proto 249
+1264:	from all fwmark 0x20000/0xc20000 unreachable proto 249
+1264:	from all fwmark 0x40000/0xc40000 unreachable proto 249
+1264:	from all fwmark 0x80000/0xc80000 unreachable proto 249
+1264:	from all fwmark 0x100000/0xd00000 unreachable proto 249
+1264:	from all fwmark 0x200000/0xe00000 unreachable proto 249
+1301:	from all fwmark 0x810000/0xff0000 lookup 1065 proto 249
+1302:	from all fwmark 0x820000/0xff0000 lookup 1066 proto 249
+1401:	from all fwmark 0xc10000/0xff0000 lookup 1129 proto 249
+1402:	from all fwmark 0xc20000/0xff0000 lookup 1130 proto 249
+1464:	from all fwmark 0xc00000/0xc00000 unreachable proto 249
+1501:	from 192.0.2.2 fwmark 0/0xff0000 lookup 1001 proto 249
+1502:	from 198.51.100.2 fwmark 0/0xff0000 lookup 1002 proto 249
+1564:	from 192.0.2.2 fwmark 0/0xff0000 unreachable proto 249
+1564:	from 198.51.100.2 fwmark 0/0xff0000 unreachable proto 249
+1600:	from all lookup 1000 proto 249
+1699:	from all unreachable proto 249
+32766:	from all lookup main
+32767:	from all lookup default
+0:	from all lookup local
+1001:	from all fwmark 0x410000/0xff0000 lookup 1001 proto 249
+1002:	from all fwmark 0x420000/0xff0000 lookup 1002 proto 249
+1064:	from all fwmark 0x400000/0xc00000 unreachable proto 249
+1100:	from all lookup main suppress_prefixlength 0 proto 249
+1201:	from all fwmark 0x10000/0xff0000 lookup 1001 proto 249
+1202:	from all fwmark 0x20000/0xff0000 lookup 1002 proto 249
+1264:	from all fwmark 0x10000/0xc10000 unreachable proto 249
+1264:	from all fwmark 0x20000/0xc20000 unreachable proto 249
+1264:	from all fwmark 0x40000/0xc40000 unreachable proto 249
+1264:	from all fwmark 0x80000/0xc80000 unreachable proto 249
+1264:	from all fwmark 0x100000/0xd00000 unreachable proto 249
+1264:	from all fwmark 0x200000/0xe00000 unreachable proto 249
+1301:	from all fwmark 0x810000/0xff0000 lookup 1065 proto 249
+1302:	from all fwmark 0x820000/0xff0000 lookup 1066 proto 249
+1401:	from all fwmark 0xc10000/0xff0000 lookup 1129 proto 249
+1402:	from all fwmark 0xc20000/0xff0000 lookup 1130 proto 249
+1464:	from all fwmark 0xc00000/0xc00000 unreachable proto 249
+1501:	from 2001:db8:1::2 fwmark 0/0xff0000 lookup 1001 proto 249
+1502:	from 2001:db8:2::2 fwmark 0/0xff0000 lookup 1002 proto 249
+1564:	from 2001:db8:1::2 fwmark 0/0xff0000 unreachable proto 249
+1564:	from 2001:db8:2::2 fwmark 0/0xff0000 unreachable proto 249
+1600:	from all lookup 1000 proto 249
+1699:	from all unreachable proto 249
+32766:	from all lookup main
+default table 1000 metric 100 
+	nexthop via 192.0.2.1 dev d1 weight 10 
+	nexthop via 198.51.100.1 dev d2 weight 3 
+	nexthop dev p0 weight 1 
+default dev p0 table 1003 src 203.0.113.2 metric 100 
+default table 1000 metric 100 pref medium
+	nexthop via fe80::1 dev d1 weight 10 
+	nexthop via fe80::1 dev d2 weight 3 
+	nexthop via fe80::1 dev g6 weight 1 
+default via fe80::1 dev d1 table 1001 src 2001:db8:1::2 metric 100 pref medium

@@ -1,0 +1,339 @@
+######## t0-smoke.sh
+PASS IPv4 forwarded connections balanced over A, B, C
+PASS IPv6 forwarded connections balanced over A, B, C
+PASS no leak
+
+t0-smoke.sh: 3 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t1-rules.sh
+== IPv4 forwarded
+PASS v4 unmarked -> balancing table
+PASS v4 path 1 -> path table 1
+PASS v4 path 1 with foreign bits -> path table 1
+PASS v4 path 5 (never configured) -> path guard
+PASS v4 path 63 -> path guard
+PASS v4 probe 1 -> path table 1
+PASS v4 probe 5 -> probe guard
+PASS v4 policy-balance 1 -> policy table
+PASS v4 policy-block 1 -> policy table
+PASS v4 policy-block 5 -> policy-block guard
+PASS v4 policy-balance 5 (unconfigured) -> balancing
+PASS v4 path 1 to connected LAN -> main (INV-1)
+PASS v4 path 1 to static main route -> main (INV-1)
+PASS v4 policy-balance 1, empty table -> falls through to balancing
+PASS v4 policy-block 1, empty table -> policy-block guard
+PASS v4 AS-48: forwarded packet with a router address as source is a martian
+PASS v4 AS-48: policy-balance from a router address, empty table -> balancing
+PASS v4 path 1, empty path table -> path guard, not moved
+== IPv4 router-originated
+PASS v4 unbound -> balancing
+PASS v4 bound to A's address -> path table 1
+PASS v4 bound to B's address -> path table 2
+PASS v4 probe mark 1 -> path table 1
+PASS v4 SO_BINDTODEVICE wana, unbound -> wana member of balancing
+PASS v4 SO_BINDTODEVICE wana, A not in balancing
+     198.18.100.9 dev wana src 192.0.2.2 
+PASS v4 SO_BINDTODEVICE wanx (non-FTR uplink)
+     198.18.100.9 dev wanx src 100.127.0.2 
+PASS v4 bound to A's address, empty path table -> source guard
+PASS v4 probe 1, empty path table -> probe guard
+     RTNETLINK answers: Network is unreachable
+PASS v4 probe 1 + SO_BINDTODEVICE wana, empty path table
+     198.18.100.9 dev wana src 192.0.2.2 mark 0x410000 
+PASS v4 SO_BINDTODEVICE wana, A not in balancing, unreachable route in balancing table
+     198.18.100.9 dev wana src 192.0.2.2 
+PASS v4 unbound, empty balancing -> final guard (main default ignored)
+PASS v4 SO_BINDTODEVICE wana, all FTR tables empty
+     198.18.100.9 dev wana src 192.0.2.2 
+PASS v4 forwarded, empty balancing -> final guard
+== IPv6 forwarded
+PASS v6 unmarked -> balancing table
+PASS v6 path 1 -> path table 1
+PASS v6 path 1 with foreign bits -> path table 1
+PASS v6 path 5 (never configured) -> path guard
+PASS v6 path 63 -> path guard
+PASS v6 probe 1 -> path table 1
+PASS v6 probe 5 -> probe guard
+PASS v6 policy-balance 1 -> policy table
+PASS v6 policy-block 1 -> policy table
+PASS v6 policy-block 5 -> policy-block guard
+PASS v6 policy-balance 5 (unconfigured) -> balancing
+PASS v6 path 1 to connected LAN -> main (INV-1)
+PASS v6 path 1 to static main route -> main (INV-1)
+PASS v6 policy-balance 1, empty table -> falls through to balancing
+PASS v6 policy-block 1, empty table -> policy-block guard
+PASS v6 AS-48: policy-balance from a router address, empty table -> balancing
+PASS v6 path 1, empty path table -> path guard, not moved
+== IPv6 router-originated
+PASS v6 unbound -> balancing
+PASS v6 bound to A's address -> path table 1
+PASS v6 bound to B's address -> path table 2
+PASS v6 probe mark 1 -> path table 1
+PASS v6 SO_BINDTODEVICE wana, unbound -> wana member of balancing
+PASS v6 SO_BINDTODEVICE wana, A not in balancing
+     RTNETLINK answers: Network is unreachable
+PASS v6 SO_BINDTODEVICE wanx (non-FTR uplink)
+     RTNETLINK answers: Network is unreachable
+PASS v6 bound to A's address, empty path table -> source guard
+PASS v6 probe 1, empty path table -> probe guard
+     RTNETLINK answers: Network is unreachable
+PASS v6 probe 1 + SO_BINDTODEVICE wana, empty path table
+     RTNETLINK answers: Network is unreachable
+PASS v6 SO_BINDTODEVICE wana, A not in balancing, unreachable route in balancing table
+     RTNETLINK answers: Network is unreachable
+PASS v6 unbound, empty balancing -> final guard (main default ignored)
+PASS v6 SO_BINDTODEVICE wana, all FTR tables empty
+     RTNETLINK answers: Network is unreachable
+PASS v6 forwarded, empty balancing -> final guard
+
+t1-rules.sh: 63 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t2-devbound.sh
+== IPv4
+PASS v4 TCP connect bound to wana, A not in the active set: connects via A (source rule after on-link source selection)
+     wana:       1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [S.], seq 3666593623, ack 328955933, win 65160, options [mss 1460,sackOK,TS val 3333163167 ecr 1256144856,nop,wscale 10], length 0;      1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [P.], seq 1:11, ack 1, win 64, options [nop,nop,TS val 3333163167 ecr 1256144856], length 10;      1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [F.], seq 11, ack 2, win 64, options [nop,nop,TS val 3333163167 ecr 1256144856], length 0;
+PASS v4 unconnected UDP bound to wana, A not in the active set: no reply (sent on-link)
+     wana:       3 ARP, Request who-has 198.18.100.9 tell 192.0.2.2, length 28;      1 ARP, Request who-has 192.0.2.2 tell 192.0.2.1, length 28;      1 ARP, Reply 192.0.2.2 is-at 8e:82:ee:07:e5:ff, length 28;
+PASS v4 UDP bound to point-to-point wanc, all wanc tables and balancing empty: sent on-link, reply dropped by rp_filter (path guard)
+     wanc:       1 IP 203.0.113.2.41733 > 198.18.100.9.7: UDP, length 1;      1 IP 198.18.100.9.7 > 203.0.113.2.41733: UDP, length 12;      1 ;
+     v4 UDP bound to non-FTR wanx: {"errors": {"timeout": 1}, "peers": {}}; wanx:       3 ARP, Request who-has 198.18.100.9 tell 100.127.0.2, length 28;      1 ;; leak sink counters v4 v6 = 0 0
+PASS v4 UDP bound to non-FTR wanx is only ARPed on-link (no IP packet reaches the sink)
+== IPv6
+PASS v6 TCP connect bound to wana, A not in the active set: source taken from wana, then source rule -> via A
+PASS v6 TCP connect bound to wana and A's address: via A
+PASS v6 unconnected UDP bound to wana, A not in the active set: via A (source rule)
+PASS v6 UDP bound to wanc, all wanc tables empty: rejected (source guard)
+
+t2-devbound.sh: 8 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t3-multipath.sh
+== IPv4 updates
+PASS v4 single A -> A,B
+     event: default table 1000 nexthop via 192.0.2.1 dev wana weight 1 nexthop via 198.51.100.1 dev wanb weight 1
+PASS v4 A,B -> A,B,C
+     event: default table 1000 nexthop via 192.0.2.1 dev wana weight 1 nexthop via 198.51.100.1 dev wanb weight 1 nexthop dev wanc weight 1
+PASS v4 A,B,C -> B,C (first member removed)
+     event: default table 1000 nexthop via 198.51.100.1 dev wanb weight 1 nexthop dev wanc weight 1
+PASS v4 B,C -> C (single, multipath to plain)
+     event: default dev wanc table 1000
+PASS v4 C -> A,C (plain to multipath)
+     event: default table 1000 nexthop via 192.0.2.1 dev wana weight 1 nexthop dev wanc weight 1
+PASS v4 A,C weights 1:1 -> 3:1
+     event: default table 1000 nexthop via 192.0.2.1 dev wana weight 3 nexthop dev wanc weight 1
+PASS v4 A,C -> A,C unchanged (idempotent replace)
+     event: default table 1000 nexthop via 192.0.2.1 dev wana weight 1 nexthop dev wanc weight 1
+== IPv4 failures (previous route must survive when nothing was mutated)
+PASS v4 A,B -> B + off-link gateway (no onlink): rejected
+     kernel: Error: Nexthop has invalid gateway.
+     table after: default proto 249 metric 100 nexthop via 192.0.2.1 dev wana weight 1 nexthop via 198.51.100.1 dev wanb weight 1 
+PASS v4 A,B -> B + nonexistent device: rejected
+     kernel: Cannot find device "nosuchdev"
+Error: cannot parse nexthop
+     table after: default proto 249 metric 100 nexthop via 192.0.2.1 dev wana weight 1 nexthop via 198.51.100.1 dev wanb weight 1 
+PASS v4 A,B -> B,B (duplicate member)
+     event: default table 1000 nexthop via 198.51.100.1 dev wanb weight 1 nexthop via 198.51.100.1 dev wanb weight 1
+PASS v4 -> B,C,C (duplicate after a valid member)
+     event: default table 1000 nexthop via 198.51.100.1 dev wanb weight 1 nexthop dev wanc weight 1 nexthop dev wanc weight 1
+PASS v4 A,B -> A,B with wanb down
+     kernel: Error: Nexthop has invalid gateway.
+     table after: default proto 249 metric 100 nexthop via 198.51.100.1 dev wanb weight 1 dead linkdown nexthop dev wanc weight 1 nexthop dev wanc weight 1 
+PASS v4 withdraw (delete by exact key) empties the table
+     event: Deleted default table 1000 nexthop via 192.0.2.1 dev wana weight 1 nexthop via 198.51.100.1 dev wanb weight 1
+== IPv6 updates
+PASS v6 single A -> A,B
+     event: default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1
+PASS v6 A,B -> A,B,C
+     event: default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 nexthop via fe80::1 dev wanc weight 1
+PASS v6 A,B,C -> B,C (first member removed)
+     event: default table 1000  nexthop via fe80::1 dev wanb weight 1 nexthop via fe80::1 dev wanc weight 1
+PASS v6 B,C -> C (single, multipath to plain)
+     event: default via fe80::1 dev wanc table 1000
+PASS v6 C -> A,C (plain to multipath)
+     event: default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanc weight 1
+PASS v6 A,C weights 1:1 -> 3:1
+     event: default table 1000  nexthop via fe80::1 dev wana weight 3 nexthop via fe80::1 dev wanc weight 1
+PASS v6 A,C -> A,C unchanged (idempotent replace)
+     event: default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanc weight 1
+== IPv6 failures (previous route must survive when nothing was mutated)
+PASS v6 A,B -> B + off-link gateway (no onlink): rejected
+     kernel: RTNETLINK answers: No route to host
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 
+PASS v6 A,B -> B + nonexistent device: rejected
+     kernel: Cannot find device "nosuchdev"
+Error: cannot parse nexthop
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 
+PASS v6 A,B -> B,B (duplicate member)
+     kernel: RTNETLINK answers: File exists
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 
+PASS v6 -> B,C,C (duplicate after a valid member)
+     kernel: RTNETLINK answers: File exists
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 
+PASS v6 A,B -> device-only member (Q12): rejected
+     kernel: Error: Device only routes can not be added for IPv6 using the multipath API.
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 
+PASS v6 A,B -> A,B with wanb down
+     kernel: Error: Nexthop device is not up.
+     table after: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1 dead linkdown 
+PASS v6 withdraw (delete by exact key) empties the table
+     event: Deleted default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1
+== IPv6 make-before-break alternative (two metrics, no replace)
+PASS v6 new set added at metric 101: lookups still use metric 100 (A,B)
+PASS v6 old route deleted by exact key: lookups use the new set
+PASS v6 table holds only the new set
+     event: default table 1000 metric 101  nexthop via fe80::1 dev wanb weight 1 nexthop via fe80::1 dev wanc weight 1
+     event: Deleted default table 1000  nexthop via fe80::1 dev wana weight 1 nexthop via fe80::1 dev wanb weight 1
+== IPv6 point-to-point member with link-local gateway (AS-35)
+PASS v6 active set {3} installed
+     connections: {"errors": {}, "peers": {"C": 12}}
+PASS v6 active set {1 3} installed
+     connections: {"errors": {}, "peers": {"A": 6, "C": 6}}
+PASS v6 active set {1 2 3} installed
+     connections: {"errors": {}, "peers": {"A": 5, "B": 5, "C": 2}}
+PASS v6 active set {3} installed
+     connections: {"errors": {}, "peers": {"C": 12}}
+PASS v6 active set {2 3} installed
+     connections: {"errors": {}, "peers": {"B": 4, "C": 8}}
+PASS v6 active set {3} installed
+     connections: {"errors": {}, "peers": {"C": 12}}
+
+t3-multipath.sh: 36 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t4-hash.sh
+PASS v4 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 487, "B": 513}})
+PASS v4 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 725, "B": 275}})
+PASS v6 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 497, "B": 503}})
+PASS v6 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 724, "B": 276}})
+== carrier loss on A before FTR reacts (route still lists A)
+     v4 table: default proto 249 metric 100 nexthop via 192.0.2.1 dev wana weight 1 linkdown nexthop via 198.51.100.1 dev wanb weight 1 
+PASS v4 ignore_routes_with_linkdown=0: connections hashed to A fail
+     v6 table: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 linkdown nexthop via fe80::1 dev wanb weight 1 
+PASS v6 ignore_routes_with_linkdown=0: connections hashed to A fail
+     v4 table: default proto 249 metric 100 nexthop via 192.0.2.1 dev wana weight 1 dead linkdown nexthop via 198.51.100.1 dev wanb weight 1 
+PASS v4 ignore_routes_with_linkdown=1: all new connections on B
+     v6 table: default proto 249 metric 100 nexthop via fe80::1 dev wana weight 1 dead linkdown nexthop via fe80::1 dev wanb weight 1 
+PASS v6 ignore_routes_with_linkdown=1: all new connections on B
+
+t4-hash.sh: 8 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t5-pinning.sh
+== IPv4 outbound flow
+     flow pinned to path id 2 (ct mark 131072)
+PASS v4 flow keeps working after its uplink leaves the active set
+PASS v4 flow keeps working with an empty active set
+PASS v4 flow summary: no error, gaps < 0.5 s
+PASS v4 path route of the flow withdrawn: flow stops (rejected, not moved)
+PASS v4 ... and nothing leaked
+     established entries left: 1
+== IPv4 inbound via B while B is outside the active set (INV-5)
+PASS v4 inbound flow through B answered (replies leave via B)
+PASS v4 inbound flow through B with an empty active set
+== IPv6 outbound flow
+     flow pinned to path id 1 (ct mark 65536)
+PASS v6 flow keeps working after its uplink leaves the active set
+PASS v6 flow keeps working with an empty active set
+PASS v6 flow summary: no error, gaps < 0.5 s
+PASS v6 path route of the flow withdrawn: flow stops (rejected, not moved)
+PASS v6 ... and nothing leaked
+     established entries left: 1
+== IPv6 inbound via B while B is outside the active set (INV-5)
+PASS v6 inbound flow through B answered (replies leave via B)
+PASS v6 inbound flow through B with an empty active set
+
+t5-pinning.sh: 14 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t6-orders.sh
+== FR-REC-1 cold installation (both families, uplinks 1 2 3)
+PASS 0 before installation: pre-existing routing: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 1 routes: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 2 class guards: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 3 probe rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 4 main bypass: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 5 path rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 6 policy rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 7 source rules and source guards: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS 8 balancing rule: f4 7/9/4/0/0 f6 5/8/7/0/0 r4 5/10/5/0/0 r6 7/7/6/0/0
+PASS 9 final guard: f4 5/7/8/0/0 f6 8/6/6/0/0 r4 5/8/7/0/0 r6 4/7/9/0/0
+PASS 10 nftables table: f4 6/7/7/0/0 f6 6/7/7/0/0 r4 9/5/6/0/0 r6 10/4/6/0/0
+== FR-REC-3 removing uplink C with pinned flows on A, B and C
+     flow C egress counters a/b/c/x: 0 0 5 0
+PASS R1 excluded from active set, policy tables emptied: f4 9/11/0/0/0 f6 5/15/0/0/0 r4 12/8/0/0/0 r6 13/7/0/0/0
+PASS R1 flows A B C alive
+PASS R2 nftables without C's assignments: f4 8/12/0/0/0 f6 12/8/0/0/0 r4 8/12/0/0/0 r6 10/10/0/0/0
+PASS R2 flows A B C alive (restoration rules cover every id)
+PASS R3 C's lookup rules, source rule and guard deleted: f4 9/11/0/0/0 f6 14/6/0/0/0 r4 7/13/0/0/0 r6 7/13/0/0/0
+PASS R3 flows A B alive, flow C rejected by the path guard (AS-37)
+PASS R4 C's routes deleted: f4 10/10/0/0/0 f6 8/12/0/0/0 r4 10/10/0/0/0 r6 6/14/0/0/0
+PASS flow C never left through another interface (counters a b c x)
+     flow C egress counters a/b/c/x: 0 0 0 0
+     flow C: {"error": "timeout", "max_gap": 0.102, "peer": "C", "received": 18, "sent": 37}
+== FR-REC-3 adding uplink C back while flows on A and B run
+PASS A1 C's path routes: f4 8/12/0/0/0 f6 10/10/0/0/0 r4 8/12/0/0/0 r6 12/8/0/0/0
+PASS A2 C's lookup rules, source rule and guard: f4 8/12/0/0/0 f6 8/12/0/0/0 r4 8/12/0/0/0 r6 10/10/0/0/0
+PASS A3 nftables with C's assignments: f4 12/8/0/0/0 f6 12/8/0/0/0 r4 8/12/0/0/0 r6 10/10/0/0/0
+PASS A4 C in the active set and policy tables: f4 7/4/9/0/0 f6 8/6/6/0/0 r4 7/7/6/0/0 r6 7/7/6/0/0
+PASS flows A B alive throughout
+PASS flow A: no error, gaps < 0.5 s
+PASS flow B: no error, gaps < 0.5 s
+== FR-REC-4 cleanup, with foreign objects present
+PASS C1 nftables table deleted: f4 9/7/4/0/0 f6 8/3/9/0/0 r4 8/4/8/0/0 r6 8/5/7/0/0
+PASS C2 final guard: f4 6/10/4/0/0 f6 3/11/6/0/0 r4 6/5/9/0/0 r6 7/9/4/0/0
+PASS C3 balancing rule: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C4 source guards then source rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C5 policy rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C6 path rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C7 main bypass: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C8 probe rules: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C9 class guards: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS C10 routes: f4 0/0/0/20/0 f6 0/0/0/20/0 r4 0/0/0/20/0 r6 0/0/0/20/0
+PASS no FTR rule or route left
+PASS foreign rules, routes and nftables table untouched
+
+t6-orders.sh: 38 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t7-startup.sh
+== IPv4, flows pinned to A (server port 8) with A outside the active set
+-- damage 1: A's path rule missing, guards intact
+PASS v4 flow blocked by the path guard, never moved (a b c x)
+     new flows while damaged: f4 0/9/11/0/0 f6 0/10/10/0/0 r4 0/10/10/0/0 r6 0/9/11/0/0
+PASS v4 flow resumes on A after repair (a b c x)
+PASS v4 flow survived
+-- damage 2: A's path rule and all class guards missing (FR-REC-8 order violated)
+PASS v4 flow falls to balancing and leaves via another uplink (a b c x)
+PASS v4 moving the connection broke it
+-- damage 3: nftables table missing, routing intact (repair phase)
+     flow egress while the table is missing (a b c x): 0 1 3 0; flow alive
+     new flows while the table is missing: f4 0/13/7/0/0 f6 0/14/6/0/0 r4 0/12/8/0/0 r6 0/8/12/0/0
+PASS v4 conntrack marks survived the table deletion
+     flow after repair: alive
+PASS v4 new flows correct after repair
+== IPv6, flows pinned to A (server port 8) with A outside the active set
+-- damage 1: A's path rule missing, guards intact
+PASS v6 flow blocked by the path guard, never moved (a b c x)
+     new flows while damaged: f4 0/7/13/0/0 f6 0/11/9/0/0 r4 0/12/8/0/0 r6 0/10/10/0/0
+PASS v6 flow resumes on A after repair (a b c x)
+PASS v6 flow survived
+-- damage 2: A's path rule and all class guards missing (FR-REC-8 order violated)
+PASS v6 flow falls to balancing and leaves via another uplink (a b c x)
+PASS v6 moving the connection broke it
+-- damage 3: nftables table missing, routing intact (repair phase)
+     flow egress while the table is missing (a b c x): 0 3 2 0; flow alive
+     new flows while the table is missing: f4 0/6/14/0/0 f6 0/11/9/0/0 r4 0/9/11/0/0 r6 0/8/12/0/0
+PASS v6 conntrack marks survived the table deletion
+     flow after repair: alive
+PASS v6 new flows correct after repair
+
+t7-startup.sh: 14 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+######## t8-source.sh
+== unbound router-originated connections over the balancing route
+PASS v4 TCP: sources spread over A, B, C primaries; secondary never chosen ({"errors": {}, "peers": {"A": 103, "B": 93, "C": 104, "local=A": 103, "local=B": 93, "local=C": 104}})
+PASS v4 TCP: secondary 192.0.2.3 not used for unbound traffic
+PASS v6 TCP: sources spread over A, B, C ({"errors": {}, "peers": {"A": 95, "B": 110, "C": 95, "local=A": 95, "local=B": 110, "local=C": 95}})
+PASS v4 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 32, "B": 36, "C": 32}})
+PASS v6 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 38, "B": 37, "C": 25}})
+PASS source address always matches the egress uplink (mismatch v4 v6)
+== bound to an address (AS-42)
+PASS v4 bound to A's secondary address: via A, seen as 192.0.2.3
+PASS v4 bound to A's secondary address with an empty active set: still via A
+PASS v4 unbound with an empty active set: rejected
+== FR-DISC-6: IPv6 uplink B without a global address, static source on the LAN, snat
+PASS v6 path route of B with a source on another interface accepted
+PASS v6 forwarded: B used with the snat source ({"errors": {}, "peers": {"A": 33, "2001:db8:b:1::1": 29, "C": 28}})
+     v6 unbound router traffic, sources: {"errors": {}, "peers": {"A": 92, "2001:db8:b:1::1": 103, "C": 105, "local=A": 92, "local=2001:db8:b:1::1": 103, "local=C": 105}}
+PASS v6 unbound router traffic: source always matches egress (mismatch v4 v6)
+PASS v6 bound to the static source: via B
+PASS v6 LAN host reaches the static source address; the reply follows the main bypass, not the source rule
+
+t8-source.sh: 14 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
