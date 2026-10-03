@@ -184,6 +184,31 @@ fn teardown_withdraws_every_route_after_the_rules() {
 }
 
 #[test]
+fn a_replaced_only_uplink_leaves_the_balancing_route_before_its_assignments() {
+    let block = |n: u8, name: &str| {
+        format!("[[uplink]]\nid = {n}\nname = \"{name}\"\ninterface = \"wan{name}\"\npriority = 1\n[uplink.ipv4]\n")
+    };
+    let only_a = config::parse(&CONFIG.replace(&block(2, "b"), "")).unwrap();
+    let only_b = config::parse(&CONFIG.replace(&block(1, "a"), "")).unwrap();
+    let a = plan::plan(&only_a, &input(&[1]));
+    let install = diff_for(&System::default(), &only_a, &a, &a, true);
+    let mut s = System::default();
+    apply(&mut s, &only_a, &install);
+    // B is new: before its assignments, the active set is empty.
+    let b = plan::plan(&only_b, &input(&[2]));
+    let mut pending = input(&[2]);
+    pending.active.insert(Family::V4, BTreeSet::new());
+    let before = plan::plan(&only_b, &pending);
+    let v = rule_kinds(&diff_for(&s, &only_b, &before, &b, true));
+    let nft = position(&v, "nft");
+    assert!(
+        position(&v, "-route 1000") < nft,
+        "A leaves before its assignments: {v:?}"
+    );
+    assert!(nft < position(&v, "route 1000"), "B joins after its assignments: {v:?}");
+}
+
+#[test]
 fn an_added_uplink_joins_the_balancing_route_after_its_assignments() {
     let cfg = config::parse(CONFIG).unwrap();
     let mut s = System::default();

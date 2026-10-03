@@ -140,9 +140,13 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
             ops.push(Op::ReplaceRoute(r.clone()));
         }
     }
-    // Routes to withdraw: path tables last, after the rules that use them;
-    // balancing and policy tables first, except in a teardown.
-
+    // Routes to withdraw. Path tables go last, after the rules that use them
+    // (FR-REC-4). Balancing and policy tables go first, except in a
+    // teardown, by comparison with the state before the nftables
+    // replacement: a removed uplink leaves the active set and its policy
+    // tables before its assignments do (FR-REC-3, FR-REC-9), also when an
+    // added uplink takes its place; the final state's routes come back
+    // after the replacement.
     let mut tables = BTreeSet::new();
     for r in system.routes.values() {
         if r.protocol == d.protocol && d.layout.tables().contains(&r.table) && r.as_planned().is_some() {
@@ -151,9 +155,16 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
     }
     let (early, late): (Vec<_>, Vec<_>) = tables
         .into_iter()
-        .filter(|key| !d.desired.routes.contains_key(key))
         .partition(|(_, t)| !d.teardown && !d.layout.is_path_table(*t));
-    for (family, table) in early {
+    let early: Vec<_> = early
+        .into_iter()
+        .filter(|key| !d.before_nft.routes.contains_key(key))
+        .collect();
+    let late: Vec<_> = late
+        .into_iter()
+        .filter(|key| !d.desired.routes.contains_key(key))
+        .collect();
+    for &(family, table) in &early {
         ops.push(Op::DeleteRoute { family, table });
     }
     let observed = observed_rules(system, d.layout, d.protocol);
@@ -172,7 +183,7 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
         ops.push(Op::ApplyNft);
     }
     for (key, r) in &d.desired.routes {
-        if d.before_nft.routes.get(key) != Some(r) && !route_present(system, d.protocol, r) {
+        if d.before_nft.routes.get(key) != Some(r) && (early.contains(key) || !route_present(system, d.protocol, r)) {
             ops.push(Op::ReplaceRoute(r.clone()));
         }
     }
