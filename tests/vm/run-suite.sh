@@ -71,12 +71,15 @@ case $mode in
     kernel=$(ls "$rootfs"/boot/vmlinuz-* | sort -V | tail -n 1)
     vng=$(command -v vng)
     # The binaries are shared read-only at /mnt (a directory that exists in
-    # the root filesystem); the guest's exit status is the suite's. PATH is
+    # the root filesystem); the guest's exit status is the suite's. Some
+    # virtme-ng versions mount the guest's /run world-writable, which the
+    # daemon refuses as a parent of its configuration (FR-CFG-5); the tests
+    # keep their configurations there, so the guest's /run is made 0755. PATH is
     # passed through sudo because vng runs its helpers (virtme-run) from it,
     # and a pipx installation lives in ~/.local/bin.
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \
       --rodir "/mnt=$bindir" \
-      --exec "uname -r && nft --version && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+      --exec "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
     ;;
 esac

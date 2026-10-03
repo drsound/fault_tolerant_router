@@ -887,3 +887,464 @@ fn as42_router_reply_from_a_secondary_address() -> Result<()> {
     assert_eq!(counter_value(&t, "other")?, 0);
     Ok(())
 }
+
+/// The IPv4 path route of table `table`, as `ip route` prints it.
+fn path_route(t: &Topology, table: u32) -> Result<String> {
+    let out = t
+        .router()
+        .output("ip", ["-4", "route", "show", "table", &table.to_string()])?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// AS-10: the DHCP lease of A changes address and gateway; FTR's artifacts
+/// follow within 1 s; connections on B are unaffected.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let flows: Vec<_> = (40..46)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect::<Result<_>>()?;
+    std::thread::sleep(Duration::from_millis(500));
+    let old = address(&t, Uplink::A)?;
+    t.ns(Node::IspA).ip("addr add 192.0.2.254/24 dev wan")?;
+    // What a DHCP client does on a new lease (the default route keeps the
+    // harness realm that marks operating-system routes).
+    let r = t.router();
+    let realm = r.run("ip", ["-4", "route", "show", "default", "dev", "wana"])?;
+    let realm = realm
+        .split_whitespace()
+        .skip_while(|w| *w != "realm")
+        .nth(1)
+        .unwrap_or("99")
+        .to_owned();
+    let start = Instant::now();
+    r.ip(&format!("addr del {old}/24 dev wana"))?;
+    r.ip("addr add 192.0.2.77/24 dev wana")?;
+    r.ip(&format!(
+        "route replace default via 192.0.2.254 dev wana metric 100 realm {realm}"
+    ))?;
+    t.wait_for(
+        "A's path route with the new gateway and source",
+        Duration::from_secs(3),
+        || {
+            let p = path_route(&t, 1001)?;
+            Ok(p.contains("via 192.0.2.254") && p.contains("src 192.0.2.77"))
+        },
+    )?;
+    let took = start.elapsed();
+    assert!(took <= Duration::from_secs(1), "updated after {took:?}");
+    let rules = ftr_rules(&t)?.join("\n");
+    assert!(
+        rules.contains("from 192.0.2.77") && !rules.contains(&format!("from {old} ")),
+        "{rules}"
+    );
+    assert!(f.log().contains("path discovery changed uplink=1"), "{}", f.log());
+    std::thread::sleep(Duration::from_secs(1));
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
+        assert!(
+            r.continuous(Duration::from_millis(1000)),
+            "flow on B interrupted: {r:?}"
+        );
+    }
+    Ok(())
+}
+
+/// AS-11: the PPP uplink reconnects with a new interface index; artifacts
+/// follow and the per-interface settings are applied again.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as11_ppp_reconnection_with_a_new_ifindex() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&abc(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let ifindex = || -> Result<Option<u64>> {
+        Ok(t.router()
+            .ip_json("link show dev ppp0")
+            .ok()
+            .and_then(|v| v[0]["ifindex"].as_u64()))
+    };
+    let before = ifindex()?.expect("ppp0");
+    assert!(path_route(&t, 1003)?.contains("dev ppp0"));
+    t.pppoe_reset()?;
+    t.wait_for("ppp0 to come back with a new index", Duration::from_secs(30), || {
+        Ok(ifindex()?.is_some_and(|i| i != before))
+    })?;
+    let back = Instant::now();
+    t.wait_for("C's path route on the new ppp0", Duration::from_secs(10), || {
+        Ok(path_route(&t, 1003)?.contains("dev ppp0")
+            && t.router()
+                .run("ip", ["-4", "addr", "show", "dev", "ppp0"])?
+                .contains("inet "))
+    })?;
+    // The address may arrive after the link: the bound applies to the last event.
+    let _ = back;
+    let svm = t.router().run("cat", ["/proc/sys/net/ipv4/conf/ppp0/src_valid_mark"])?;
+    assert_eq!(svm.trim(), "1", "per-interface settings re-applied");
+    let route = path_route(&t, 1003)?;
+    let addr = address(&t, Uplink::C)?;
+    assert!(route.contains(&format!("src {addr}")), "{route}");
+    Ok(())
+}
+
+/// AS-22: retransmitted SYNs without answer and one-way UDP flows while the
+/// active set changes: every packet of each flow leaves through one uplink.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as22_unanswered_and_one_way_flows_stay_on_their_uplink() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    t.inet().nft("table inet blackhole {\n  chain in {\n    type filter hook prerouting priority 0; policy accept;\n    tcp dport 9999 drop\n  }\n}\n")?;
+    // The UDP flows are told apart by their (pre-NAT) source port.
+    t.router().nft("table inet t_flows {\n  set flows_tcp { type ipv4_addr . inet_service . ifname; flags dynamic; size 4096; }\n  set flows_udp { type inet_service . ifname; flags dynamic; size 4096; }\n  chain post {\n    type filter hook postrouting priority 300; policy accept;\n    oifname { \"wana\", \"wanb\" } tcp dport 9999 add @flows_tcp { ip daddr . ct original proto-src . oifname }\n    oifname { \"wana\", \"wanb\" } udp dport 7002 add @flows_udp { ct original proto-src . oifname }\n  }\n}\n")?;
+    let dsts: Vec<String> = (60..70)
+        .map(|n| format!("{}:9999", testbed::plan::server(Family::V4, n)))
+        .collect();
+    std::thread::scope(|s| -> Result<()> {
+        let syn = s.spawn(|| t.connect_to(Node::Client, &dsts, 10, false, Duration::from_secs(7)));
+        let udp: Vec<_> = (0..5u16)
+            .map(|i| {
+                let t = &t;
+                s.spawn(move || {
+                    t.udp_send(
+                        Node::Client,
+                        testbed::plan::server(Family::V4, 70 + i as u8),
+                        43000 + i,
+                        60,
+                        Duration::from_millis(100),
+                    )
+                })
+            })
+            .collect();
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_millis(1200));
+            t.upstream_down(Uplink::B)?;
+            wait_members(&t, &["wana"], Duration::from_secs(5))?;
+            t.upstream_up(Uplink::B)?;
+            wait_members(&t, &["wana", "wanb"], Duration::from_secs(8))?;
+        }
+        syn.join().expect("syn thread")?;
+        for u in udp {
+            u.join().expect("udp thread")?;
+        }
+        Ok(())
+    })?;
+    let listing = t.router().run("nft", ["-j", "list", "table", "inet", "t_flows"])?;
+    let v: serde_json::Value = serde_json::from_str(&listing)?;
+    let mut flows: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+    for o in v["nftables"].as_array().into_iter().flatten() {
+        let Some(set) = o.get("set") else { continue };
+        for e in set["elem"].as_array().into_iter().flatten() {
+            let parts = e["concat"]
+                .as_array()
+                .or_else(|| e["elem"]["val"]["concat"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            let parts: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+            if let Some((ifname, key)) = parts.split_last() {
+                flows
+                    .entry(format!("{} {}", set["name"], key.join(" ")))
+                    .or_default()
+                    .insert(ifname.clone());
+            }
+        }
+    }
+    assert!(flows.len() >= 12, "flows seen: {flows:?}");
+    let split: Vec<_> = flows.iter().filter(|(_, ifs)| ifs.len() > 1).collect();
+    assert!(split.is_empty(), "flows that changed uplink: {split:?}");
+    Ok(())
+}
+
+/// AS-30: with an empty active set and no operating-system default route,
+/// inbound DNAT traffic, connections to router listeners and ICMP and TCP
+/// probe replies are accepted; without the source rule of the probe source,
+/// ICMP probe replies fail the IPv4 reverse-path check (negative control).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as30_replies_with_an_empty_active_set() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1).priority(None),
+        UplinkSpec::new(Uplink::B, 2).priority(None),
+    ];
+    let health = HealthSpec {
+        text: "interval = \"1s\"\ntimeout = \"300ms\"\nattempts = 2\n[health.ipv4]\ntargets = [\"icmp:1.1.1.1\", \"icmp:8.8.8.8\", \"tcp:9.9.9.9:443\", \"tcp:208.67.222.222:443\"]\n".into(),
+    };
+    // Static gateways: the operating-system default routes go away.
+    let (gwa, gwb) = (gateway(&t, Uplink::A)?, gateway(&t, Uplink::B)?);
+    let config = ftr::ipv4_config(&ups, &health, "", "")
+        .replacen("[uplink.ipv4]\n", &format!("[uplink.ipv4]\ngateway = \"{gwa}\"\n"), 1)
+        .replacen(
+            "[uplink.ipv4]\n[health]",
+            &format!("[uplink.ipv4]\ngateway = \"{gwb}\"\n[health]"),
+            1,
+        );
+    for _ in 0..3 {
+        let _ = t.router().output("ip", ["-4", "route", "del", "default"])?;
+    }
+    let mut f = t.start_ftr(&config)?;
+    f.wait_installed(&t)?;
+    assert!(balancing_members(&t)?.is_empty());
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        !f.log().contains("to=Down"),
+        "ICMP and TCP probe replies accepted:\n{}",
+        f.log()
+    );
+    let _client = serve_in(&t, Node::Client)?;
+    let _router = serve_in(&t, Node::Router)?;
+    t.router().nft(&format!(
+        "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" tcp dport 8007 dnat to {}:{}\n  }}\n}}\n",
+        testbed::plan::LAN_CLIENT_V4,
+        testbed::plan::TCP_PORT
+    ))?;
+    let a = address(&t, Uplink::A)?;
+    for dst in [format!("{a}:8007"), format!("{a}:7000")] {
+        let r = t.connect_to(Node::Inet, std::slice::from_ref(&dst), 5, false, Duration::from_secs(2))?;
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok),
+            "{dst}: {:?}",
+            r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+        );
+    }
+    // Negative control: freeze the daemon, remove the source rule of A's
+    // address, and watch ICMP probe replies fail the reverse-path check.
+    f.signal("STOP")?;
+    t.router().ip(&format!("rule del from {a} pref 1501"))?;
+    let drops = || -> Result<u64> {
+        let out = t.router().run("nstat", ["-az", "TcpExtIPReversePathFilter"])?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+            .unwrap_or(0))
+    };
+    let before = drops()?;
+    let ping = t.router().output(
+        "ping",
+        [
+            "-n",
+            "-c",
+            "3",
+            "-W",
+            "1",
+            "-I",
+            "wana",
+            "-m",
+            &(0x0041_0000u32).to_string(),
+            "1.1.1.1",
+        ],
+    )?;
+    assert!(
+        !ping.status.success(),
+        "replies must be dropped without the source rule"
+    );
+    assert!(drops()? > before, "reverse-path drops counted");
+    f.signal("CONT")?;
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-37: an uplink removed by reload with a live connection: its packets
+/// are rejected by the path guard, never balanced; router traffic bound to
+/// its interface never leaves through another interface (INV-2, INV-3).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as37_removed_uplink_connections_are_rejected_not_moved() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::C, 3),
+        UplinkSpec::new(Uplink::A, 1).priority(Some(2)),
+        UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert_eq!(balancing_members(&t)?, ["ppp0"]);
+    t.reset_counters()?;
+    let flow = t.start_flow(
+        Node::Client,
+        testbed::plan::server(Family::V4, 77),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_millis(700));
+    counter(
+        &t,
+        "moved",
+        "oifname { \"wana\", \"wanb\" } ip daddr { 198.18.100.77, 198.18.100.78 }",
+    )?;
+    f.write_config(&ftr::ipv4_config(&[ups[1], ups[2]], &HealthSpec::fast(), "", ""))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let report = flow.stop()?;
+    assert_eq!(report.uplink(), Some(Uplink::C));
+    assert_eq!(t.ipv4_leaks()?, 0, "INV-3 for the connection of the removed uplink");
+    // Router traffic bound to C's interface: outside INV-3 (§4.1.1), it
+    // may leave on-link through C but never through another interface.
+    let _ = t
+        .router()
+        .output("ping", ["-n", "-c", "2", "-W", "1", "-I", "ppp0", "198.18.100.78"])?;
+    assert_eq!(
+        counter_value(&t, "moved")?,
+        0,
+        "no packet of the connection or of the bound traffic left through A or B"
+    );
+    Ok(())
+}
+
+/// AS-38: the checkpoint stays fresh without transitions, so a restart keeps
+/// a down path down (warm start); after a reboot (another boot id) the start
+/// is cold.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as38_warm_restart_and_cold_start_after_reboot() -> Result<()> {
+    let t = build();
+    let mut f = t.start_ftr(&ftr::ipv4_config(
+        &ab(),
+        &HealthSpec::fast(),
+        "all_down_policy = \"keep\"",
+        "",
+    ))?;
+    f.wait_installed(&t)?;
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(10))?;
+    let checkpoint = f.dir.join("state/health.json");
+    let stamp = |p: &std::path::Path| -> Result<u64> {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p)?)?;
+        Ok(v["boottime_ms"].as_u64().unwrap_or(0))
+    };
+    let first = stamp(&checkpoint)?;
+    std::thread::sleep(Duration::from_secs(32));
+    assert!(
+        stamp(&checkpoint)? > first,
+        "rewritten at least every 30 s without transitions"
+    );
+    f.stop()?;
+    f.start(&t)?;
+    f.wait_log(
+        &t,
+        "initial path state uplink=1 family=ipv4 state=Down warm=true",
+        1,
+        Duration::from_secs(10),
+    )?;
+    f.wait_installed(&t)?;
+    assert_eq!(balancing_members(&t)?, ["wanb"]);
+    f.stop()?;
+    // Reboot: another boot identifier.
+    let text = std::fs::read_to_string(&checkpoint)?;
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let boot = v["boot_id"].as_str().unwrap_or_default().to_owned();
+    std::fs::write(&checkpoint, text.replace(&boot, "00000000-0000-0000-0000-000000000000"))?;
+    f.start(&t)?;
+    f.wait_log(
+        &t,
+        "initial path state uplink=1 family=ipv4 state=Up warm=false",
+        1,
+        Duration::from_secs(10),
+    )?;
+    f.wait_log(
+        &t,
+        "uplink=1 family=ipv4 from=Up to=Down reason=probe_failed",
+        1,
+        Duration::from_secs(10),
+    )?;
+    t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+/// AS-50: a connection from a host behind an interface FTR does not manage
+/// to a LAN host, whose replies follow the balancing route: the replies are
+/// never assigned a path and continue through the other uplink when theirs
+/// loses readiness.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as50_unmanaged_interface_replies_are_not_pinned() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let _client = serve_in(&t, Node::Client)?;
+    // An unmanaged link between the router and the internet node; the
+    // internet node reaches the LAN through it from 198.18.100.50, which the
+    // router reaches only through its uplinks.
+    testbed::netns::host(
+        "ip",
+        [
+            "link",
+            "add",
+            "wanx",
+            "netns",
+            t.router().name(),
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "rx",
+            "netns",
+            t.inet().name(),
+        ],
+    )?;
+    t.router().ip("addr add 10.250.0.1/30 dev wanx")?;
+    t.router().ip("link set wanx up")?;
+    let i = t.inet();
+    i.ip("addr add 10.250.0.2/30 dev rx")?;
+    i.ip("link set rx up")?;
+    i.ip("addr add 198.18.100.50/32 dev lo")?;
+    i.ip("route add 198.51.100.0/24 via 10.250.0.1 src 198.18.100.50")?;
+    for k in ["all", "default", "rx"] {
+        i.run("sysctl", ["-qw", &format!("net.ipv4.conf.{k}.rp_filter=0")])?;
+    }
+    for name in i.run("ls", ["/proc/sys/net/ipv4/conf"])?.split_whitespace() {
+        let _ = i.output("sysctl", ["-qw", &format!("net.ipv4.conf.{name}.rp_filter=0")]);
+    }
+    counter(&t, "a", "oifname \"wana\" ip daddr 198.18.100.50")?;
+    counter(&t, "b", "oifname \"wanb\" ip daddr 198.18.100.50")?;
+    let flow = t.start_flow(
+        Node::Inet,
+        testbed::plan::LAN_CLIENT_V4.into(),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    let ct = t.router().run(
+        "conntrack",
+        [
+            "-L",
+            "-s",
+            "198.18.100.50",
+            "-d",
+            &testbed::plan::LAN_CLIENT_V4.to_string(),
+        ],
+    )?;
+    let marks: Vec<&str> = ct.split_whitespace().filter(|w| w.starts_with("mark=")).collect();
+    assert!(
+        !marks.is_empty()
+            && marks
+                .iter()
+                .all(|m| u32::from_str_radix(m.trim_start_matches("mark="), 10).unwrap_or(1) & 0x00ff_0000 == 0),
+        "{ct}"
+    );
+    let (a, b) = (counter_value(&t, "a")?, counter_value(&t, "b")?);
+    let used = if a > b { Uplink::A } else { Uplink::B };
+    assert!(a.min(b) == 0 && a.max(b) > 0, "replies through one uplink: a={a} b={b}");
+    t.carrier_down(used)?;
+    std::thread::sleep(Duration::from_secs(3));
+    let report = flow.stop()?;
+    assert!(report.continuous(Duration::from_millis(2500)), "{report:?}");
+    let other = if used == Uplink::A {
+        counter_value(&t, "b")?
+    } else {
+        counter_value(&t, "a")?
+    };
+    assert!(other > 0, "replies continued through the other uplink");
+    t.carrier_up(used)?;
+    Ok(())
+}
