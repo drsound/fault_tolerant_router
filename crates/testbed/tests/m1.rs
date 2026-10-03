@@ -1329,7 +1329,7 @@ fn as50_unmanaged_interface_replies_are_not_pinned() -> Result<()> {
         !marks.is_empty()
             && marks
                 .iter()
-                .all(|m| u32::from_str_radix(m.trim_start_matches("mark="), 10).unwrap_or(1) & 0x00ff_0000 == 0),
+                .all(|m| m.trim_start_matches("mark=").parse::<u32>().unwrap_or(1) & 0x00ff_0000 == 0),
         "{ct}"
     );
     let (a, b) = (counter_value(&t, "a")?, counter_value(&t, "b")?);
