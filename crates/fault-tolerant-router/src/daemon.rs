@@ -377,10 +377,11 @@ impl Daemon {
         if self.cfg.firewall.mode == FirewallMode::External {
             match nftctl::table(&self.cfg.firewall.nft_path).await {
                 Ok(Some(_)) => {
-                    self.degraded.remove("external_ruleset_missing");
+                    self.recover("external_ruleset_missing");
                 }
                 Ok(None) => {
-                    if self.degraded.insert("external_ruleset_missing") {
+                    if !self.degraded.contains("external_ruleset_missing") {
+                        self.degrade("external_ruleset_missing");
                         warn!(
                             "external firewall mode: table inet {} is missing; load `export-nft` output",
                             nft::TABLE
@@ -404,6 +405,42 @@ impl Daemon {
         }
     }
 
+    /// Adds a degradation reason; `status_degraded` on the overall
+    /// transition (FR-EV-1, FR-API-2).
+    fn degrade(&mut self, reason: &'static str) {
+        let was_ok = self.degraded.is_empty();
+        if self.degraded.insert(reason) && was_ok {
+            warn!(reason, "status_degraded");
+        }
+    }
+
+    /// Clears a degradation reason; `status_recovered` only when no other
+    /// reason remains.
+    fn recover(&mut self, reason: &'static str) {
+        if self.degraded.remove(reason) && self.degraded.is_empty() {
+            info!(reason, "status_recovered");
+        }
+    }
+
+    /// FR-CT-2 runtime inspection against the running configuration.
+    async fn inspect_flowtables(&mut self) {
+        match nftctl::ruleset(&self.cfg.firewall.nft_path).await {
+            Ok(r) => {
+                let found = checks::flowtables(&r, &self.cfg);
+                if found.is_empty() {
+                    self.recover("flow_offload");
+                } else {
+                    for e in &found {
+                        error!("{e}");
+                    }
+                    self.degrade("flow_offload");
+                }
+            }
+            // A failed inspection is reported and never clears the reason.
+            Err(e) => error!("flowtable inspection failed: {e}"),
+        }
+    }
+
     fn count_removal(&mut self, kind: &'static str) {
         let o = self.ownership.entry(kind).or_default();
         let now = Instant::now();
@@ -418,7 +455,7 @@ impl Daemon {
         o.clean_reconciliations = 0;
         if o.removals.len() > 3 && !o.conflict {
             o.conflict = true;
-            self.degraded.insert("ownership_conflict");
+            self.degrade("ownership_conflict");
             warn!(
                 kind,
                 "artifacts removed by a third party more than 3 times in 5 minutes: immediate repairs stop (FR-COEX-4)"
@@ -817,15 +854,16 @@ impl Daemon {
     }
 
     fn applied(&mut self) {
-        if self.retry.take().is_some() || self.degraded.remove("apply_failed") {
+        if self.retry.take().is_some() || self.degraded.contains("apply_failed") {
             info!("desired state fully applied");
+            self.recover("apply_failed");
         }
     }
 
     /// FR-REC-5: report, count, retry with exponential backoff (1 s to 60 s).
     fn failed(&mut self, f: Failure) {
         error!(operation = %f.op, "apply_failed: {}", f.error);
-        self.degraded.insert("apply_failed");
+        self.degrade("apply_failed");
         if let Some((family, table)) = f.route
             && let Some(key) = self
                 .paths
@@ -852,6 +890,7 @@ impl Daemon {
             Err(e) => warn!("full reconciliation dump failed: {e}"),
         }
         self.check_nft().await;
+        self.inspect_flowtables().await;
         for o in self.ownership.values_mut() {
             if o.conflict {
                 o.clean_reconciliations += 1;
@@ -862,7 +901,7 @@ impl Daemon {
             }
         }
         if self.ownership.values().all(|o| !o.conflict) {
-            self.degraded.remove("ownership_conflict");
+            self.recover("ownership_conflict");
         }
         self.route_failed.clear();
         self.dirty = true;
@@ -887,6 +926,24 @@ impl Daemon {
         if new.structural() != self.cfg.structural() {
             error!("reload_failed: structural settings cannot change on reload (FR-CFG-4)");
             return;
+        }
+        // FR-CT-2: inspect against the running configuration, and refuse a
+        // proposed configuration that would match.
+        self.inspect_flowtables().await;
+        match nftctl::ruleset(&new.firewall.nft_path).await {
+            Ok(r) => {
+                let found = checks::flowtables(&r, &new);
+                if !found.is_empty() {
+                    for e in found {
+                        error!("reload_failed: {e}");
+                    }
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("reload_failed: cannot inspect the flowtables: {e}");
+                return;
+            }
         }
         let conflicts = self.manifest.check(&new);
         if !conflicts.is_empty() {

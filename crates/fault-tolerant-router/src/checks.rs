@@ -194,17 +194,38 @@ fn network(a: IpAddr, len: u8) -> IpAddr {
     }
 }
 
+/// Flowtables whose device selectors match a configured uplink or downlink
+/// (FR-CT-2): by name, also for interfaces that do not exist, a trailing `*`
+/// treated as a possible prefix selector. Software and hardware offload
+/// alike. Returns the diagnostics.
+pub fn flowtables(ruleset: &Value, config: &Config) -> Vec<String> {
+    let interfaces = config
+        .uplinks
+        .iter()
+        .map(|u| (u.interface.as_str(), "uplink"))
+        .chain(config.downlinks.iter().map(|d| (d.as_str(), "downlink")));
+    let interfaces: Vec<(&str, &str)> = interfaces.collect();
+    let mut v = Vec::new();
+    for (ft, selector) in nftctl::flowtable_devices(ruleset) {
+        for (name, role) in &interfaces {
+            let matches = match selector.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => selector == *name,
+            };
+            if matches {
+                v.push(format!(
+                    "flowtable {ft}: device selector {selector:?} matches the {role} {name}; flow offload between downlinks and uplinks bypasses FTR's marking and is not supported (FR-CT-2)"
+                ));
+            }
+        }
+    }
+    v
+}
+
 /// FR-CT-1, FR-CT-2, FR-NAT-4 from the JSON ruleset.
 pub fn ruleset(ruleset: &Value, config: &Config) -> Findings {
     let mut f = Findings::default();
-    let uplinks: Vec<&str> = config.uplinks.iter().map(|u| u.interface.as_str()).collect();
-    for (ft, dev) in nftctl::flowtable_devices(ruleset) {
-        if uplinks.contains(&dev.as_str()) {
-            f.errors.push(format!(
-                "flowtable {ft} includes the uplink interface {dev}: offloaded packets bypass FTR's marking (FR-CT-2)"
-            ));
-        }
-    }
+    f.errors.extend(flowtables(ruleset, config));
     for c in nftctl::notrack_chains(ruleset) {
         f.warnings.push(format!(
             "chain {c} contains notrack statements: untracked data traffic is not pinned (FR-CT-1)"
@@ -360,6 +381,17 @@ mod tests {
             r#"{"nftables":[{"flowtable":{"family":"inet","table":"f","name":"ft","dev":["lan","wana"]}}]}"#,
         )
         .unwrap();
-        assert_eq!(ruleset(&r, &cfg).errors.len(), 1);
+        assert_eq!(ruleset(&r, &cfg).errors.len(), 2, "uplink and downlink");
+        let r: Value = serde_json::from_str(
+            r#"{"nftables":[{"flowtable":{"family":"inet","table":"f","name":"ft","dev":"wan*"}},{"flowtable":{"family":"ip","table":"g","name":"other","dev":"eth9"}}]}"#,
+        )
+        .unwrap();
+        let e = flowtables(&r, &cfg);
+        assert_eq!(
+            e.len(),
+            1,
+            "a trailing * is a possible prefix; unrelated devices are fine: {e:?}"
+        );
+        assert!(e[0].contains("inet f ft") && e[0].contains("\"wan*\"") && e[0].contains("uplink wana"));
     }
 }
