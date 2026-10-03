@@ -1,0 +1,243 @@
+######## t1-ruleset.sh
+== syntax and bytecode
+PASS ruleset accepted by nft (check mode)
+     bitwise operations: 272, of which constant mask-and-xor: 272
+     sample:  [ meta load mark => reg 1 ] [ bitwise reg 1 = ( reg 1 & 0xff00ffff ) ^ 0x00010000 ] [ meta set mark with reg 1 ] [ immediate reg 0 return ] 
+PASS every bitwise operation is register & constant ^ constant (FR-MARK-3)
+PASS no bitwise operation combines two registers
+PASS no accept, drop or reject verdict in any rule (FR-FW-4)
+     rules in the table: 151
+== traffic over every uplink (including the point-to-point one) with the refined ruleset
+PASS v4 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 9, "B": 11, "C": 10}})
+PASS v6 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 11, "B": 9, "C": 10}})
+== JSON listing stability for FR-REC-6
+PASS raw listings differ after re-applying identical text
+     keys that differ: ['table.handle'] objects 152 152
+PASS listings equal once metainfo and handles are removed
+PASS a third-party change is detected after normalisation
+== atomic replacement with live flows and NAT bindings
+PASS v4 outbound NAT flow across 20 replacements: no error, gap < 0.5 s
+PASS v4 inbound DNAT flow across 20 replacements: no error, gap < 0.5 s
+PASS v6 outbound NAT flow across 20 replacements: no error, gap < 0.5 s
+PASS v6 inbound DNAT flow across 20 replacements: no error, gap < 0.5 s
+
+t1-ruleset.sh: 13 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t2-lifecycle.sh
+== IPv4 outbound forwarded connection, active set {B}
+PASS v4 connection works via B ({"errors": {}, "peers": {"B": 1}})
+     o_fin_all=5 o_fin_c2=5 o_fin_if_wanb=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_wanb=5 o_post_m2=5 o_pre_all=5 o_pre_c0=1 o_pre_c2=4 o_pre_m0=1 o_pre_m2=4 r_fin_all=3 r_fin_c2=3 r_fin_if_lan=3 r_fin_m2=3 r_post_all=3 r_post_c2=3 r_post_if_lan=3 r_post_m2=3 r_pre_all=3 r_pre_c2=3 r_pre_m2=3
+PASS v4 first packet unmarked in prerouting (no assignment before routing)
+PASS v4 every later original packet restored in prerouting
+PASS v4 every reply packet restored in prerouting
+PASS v4 after postrouting every original packet carries path 2 in conntrack and packet marks
+PASS v4 ... packet mark
+PASS v4 conntrack entry marked with path 2
+== IPv4 policy-marked connection (policy-balance to A), active set {B}
+PASS v4 policy connection via A ({"errors": {}, "peers": {"A": 1}})
+     o_fin_all=5 o_fin_c1=5 o_fin_if_wana=5 o_fin_m1=5 o_post_all=5 o_post_c1=5 o_post_if_wana=5 o_post_m1=5 o_pre_all=5 o_pre_c0=1 o_pre_c1=4 o_pre_m1=4 o_pre_m129=1 r_fin_all=3 r_fin_c1=3 r_fin_if_lan=3 r_fin_m1=3 r_post_all=3 r_post_c1=3 r_post_if_lan=3 r_post_m1=3 r_pre_all=3 r_pre_c1=3 r_pre_m1=3
+PASS v4 first packet carries the policy value 0x81 in the packet mark only
+PASS v4 after postrouting: path value 1 (actual egress) in conntrack and packet marks
+PASS v4 conntrack entry marked with path 1, not the policy value
+PASS v4 policy table of A empty: connection balanced via B ({"errors": {}, "peers": {"B": 1}})
+PASS v4 ... and its conntrack mark is path 2, the actual egress (FR-POL-2)
+== IPv4 inbound connection through B, active set {A}
+PASS v4 inbound connection answered
+     o_fin_all=5 o_fin_c2=5 o_fin_if_lan=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_lan=5 o_post_m2=5 o_pre_all=5 o_pre_c2=5 o_pre_m2=5 r_fin_all=4 r_fin_c2=4 r_fin_if_wanb=4 r_fin_m2=4 r_post_all=4 r_post_c2=4 r_post_if_wanb=4 r_post_m2=4 r_pre_all=4 r_pre_c2=4 r_pre_m2=4
+PASS v4 every original packet carries path 2 after prerouting, the first included
+PASS v4 every reply packet restored on the downlink
+PASS v4 every reply leaves through B
+== IPv4 probes (ICMP and TCP) of A, active set {B}
+PASS v4 ICMP probes answered ({"lost": 0, "replies": 3})
+PASS v4 TCP probes answered
+     o_fin_all=13 o_fin_c0=13 o_fin_if_wana=13 o_fin_m65=13 o_out_all=13 o_out_c0=13 o_out_if_wana=13 o_out_m65=13 o_post_all=13 o_post_c0=13 o_post_if_wana=13 o_post_m65=13 r_pre_all=9 r_pre_c0=9 r_pre_m0=9
+PASS v4 probe packets keep the probe value after output and postrouting (never assigned)
+PASS v4 probe packets leave through A
+PASS v4 conntrack entries of probes carry no path value
+PASS v4 replies to probes are left unmarked
+== IPv6 outbound forwarded connection, active set {B}
+PASS v6 connection works via B ({"errors": {}, "peers": {"B": 1}})
+     o_fin_all=5 o_fin_c2=5 o_fin_if_wanb=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_wanb=5 o_post_m2=5 o_pre_all=5 o_pre_c0=1 o_pre_c2=4 o_pre_m0=1 o_pre_m2=4 r_fin_all=3 r_fin_c2=3 r_fin_if_lan=3 r_fin_m2=3 r_post_all=3 r_post_c2=3 r_post_if_lan=3 r_post_m2=3 r_pre_all=3 r_pre_c2=3 r_pre_m2=3
+PASS v6 first packet unmarked in prerouting (no assignment before routing)
+PASS v6 every later original packet restored in prerouting
+PASS v6 every reply packet restored in prerouting
+PASS v6 after postrouting every original packet carries path 2 in conntrack and packet marks
+PASS v6 ... packet mark
+PASS v6 conntrack entry marked with path 2
+== IPv6 policy-marked connection (policy-balance to A), active set {B}
+PASS v6 policy connection via A ({"errors": {}, "peers": {"A": 1}})
+     o_fin_all=5 o_fin_c1=5 o_fin_if_wana=5 o_fin_m1=5 o_post_all=5 o_post_c1=5 o_post_if_wana=5 o_post_m1=5 o_pre_all=5 o_pre_c0=1 o_pre_c1=4 o_pre_m1=4 o_pre_m129=1 r_fin_all=3 r_fin_c1=3 r_fin_if_lan=3 r_fin_m1=3 r_post_all=3 r_post_c1=3 r_post_if_lan=3 r_post_m1=3 r_pre_all=3 r_pre_c1=3 r_pre_m1=3
+PASS v6 first packet carries the policy value 0x81 in the packet mark only
+PASS v6 after postrouting: path value 1 (actual egress) in conntrack and packet marks
+PASS v6 conntrack entry marked with path 1, not the policy value
+PASS v6 policy table of A empty: connection balanced via B ({"errors": {}, "peers": {"B": 1}})
+PASS v6 ... and its conntrack mark is path 2, the actual egress (FR-POL-2)
+== IPv6 inbound connection through B, active set {A}
+PASS v6 inbound connection answered
+     o_fin_all=5 o_fin_c2=5 o_fin_if_lan=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_lan=5 o_post_m2=5 o_pre_all=5 o_pre_c2=5 o_pre_m2=5 r_fin_all=3 r_fin_c2=3 r_fin_if_wanb=3 r_fin_m2=3 r_post_all=3 r_post_c2=3 r_post_if_wanb=3 r_post_m2=3 r_pre_all=3 r_pre_c2=3 r_pre_m2=3
+PASS v6 every original packet carries path 2 after prerouting, the first included
+PASS v6 every reply packet restored on the downlink
+PASS v6 every reply leaves through B
+== IPv6 probes (ICMP and TCP) of A, active set {B}
+PASS v6 ICMP probes answered ({"lost": 0, "replies": 3})
+PASS v6 TCP probes answered
+     o_fin_all=13 o_fin_c0=13 o_fin_if_wana=13 o_fin_m65=13 o_out_all=13 o_out_c0=13 o_out_if_wana=13 o_out_m65=13 o_post_all=13 o_post_c0=13 o_post_if_wana=13 o_post_m65=13 r_pre_all=9 r_pre_c0=9 r_pre_m0=9
+PASS v6 probe packets keep the probe value after output and postrouting (never assigned)
+PASS v6 probe packets leave through A
+PASS v6 conntrack entries of probes carry no path value
+PASS v6 replies to probes are left unmarked
+
+t2-lifecycle.sh: 46 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t3-foreign.sh
+######## fwmark_mask 0x000000ff (offset 0): foreign packet bits 0x01010100 + 0x08080800, conntrack bits 0x02020200, socket bits 0x10101000
+PASS v4 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v4 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v4 conntrack mark = foreign bits | path 2
+PASS v4 inbound connections through B answered
+PASS v4 replies leave with all foreign bits and path 2
+PASS v4 conntrack mark of inbound = foreign bits | path 2
+PASS v4 probe of A with foreign bits in the socket mark answered
+PASS v4 probe packets keep foreign bits and the probe value
+PASS v4 probe conntrack mark has only the foreign conntrack bits
+PASS v6 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v6 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v6 conntrack mark = foreign bits | path 2
+PASS v6 inbound connections through B answered
+PASS v6 replies leave with all foreign bits and path 2
+PASS v6 conntrack mark of inbound = foreign bits | path 2
+PASS v6 probe of A with foreign bits in the socket mark answered
+PASS v6 probe packets keep foreign bits and the probe value
+PASS v6 probe conntrack mark has only the foreign conntrack bits
+
+t3-foreign.sh: 18 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## fwmark_mask 0x00ff0000 (offset 16): foreign packet bits 0x01000101 + 0x08000808, conntrack bits 0x02000202, socket bits 0x10001010
+PASS v4 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v4 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v4 conntrack mark = foreign bits | path 2
+PASS v4 inbound connections through B answered
+PASS v4 replies leave with all foreign bits and path 2
+PASS v4 conntrack mark of inbound = foreign bits | path 2
+PASS v4 probe of A with foreign bits in the socket mark answered
+PASS v4 probe packets keep foreign bits and the probe value
+PASS v4 probe conntrack mark has only the foreign conntrack bits
+PASS v6 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v6 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v6 conntrack mark = foreign bits | path 2
+PASS v6 inbound connections through B answered
+PASS v6 replies leave with all foreign bits and path 2
+PASS v6 conntrack mark of inbound = foreign bits | path 2
+PASS v6 probe of A with foreign bits in the socket mark answered
+PASS v6 probe packets keep foreign bits and the probe value
+PASS v6 probe conntrack mark has only the foreign conntrack bits
+
+t3-foreign.sh: 18 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## fwmark_mask 0xff000000 (offset 24): foreign packet bits 0x00010101 + 0x00080808, conntrack bits 0x00020202, socket bits 0x00101010
+PASS v4 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v4 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v4 conntrack mark = foreign bits | path 2
+PASS v4 inbound connections through B answered
+PASS v4 replies leave with all foreign bits and path 2
+PASS v4 conntrack mark of inbound = foreign bits | path 2
+PASS v4 probe of A with foreign bits in the socket mark answered
+PASS v4 probe packets keep foreign bits and the probe value
+PASS v4 probe conntrack mark has only the foreign conntrack bits
+PASS v6 outbound connections via B with foreign bits present ({"errors": {}, "peers": {"B": 3}})
+PASS v6 outbound packets leave with all foreign bits and path 2 (all ok)
+PASS v6 conntrack mark = foreign bits | path 2
+PASS v6 inbound connections through B answered
+PASS v6 replies leave with all foreign bits and path 2
+PASS v6 conntrack mark of inbound = foreign bits | path 2
+PASS v6 probe of A with foreign bits in the socket mark answered
+PASS v6 probe packets keep foreign bits and the probe value
+PASS v6 probe conntrack mark has only the foreign conntrack bits
+
+t3-foreign.sh: 18 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t4-flows.sh
+== AS-22: unanswered SYNs and one-way UDP while the active set changes
+     flows {('IP', 'tcp'): 10, ('IP', 'udp'): 10, ('IP6', 'tcp'): 10, ('IP6', 'udp'): 10} split 0 min_packets 4; syn sockets: {"pending": 10} {"pending": 10}; udp: {"errors": {}, "sent": 400} {"errors": {}, "sent": 400}
+PASS 40 flows observed (10 per family and protocol)
+PASS every packet of every flow left through a single uplink
+PASS every SYN flow was retransmitted at least 3 times (4 SYNs)
+== RELATED ICMP for inbound traffic through B, active set {A}
+PASS v4 port unreachable from the LAN host leaves through B only (a b c)
+     IP 198.51.100.2 > 198.18.2.1: ICMP 198.51.100.2 udp port 8009 unreachable, length 37
+PASS v4 time exceeded generated by the router leaves through B only (a b c)
+     IP 198.51.100.2 > 198.18.2.1: ICMP time exceeded in-transit, length 37
+PASS v6 port unreachable from the LAN host leaves through B only (a b c)
+     IP6 2001:db8:b::2 > 2001:db8:ff02::1: ICMP6, destination unreachable, unreachable port, 2001:db8:b::2 udp port 8009, length 57
+PASS v6 time exceeded generated by the router leaves through B only (a b c)
+     IP6 2001:db8:b::2 > 2001:db8:ff02::1: ICMP6, time exceeded in-transit for 2001:db8:b::2, length 57
+== AS-31 core: path MTU discovery for a pinned outbound flow (provider A's core link MTU 1300)
+PASS v4 300 kB transfer pinned to A completes across a 1300-byte link
+PASS v4 control: with the ICMP errors dropped the transfer fails
+PASS v6 300 kB transfer pinned to A completes across a 1300-byte link
+PASS v6 control: with the ICMP errors dropped the transfer fails
+
+t4-flows.sh: 11 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t5-output.sh
+     v4 with-output-chain: {"errors": {}, "peers": {"198.18.1.1": 5}}; replies via a=15 b=0; conntrack path 0x1 0x1 0x1 0x1 0x1 
+PASS v4 replies of the router leave through the arrival uplink A
+     v6 with-output-chain: {"errors": {}, "peers": {"2001:db8:ff01::1": 5}}; replies via a=16 b=0; conntrack path 0x1 0x1 0x1 0x1 0x1 
+PASS v6 replies of the router leave through the arrival uplink A
+     v4 without-output-chain: {"errors": {}, "peers": {"198.18.1.1": 5}}; replies via a=0 b=15; conntrack path 0x1 0x1 0x1 0x1 0x1 
+PASS v4 control without the output chain: replies follow balancing through B
+     v6 without-output-chain: {"errors": {}, "peers": {"2001:db8:ff01::1": 5}}; replies via a=0 b=15; conntrack path 0x1 0x1 0x1 0x1 0x1 
+PASS v6 control without the output chain: replies follow balancing through B
+
+t5-output.sh: 4 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t6-policies.sh
+== IPv4
+PASS v4 balance policy: new connections via A although A is not in the active set ({"errors": {}, "peers": {"A": 8}})
+PASS v4 block policy: new connections via A ({"errors": {}, "peers": {"A": 8}})
+PASS v4 flows opened before stay alive on A
+PASS v4 balance policy, A's table empty: new connections balanced over B, C ({"errors": {}, "peers": {"B": 5, "C": 3}})
+PASS v4 block policy, A's table empty: new connections fail ({"errors": {"ENETUNREACH": 2, "timeout": 2}, "peers": {}})
+PASS v4 ... and none of their packets leaves through any uplink
+     flow opened during the fallback pinned to path 0x2
+PASS v4 after A's tables return, the fallback flow is still on path 0x2
+PASS v4 new balance-policy connections via A again
+PASS v4 balance-policy flow on A: no error
+PASS v4 block-policy flow on A: no error
+PASS v4 fallback flow: no error, not on A
+== IPv6
+PASS v6 balance policy: new connections via A although A is not in the active set ({"errors": {}, "peers": {"A": 8}})
+PASS v6 block policy: new connections via A ({"errors": {}, "peers": {"A": 8}})
+PASS v6 flows opened before stay alive on A
+PASS v6 balance policy, A's table empty: new connections balanced over B, C ({"errors": {}, "peers": {"B": 7, "C": 1}})
+PASS v6 block policy, A's table empty: new connections fail ({"errors": {"ENETUNREACH": 4}, "peers": {}})
+PASS v6 ... and none of their packets leaves through any uplink
+     flow opened during the fallback pinned to path 0x2
+PASS v6 after A's tables return, the fallback flow is still on path 0x2
+PASS v6 new balance-policy connections via A again
+PASS v6 balance-policy flow on A: no error
+PASS v6 block-policy flow on A: no error
+PASS v6 fallback flow: no error, not on A
+
+t6-policies.sh: 22 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t7-as30.sh
+PASS no default route left in main
+PASS v4 rp_filter=2 src_valid_mark=1: inbound DNAT through A -> ok
+PASS v4 rp_filter=2 src_valid_mark=1: connection to a router listener through A -> ok
+PASS v4 rp_filter=2 src_valid_mark=1: ICMP probe of A answered -> ok
+PASS v4 rp_filter=2 src_valid_mark=1: TCP probe of A answered -> ok
+PASS v6 rp_filter=2 src_valid_mark=1: inbound DNAT through A -> ok
+PASS v6 rp_filter=2 src_valid_mark=1: connection to a router listener through A -> ok
+PASS v6 rp_filter=2 src_valid_mark=1: ICMP probe of A answered -> ok
+PASS v6 rp_filter=2 src_valid_mark=1: TCP probe of A answered -> ok
+PASS IPv4 reverse-path drops so far
+== IPv4 negative control: source rule (and its guard) of the probe source removed
+PASS v4 ICMP probe replies rejected by reverse-path filtering (source guard)
+PASS v4 ICMP probe replies rejected by reverse-path filtering (final guard)
+PASS v4 reverse-path drops counted
+     v4 TCP probe without the source rule: {"errors": {"timeout": 1}, "peers": {}}
+== src_valid_mark = 0 on the uplinks
+PASS v4 src_valid_mark=0: inbound DNAT through A -> fail
+PASS v4 src_valid_mark=0: connection to a router listener through A -> ok
+PASS v4 src_valid_mark=0: ICMP probe of A answered -> ok
+PASS v4 src_valid_mark=0: TCP probe of A answered -> ok
+PASS v6 src_valid_mark=0: inbound DNAT through A -> ok
+PASS v6 src_valid_mark=0: connection to a router listener through A -> ok
+PASS v6 src_valid_mark=0: ICMP probe of A answered -> ok
+PASS v6 src_valid_mark=0: TCP probe of A answered -> ok
+     v4 reverse-path drops with src_valid_mark=0: 10
+
+t7-as30.sh: 21 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
