@@ -58,7 +58,23 @@ jobs:
             sudo ln -sf /etc/apparmor.d/usr.sbin.dnsmasq /etc/apparmor.d/disable/
             sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.dnsmasq || true
           fi
-      - run: uname -r && nft --version
+      - name: Cache the upstream nftables build
+        id: nft-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ftr-nftables
+          key: nftables-${{ runner.os }}-${{ hashFiles('tests/ci/build-nftables.sh') }}
+      - name: Build the newest upstream nftables
+        # The runner's distribution ships an older nftables; §14.1 asks for a
+        # current one. It is installed in /usr/local/sbin, which comes before
+        # /usr/sbin in sudo's secure_path.
+        run: |
+          sudo apt-get install -y --no-install-recommends libjansson-dev
+          if [ "${{ steps.nft-cache.outputs.cache-hit }}" != true ]; then
+            tests/ci/build-nftables.sh ~/.cache/ftr-nftables
+          fi
+          sudo ln -sf ~/.cache/ftr-nftables/sbin/nft /usr/local/sbin/nft
+      - run: uname -r && sudo nft --version
       - run: tests/vm/run-suite.sh --host
 
   netns-minimum:
