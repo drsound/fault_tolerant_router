@@ -608,8 +608,11 @@ impl Drop for RemoveOnDrop {
 #[ignore = "needs root and network namespaces"]
 fn as33_networkd_foreign_management() -> Result<()> {
     let t = build();
+    // A script's process name is its file name. (A copy of `sleep` is not
+    // enough: uutils' multicall binary picks the utility by its own name.)
     let fake = t.dir().join("systemd-networkd");
-    std::fs::copy("/bin/sleep", &fake)?;
+    std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n")?;
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let fake = fake.display().to_string();
     let dropins = t.netns_etc(Node::Router).join("systemd/networkd.conf.d");
     std::fs::create_dir_all(&dropins)?;
@@ -623,9 +626,7 @@ fn as33_networkd_foreign_management() -> Result<()> {
     let enabled = |key: &str| format!("systemd-networkd is active with {key} enabled");
 
     // A networkd in another namespace manages other interfaces.
-    let mut other = t
-        .client()
-        .spawn(&fake, ["infinity"], &t.dir().join("networkd-client.log"))?;
+    let mut other = t.client().spawn(&fake, [""; 0], &t.dir().join("networkd-client.log"))?;
     let (ok, text) = check(&f)?;
     assert!(ok, "{text}");
     f.start(&t)?;
@@ -634,9 +635,7 @@ fn as33_networkd_foreign_management() -> Result<()> {
     other.kill()?;
     other.wait()?;
 
-    let mut networkd = t
-        .router()
-        .spawn(&fake, ["infinity"], &t.dir().join("networkd-router.log"))?;
+    let mut networkd = t.router().spawn(&fake, [""; 0], &t.dir().join("networkd-router.log"))?;
     // Defaults: both enabled.
     let (ok, text) = check(&f)?;
     assert!(!ok, "{text}");

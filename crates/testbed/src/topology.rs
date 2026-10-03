@@ -110,11 +110,18 @@ pub fn prefix(run_id: &str) -> String {
 }
 
 fn random_run_id() -> String {
+    // Parallel tests can read the same clock value (a coarse clock source
+    // in a virtual machine): a per-process sequence number tells them apart.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let mixed = (nanos as u64) ^ (u64::from(std::process::id()) << 32) ^ (nanos >> 64) as u64;
+    let mixed = (nanos as u64)
+        ^ (u64::from(std::process::id()) << 32)
+        ^ (nanos >> 64) as u64
+        ^ seq.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     // Fold to 24 bits: short names keep `ip netns list` readable.
     format!("{:06x}", (mixed ^ (mixed >> 24) ^ (mixed >> 48)) & 0xff_ffff)
 }
