@@ -1,6 +1,7 @@
 #!/bin/sh
 # Spike S3: run the netlink checks inside a disposable namespace.
-# Usage: run.sh [BINARY] [TEST]   (TEST: all, rules, routes, extack, notify, inspect, implicit, dumpintr, enobufs, install)
+# Usage: run.sh [BINARY] [TEST]   (TEST: all, rules, routes, extack, notify, inspect, implicit, dumpintr, enobufs, dumpskip, install)
+# S3_DUMPSKIP_CASES=name,... limits the dumpskip group to some cases.
 set -eu
 BIN=$(readlink -f "${1:-./s3-netlink}")
 TEST=${2:-all}
