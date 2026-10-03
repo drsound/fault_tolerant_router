@@ -28,8 +28,14 @@ impl Setting {
 
     /// The conventional dotted name, for messages.
     pub fn display(&self) -> String {
-        self.key.replace('/', ".")
+        dotted(&self.key)
     }
+}
+
+/// A `/proc/sys` key (`net/ipv4/ip_forward`) in the dotted form of
+/// `sysctl(8)`.
+pub fn dotted(key: impl AsRef<str>) -> String {
+    key.as_ref().replace('/', ".")
 }
 
 fn global(key: &str, value: &'static str, family: Family) -> Setting {

@@ -95,8 +95,34 @@ impl Ns {
         Ok(())
     }
 
+    /// The value of a sysctl inside the namespace (`net.ipv4.ip_forward`).
+    pub fn sysctl_get(&self, key: &str) -> Result<String> {
+        Ok(self.run("sysctl", ["-n", key])?.trim().to_owned())
+    }
+
+    /// The packets of a named nftables counter in the namespace.
+    pub fn counter(&self, family: &str, table: &str, name: &str) -> Result<u64> {
+        let out = self.run("nft", ["-j", "list", "counter", family, table, name])?;
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        v["nftables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|o| o["counter"]["packets"].as_u64())
+            .ok_or_else(|| anyhow::anyhow!("counter {name} not found in {family} {table}"))
+    }
+
     /// Spawns a long-running process with stdout and stderr appended to `log`.
     pub fn spawn<I, S>(&self, program: &str, args: I, log: &Path) -> Result<Child>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.spawn_env(program, args, &[], log)
+    }
+
+    /// [`Ns::spawn`] with environment variables.
+    pub fn spawn_env<I, S>(&self, program: &str, args: I, env: &[(String, String)], log: &Path) -> Result<Child>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -108,7 +134,11 @@ impl Ns {
             .with_context(|| format!("opening {}", log.display()))?;
         let err = out.try_clone()?;
         let mut c = self.command(program);
-        c.args(args).stdin(Stdio::null()).stdout(out).stderr(err);
+        c.args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err);
         c.spawn()
             .with_context(|| format!("spawning {program} in {}", self.name))
     }

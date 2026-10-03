@@ -1,13 +1,13 @@
-//! Hooks for the acceptance scenarios, compiled only with the `test-hooks`
-//! feature: `tests/vm/run-suite.sh` enables it, release builds never do.
-
-use std::sync::OnceLock;
+//! Hooks for the acceptance scenarios. They act only in builds with the
+//! `test-hooks` feature, which `tests/vm/run-suite.sh` enables and release
+//! builds never do; otherwise they do nothing.
 
 /// `FTR_TEST_BOOTTIME_SHIFT_MS`: milliseconds added to `CLOCK_BOOTTIME`, so
 /// that a scenario can age the health checkpoint past its maximum age on a
 /// host that booted less than that age ago (AS-47).
+#[cfg(feature = "test-hooks")]
 pub fn boottime_shift_ms() -> u64 {
-    static SHIFT: OnceLock<u64> = OnceLock::new();
+    static SHIFT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SHIFT.get_or_init(|| {
         std::env::var("FTR_TEST_BOOTTIME_SHIFT_MS")
             .ok()
@@ -22,7 +22,8 @@ pub fn boottime_shift_ms() -> u64 {
 /// file is rewritten with N - 1; while it holds 0, the step fails with an
 /// injected error, until the file is removed or rewritten. Every step is
 /// appended to `<file>.steps`, followed by ` failed` when it failed.
-pub fn step(name: &str) -> Result<(), String> {
+#[cfg(feature = "test-hooks")]
+pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
     use std::io::Write;
 
     let Some(path) = std::env::var_os("FTR_TEST_FAULTS").map(std::path::PathBuf::from) else {
@@ -45,4 +46,14 @@ pub fn step(name: &str) -> Result<(), String> {
         let _ = writeln!(f, "{name}{}", if result.is_err() { " failed" } else { "" });
     }
     result
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn boottime_shift_ms() -> u64 {
+    0
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn step(_name: impl std::fmt::Display) -> Result<(), String> {
+    Ok(())
 }

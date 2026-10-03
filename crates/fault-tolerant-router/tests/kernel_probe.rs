@@ -11,19 +11,8 @@ use fault_tolerant_router::model::{Family, FieldValue, FwMask, PathKey, UplinkId
 use fault_tolerant_router::probe::{self, Report, Spec};
 use tokio::sync::mpsc;
 
-fn private_netns() {
-    let own = std::fs::read_link("/proc/self/ns/net").expect("own netns");
-    let init = std::fs::read_link("/proc/1/ns/net").expect("netns of pid 1 (needs root)");
-    assert_ne!(
-        own, init,
-        "refusing to change the initial network namespace; run under `unshare -n`"
-    );
-}
-
-fn sh(cmd: &str) {
-    let ok = Command::new("sh").args(["-c", cmd]).status().expect("sh").success();
-    assert!(ok, "{cmd}");
-}
+mod common;
+use common::{private_netns, sh};
 
 /// A peer namespace on the other end of veth `p0`, with the targets on its
 /// loopback interface.

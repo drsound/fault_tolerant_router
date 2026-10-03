@@ -23,5 +23,4 @@ pub mod select;
 pub mod state;
 pub mod sysctl;
 pub mod system;
-#[cfg(feature = "test-hooks")]
 pub mod test_hooks;

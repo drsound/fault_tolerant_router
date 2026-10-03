@@ -276,24 +276,11 @@ impl Topology {
         })
     }
 
-    fn named_counter(&self, family: &str, table: &str, name: &str) -> Result<u64> {
-        let out = self
-            .router()
-            .run("nft", ["-j", "list", "counter", family, table, name])?;
-        let v: serde_json::Value = serde_json::from_str(&out)?;
-        v["nftables"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find_map(|o| o["counter"]["packets"].as_u64())
-            .ok_or_else(|| anyhow::anyhow!("counter {name} not found"))
-    }
-
     /// IPv4 packets routed by an operating-system default route of the router
     /// (realm match) since the last [`Topology::reset_counters`]. Any non-zero
     /// value while FTR is installed is a leak (INV-3).
     pub fn ipv4_leaks(&self) -> Result<u64> {
-        self.named_counter("ip", "tb_observe", "leak4")
+        self.router().counter("ip", "tb_observe", "leak4")
     }
 
     /// Packets of `family` that left the router through `uplink` since the last reset.
@@ -301,7 +288,8 @@ impl Topology {
         if !uplink.families().contains(&family) {
             bail!("uplink {uplink} has no {family}");
         }
-        self.named_counter("inet", "tb_egress", &counter_name(uplink, family))
+        self.router()
+            .counter("inet", "tb_egress", &counter_name(uplink, family))
     }
 
     /// Resets the harness counters of the router.

@@ -16,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::inject::Daemon;
+use crate::netns::Ns;
 use crate::plan::Uplink;
 use crate::topology::Topology;
 
@@ -99,6 +100,11 @@ pub fn foreign_bit(n: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// [`ipv4_config`] with fast health settings and nothing else.
+pub fn ipv4(uplinks: &[UplinkSpec]) -> String {
+    ipv4_config(uplinks, &HealthSpec::fast(), "", "")
+}
+
 /// An IPv4 configuration over the given uplinks, with `lan` as downlink.
 /// `extra` is appended verbatim (other tables, routing settings).
 pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
@@ -146,7 +152,7 @@ pub struct Ftr {
 impl Topology {
     /// The directory for the daemon's configuration and state of this run.
     pub fn ftr_dir(&self) -> PathBuf {
-        PathBuf::from("/run/ftr-tests").join(self.run_id())
+        PathBuf::from(crate::topology::FTR_ROOT).join(self.run_id())
     }
 
     /// Writes `config` (with this run's `state_dir`) and starts the daemon.
@@ -160,7 +166,7 @@ impl Topology {
     pub fn prepare_ftr(&self, config: &str) -> Result<Ftr> {
         let dir = self.ftr_dir();
         fs::create_dir_all(&dir)?;
-        for d in [Path::new("/run/ftr-tests"), dir.as_path()] {
+        for d in [Path::new(crate::topology::FTR_ROOT), dir.as_path()] {
             fs::set_permissions(d, fs::Permissions::from_mode(0o755))?;
         }
         let f = Ftr {
@@ -202,12 +208,10 @@ impl Ftr {
     /// Starts `run --config` (again, after a stop).
     pub fn start(&mut self, t: &Topology) -> Result<()> {
         let config = self.config.display().to_string();
-        let mut args: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        args.push(self.bin.display().to_string());
-        args.extend(self.args(&["run", "--config", &config]));
+        let args = self.args(&["run", "--config", &config]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.log_start = fs::metadata(&self.log).map(|m| m.len() as usize).unwrap_or(0);
-        self.daemon = Some(t.start_daemon(Path::new("env"), &args)?);
+        self.daemon = Some(t.start_daemon(&self.bin, &args, &self.env)?);
         Ok(())
     }
 
@@ -221,13 +225,19 @@ impl Ftr {
     /// Runs a CLI command in the router namespace (with this run's lock and
     /// the environment set by [`Ftr::set_env`]).
     pub fn cli(&self, rest: &[&str]) -> Result<Output> {
-        let args = self.args(rest);
-        Ok(std::process::Command::new("ip")
-            .args(["netns", "exec", &self.router_ns, "env"])
-            .args(self.env.iter().map(|(k, v)| format!("{k}={v}")))
-            .arg(&self.bin)
-            .args(&args)
+        Ok(Ns::new(self.router_ns.as_str())
+            .command(&self.bin)
+            .args(self.args(rest))
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .output()?)
+    }
+
+    /// Runs a CLI command with this run's configuration (`--config`).
+    pub fn cli_config(&self, args: &[&str]) -> Result<Output> {
+        let config = self.config.display().to_string();
+        let mut v = args.to_vec();
+        v.extend(["--config", &config]);
+        self.cli(&v)
     }
 
     /// The log of the daemon since its last start.
@@ -287,4 +297,9 @@ impl Drop for Ftr {
         drop(self.daemon.take());
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Standard error then standard output of a command, as text.
+pub fn output_text(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout)
 }

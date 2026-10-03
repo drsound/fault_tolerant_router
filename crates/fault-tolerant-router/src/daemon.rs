@@ -292,13 +292,27 @@ fn report(f: &checks::Findings) -> Result<()> {
 }
 
 impl Daemon {
-    /// `None` once a reload has removed the uplink.
-    fn hysteresis(&self, id: UplinkId) -> Option<Hysteresis> {
-        let h = &self.cfg.uplink(id)?.health;
-        Some(Hysteresis {
+    fn hysteresis(&self, id: UplinkId) -> Hysteresis {
+        let h = &self
+            .cfg
+            .uplink(id)
+            .expect("paths exist only for configured uplinks")
+            .health;
+        Hysteresis {
             fall: h.fall,
             rise: h.rise,
-        })
+        }
+    }
+
+    /// Drops the paths that `keep` rejects and stops their probers.
+    fn prune_paths(&mut self, keep: impl Fn(&PathKey) -> bool) {
+        self.paths.retain(|k, p| {
+            let kept = keep(k);
+            if !kept && let Some((_, h)) = p.prober.take() {
+                h.abort();
+            }
+            kept
+        });
     }
 
     fn load_drain_and_checkpoint(&mut self) {
@@ -385,7 +399,6 @@ impl Daemon {
         }
         sysctl::record(&mut self.manifest, &diffs);
         self.state_dir.write_manifest(&self.manifest)?;
-        #[cfg(feature = "test-hooks")]
         crate::test_hooks::step("set sysctls").map_err(|e| anyhow::anyhow!(e))?;
         for d in diffs {
             sysctl::write(&d.setting.key, d.setting.value).with_context(|| d.setting.display())?;
@@ -445,9 +458,16 @@ impl Daemon {
 
     /// FR-CT-2 runtime inspection against the running configuration.
     async fn inspect_flowtables(&mut self) {
-        match nftctl::ruleset(&self.cfg.firewall.nft_path).await {
+        let listing = nftctl::flowtables(&self.cfg.firewall.nft_path).await;
+        self.record_flowtables(&listing);
+    }
+
+    /// The `flow_offload` reason from a flowtable listing, against the
+    /// running configuration.
+    fn record_flowtables(&mut self, listing: &std::result::Result<serde_json::Value, String>) {
+        match listing {
             Ok(r) => {
-                let found = checks::flowtables(&r, &self.cfg);
+                let found = checks::flowtables(r, &self.cfg);
                 if found.is_empty() {
                     self.recover("flow_offload");
                 } else {
@@ -577,16 +597,14 @@ impl Daemon {
                 }
             }
             probe::Report::Round(r) => {
-                // A round already queued when a reload removed its uplink.
-                let Some(h) = self.hysteresis(r.path.uplink) else {
-                    debug!("discarding a round of a removed uplink");
-                    return;
-                };
-                let Some(p) = self.paths.get_mut(&r.path) else { return };
-                if p.generation != r.generation {
+                // Rounds already queued when their prober was replaced, or
+                // when a reload removed the uplink and its paths.
+                if self.paths.get(&r.path).is_none_or(|p| p.generation != r.generation) {
                     debug!("discarding a round of an older generation (FR-PROBE-3)");
                     return;
                 }
+                let h = self.hysteresis(r.path.uplink);
+                let p = self.paths.get_mut(&r.path).expect("checked above");
                 let round = if r.passed { Round::Passed } else { Round::Failed };
                 debug!(uplink = r.path.uplink.get(), family = %r.path.family, passed = r.passed, reachable = r.reachable, "probe round");
                 if let Some(t) = p.machine.round(round, h) {
@@ -686,13 +704,7 @@ impl Daemon {
                 },
             );
         }
-        self.paths.retain(|k, p| {
-            let keep = input.paths.contains_key(k);
-            if !keep && let Some((_, h)) = p.prober.take() {
-                h.abort();
-            }
-            keep
-        });
+        self.prune_paths(|k| input.paths.contains_key(k));
         self.manage_probers();
         for family in Family::ALL {
             if !self.cfg.manages(family) {
@@ -730,7 +742,6 @@ impl Daemon {
     /// generation (FR-PROBE-1, FR-PROBE-3).
     fn manage_probers(&mut self) {
         let mask = self.cfg.routing.fwmark_mask;
-        let mut generation = self.probe_generation;
         for (key, p) in self.paths.iter_mut() {
             let u = self.cfg.uplink(key.uplink).expect("configured");
             let ready = p.discovered.as_ref().and_then(|d| d.ready.as_ref().ok()).copied();
@@ -757,15 +768,14 @@ impl Daemon {
             if let Some((_, h)) = p.prober.take() {
                 h.abort();
             }
-            generation += 1;
-            p.generation = generation;
+            self.probe_generation += 1;
+            p.generation = self.probe_generation;
             if let Some(mut spec) = wanted {
                 spec.generation = p.generation;
                 let handle = probe::spawn(spec.clone(), self.probe_tx.clone());
                 p.prober = Some((spec, handle));
             }
         }
-        self.probe_generation = generation;
     }
 
     fn desired(&self, input: &Input, exclude: &BTreeSet<UplinkId>) -> Desired {
@@ -792,7 +802,12 @@ impl Daemon {
                 error: format!("{e:#}"),
                 route: None,
             })?;
-            self.sysctls_pending.remove(&only);
+            if only.is_none() {
+                // Every setting, every interface included.
+                self.sysctls_pending.clear();
+            } else {
+                self.sysctls_pending.remove(&only);
+            }
         }
         Ok(())
     }
@@ -837,6 +852,7 @@ impl Daemon {
                 before_nft: &before,
                 desired: &desired,
                 nft_pending,
+                teardown: false,
             },
         );
         // FR-COEX-4: while repairs of a kind are suspended, artifacts that a
@@ -846,7 +862,7 @@ impl Daemon {
             self.held_rules.clear();
             self.held_routes.clear();
         }
-        let held = ops.len();
+        let before = ops.len();
         let ops: Vec<Op> = ops
             .into_iter()
             .filter(|op| match op {
@@ -855,9 +871,9 @@ impl Daemon {
                 _ => true,
             })
             .collect();
-        if ops.len() != held {
+        if ops.len() != before {
             debug!(
-                held = held - ops.len(),
+                held = before - ops.len(),
                 "repairs held until the next full reconciliation (FR-COEX-4)"
             );
         }
@@ -909,16 +925,13 @@ impl Daemon {
         for family in departed {
             let h = sysctl::hand_back(&mut self.manifest, family, sysctl::read, sysctl::write);
             for k in &h.restored {
-                info!("restored {} (family {family} handed back)", k.replace('/', "."));
+                info!("restored {} (family {family} handed back)", sysctl::dotted(k));
             }
             for k in &h.released {
-                info!(
-                    "{} left as it is: changed since FTR set it, or gone",
-                    k.replace('/', ".")
-                );
+                info!("{} left as it is: changed since FTR set it, or gone", sysctl::dotted(k));
             }
             for (k, e) in h.failed {
-                failures.push(format!("{}: {e}", k.replace('/', ".")));
+                failures.push(format!("{}: {e}", sysctl::dotted(k)));
             }
         }
         if let Err(e) = self.state_dir.write_manifest(&self.manifest) {
@@ -1012,8 +1025,14 @@ impl Daemon {
         }
         // FR-CT-2: inspect against the running configuration, and refuse a
         // proposed configuration that would match.
-        self.inspect_flowtables().await;
-        match nftctl::ruleset(&new.firewall.nft_path).await {
+        let listing = nftctl::flowtables(&self.cfg.firewall.nft_path).await;
+        self.record_flowtables(&listing);
+        let proposed = if new.firewall.nft_path == self.cfg.firewall.nft_path {
+            listing
+        } else {
+            nftctl::flowtables(&new.firewall.nft_path).await
+        };
+        match proposed {
             Ok(r) => {
                 let found = checks::flowtables(&r, &new);
                 if !found.is_empty() {
@@ -1043,6 +1062,10 @@ impl Daemon {
         }
         self.manifest = manifest;
         self.cfg = new;
+        // Paths exist only for configured uplinks: those of removed uplinks
+        // go at once, with their probers.
+        let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
+        self.prune_paths(|k| configured.contains(&k.uplink));
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
         self.sysctls_pending.insert(None);
         info!("config_reloaded");
@@ -1164,6 +1187,7 @@ impl Daemon {
                 before_nft: &desired,
                 desired: &desired,
                 nft_pending: self.cfg.firewall.mode == FirewallMode::Managed,
+                teardown: false,
             },
         );
         for op in &ops {

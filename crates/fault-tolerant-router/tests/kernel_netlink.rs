@@ -14,14 +14,8 @@ use fault_tolerant_router::netlink::{Client, EEXIST, Mutation};
 use fault_tolerant_router::plan::{self, Input, PathInput, ReadyPath};
 use netlink_packet_route::RouteNetlinkMessage;
 
-fn private_netns() {
-    let own = std::fs::read_link("/proc/self/ns/net").expect("own netns");
-    let init = std::fs::read_link("/proc/1/ns/net").expect("netns of pid 1 (needs root)");
-    assert_ne!(
-        own, init,
-        "refusing to change rules in the initial network namespace; run under `unshare -n`"
-    );
-}
+mod common;
+use common::private_netns;
 
 fn ip(args: &str) {
     let ok = Command::new("ip")

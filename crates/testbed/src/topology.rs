@@ -21,6 +21,7 @@
 
 use std::fs;
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::thread::sleep;
@@ -104,6 +105,33 @@ pub struct Topology {
     torn_down: bool,
 }
 
+/// Where scenarios keep the daemon's configuration and state: the daemon
+/// refuses configuration files whose parent directories are writable by
+/// group or others (FR-CFG-5), which excludes `/tmp`.
+pub const FTR_ROOT: &str = "/run/ftr-tests";
+
+/// Where scenarios keep executables that the daemon runs (an `nft_path`
+/// wrapper): owned by root up to `/` like [`FTR_ROOT`], but not under `/run`,
+/// which may be mounted `noexec`.
+pub const EXEC_ROOT: &str = "/var/lib/ftr-tests";
+
+/// Reserves a run identifier: its working directory, created exclusively,
+/// and no namespace of that run. `None` when the identifier is taken.
+fn reserve(work_root: &Path, id: &str) -> Result<Option<PathBuf>> {
+    fs::create_dir_all(work_root).with_context(|| format!("creating {}", work_root.display()))?;
+    let dir = work_root.join(id);
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    if netns::list()?.iter().any(|n| n.starts_with(&prefix(id))) {
+        let _ = fs::remove_dir(&dir);
+        return Ok(None);
+    }
+    Ok(Some(dir))
+}
+
 /// Namespace name prefix of a run.
 pub fn prefix(run_id: &str) -> String {
     format!("tb-{run_id}-")
@@ -133,15 +161,21 @@ impl Topology {
         if !crate::is_root() {
             bail!("the test harness needs root (network namespaces, nftables, PPPoE)");
         }
-        let run_id = opts.run_id.clone().unwrap_or_else(random_run_id);
-        if !run_id.chars().all(|c| c.is_ascii_alphanumeric()) || run_id.is_empty() || run_id.len() > 12 {
-            bail!("run id must be 1-12 alphanumeric characters");
-        }
-        if netns::list()?.iter().any(|n| n.starts_with(&prefix(&run_id))) {
-            bail!("run {run_id} already exists");
-        }
-        let dir = opts.work_root.join(&run_id);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let (run_id, dir) = match &opts.run_id {
+            Some(id) => {
+                if !id.chars().all(|c| c.is_ascii_alphanumeric()) || id.is_empty() || id.len() > 12 {
+                    bail!("run id must be 1-12 alphanumeric characters");
+                }
+                let dir = reserve(&opts.work_root, id)?.with_context(|| format!("run {id} already exists"))?;
+                (id.clone(), dir)
+            }
+            None => loop {
+                let id = random_run_id();
+                if let Some(dir) = reserve(&opts.work_root, &id)? {
+                    break (id, dir);
+                }
+            },
+        };
         let mut topo = Topology {
             run_id,
             dir,
@@ -212,6 +246,25 @@ impl Topology {
     /// (for example `systemd` over `/etc/systemd`). Removed with the run.
     pub fn netns_etc(&self, node: Node) -> PathBuf {
         Path::new("/etc/netns").join(self.ns(node).name())
+    }
+
+    /// The router's index of an interface, if it exists.
+    pub fn ifindex(&self, ifc: &str) -> Option<u64> {
+        self.router()
+            .ip_json(&format!("link show dev {ifc}"))
+            .ok()
+            .and_then(|v| v[0]["ifindex"].as_u64())
+    }
+
+    /// This run's directory under [`EXEC_ROOT`], created on first use and
+    /// removed with the run.
+    pub fn exec_dir(&self) -> Result<PathBuf> {
+        let dir = Path::new(EXEC_ROOT).join(&self.run_id);
+        fs::create_dir_all(&dir)?;
+        for d in [Path::new(EXEC_ROOT), dir.as_path()] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(dir)
     }
 
     /// Path of the agent executable.
@@ -814,6 +867,9 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
             let _ = fs::remove_dir_all(etc);
         }
     }
+    for root in [FTR_ROOT, EXEC_ROOT] {
+        let _ = fs::remove_dir_all(Path::new(root).join(run_id));
+    }
     let _ = fs::remove_file(format!("/run/ppp-tb-{run_id}-c.pid"));
     let _ = fs::remove_file(format!("/var/run/ppp-tb-{run_id}-c.pid"));
     let dir = work_root.join(run_id);
@@ -828,7 +884,6 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
 }
 
 fn chmod_x(p: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(p, fs::Permissions::from_mode(0o755))?;
     Ok(())
 }

@@ -21,19 +21,8 @@ use fault_tolerant_router::state::{Manifest, StateDir};
 use fault_tolerant_router::sysctl;
 use fault_tolerant_router::system::Scope;
 
-fn private_netns() {
-    let own = std::fs::read_link("/proc/self/ns/net").expect("own netns");
-    let init = std::fs::read_link("/proc/1/ns/net").expect("netns of pid 1 (needs root)");
-    assert_ne!(
-        own, init,
-        "refusing to change the initial network namespace; run under `unshare -n`"
-    );
-}
-
-fn sh(cmd: &str) {
-    let ok = Command::new("sh").args(["-c", cmd]).status().expect("sh").success();
-    assert!(ok, "{cmd}");
-}
+mod common;
+use common::{private_netns, sh};
 
 fn nft_path() -> PathBuf {
     ["/usr/local/sbin/nft", "/usr/sbin/nft", "/sbin/nft"]
@@ -143,6 +132,7 @@ async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pen
             before_nft: &desired,
             desired: &desired,
             nft_pending,
+            teardown: false,
         },
     );
     let n = ops.len();

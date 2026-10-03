@@ -80,6 +80,13 @@ pub async fn table(nft: &Path) -> Result<Option<Value>, String> {
     }
 }
 
+/// The JSON listing of the flowtables only (FR-CT-2 runtime inspection): the
+/// same objects as in the ruleset, without dumping large sets.
+pub async fn flowtables(nft: &Path) -> Result<Value, String> {
+    let text = run(nft, &["-j", "list", "flowtables"], None).await?;
+    serde_json::from_str(&text).map_err(|e| format!("nft JSON: {e}"))
+}
+
 /// The JSON listing of the whole ruleset (read-only checks).
 pub async fn ruleset(nft: &Path) -> Result<Value, String> {
     let text = run(nft, &["-j", "list", "ruleset"], None).await?;

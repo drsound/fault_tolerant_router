@@ -18,6 +18,7 @@ use crate::reconcile::{self, DiffInput};
 use crate::state::{self, Mode, StateDir};
 use crate::sysctl;
 use crate::system::Scope;
+use crate::test_hooks;
 
 pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
     let manifest = state_dir.manifest().context("manifest")?;
@@ -38,8 +39,7 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
         ),
     };
     if managed {
-        #[cfg(feature = "test-hooks")]
-        crate::test_hooks::step("remove the nftables table").map_err(|e| anyhow!(e))?;
+        test_hooks::step("remove the nftables table").map_err(|e| anyhow!(e))?;
         nftctl::apply(&cfg.firewall.nft_path, &nft::removal())
             .await
             .map_err(|e| anyhow!("removing table inet {}: {e}", nft::TABLE))?;
@@ -63,30 +63,24 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
             before_nft: &empty,
             desired: &empty,
             nft_pending: false,
+            teardown: true,
         },
     );
-    // FR-REC-4: every route goes after the rules. The diff withdraws
-    // balancing and policy routes first, as removing an uplink at runtime
-    // needs (FR-REC-3); a stable sort moves them back among the routes.
-    let mut ops = ops;
-    ops.sort_by_key(|op| matches!(op, reconcile::Op::DeleteRoute { .. }));
     let n = ops.len();
     reconcile::execute(&client, &mut system, &scope, protocol, ops, || async { Ok(()) })
         .await
         .map_err(|f| anyhow!("{}: {}", f.op, f.error))?;
     info!(operations = n, "removed FTR's rules and routes");
-    #[cfg(feature = "test-hooks")]
-    crate::test_hooks::step("restore sysctls").map_err(|e| anyhow!(e))?;
+    test_hooks::step("restore sysctls").map_err(|e| anyhow!(e))?;
     if let Some(m) = &manifest {
         for (key, result) in sysctl::restore(m, |_| true) {
             match result {
-                Ok(()) => info!("restored {}", key.replace('/', ".")),
-                Err(e) => warn!("restoring {}: {e}", key.replace('/', ".")),
+                Ok(()) => info!("restored {}", sysctl::dotted(key)),
+                Err(e) => warn!("restoring {}: {e}", sysctl::dotted(key)),
             }
         }
     }
-    #[cfg(feature = "test-hooks")]
-    crate::test_hooks::step("remove the state files and the manifest").map_err(|e| anyhow!(e))?;
+    test_hooks::step("remove the state files and the manifest").map_err(|e| anyhow!(e))?;
     state_dir.reset().context("state files")?;
     let path = state_dir.path.join(state::MANIFEST);
     match std::fs::remove_file(&path) {

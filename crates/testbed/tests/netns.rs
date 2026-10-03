@@ -79,11 +79,6 @@ fn clear_steering(t: &Topology) -> Result<()> {
     Ok(())
 }
 
-fn ppp_ifindex(t: &Topology) -> Option<u64> {
-    let v = t.router().ip_json("link show dev ppp0").ok()?;
-    v.as_array()?.first()?["ifindex"].as_u64()
-}
-
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn topology_comes_up_with_os_default_routes_and_tears_down() -> Result<()> {
@@ -103,7 +98,7 @@ fn topology_comes_up_with_os_default_routes_and_tears_down() -> Result<()> {
     assert_eq!(mtu, Some(1492), "PPPoE MTU");
 
     // Daemon handle, exercised with a stand-in process.
-    let d = t.start_daemon(Path::new("/bin/sleep"), &["30"])?;
+    let d = t.start_daemon(Path::new("/bin/sleep"), &["30"], &[])?;
     assert!(d.pid().is_some());
     let status = d.stop()?;
     assert!(!status.success(), "sleep ends by SIGTERM");
@@ -131,18 +126,7 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
         "table ip t_lan_leak {{\n  counter c {{}}\n  chain post {{\n    type filter hook postrouting priority 400; policy accept;\n    iifname \"lan\" meta rtclassid {} counter name c\n  }}\n}}\n",
         plan::OS_ROUTE_REALM
     ))?;
-    let lan_leaks = || -> Result<u64> {
-        let out = t
-            .router()
-            .run("nft", ["-j", "list", "counter", "ip", "t_lan_leak", "c"])?;
-        let v: serde_json::Value = serde_json::from_str(&out)?;
-        Ok(v["nftables"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find_map(|o| o["counter"]["packets"].as_u64())
-            .unwrap_or(0))
-    };
+    let lan_leaks = || t.router().counter("ip", "t_lan_leak", "c");
     for u in t.uplinks() {
         steer_lan(&t, u)?;
         t.reset_counters()?;
@@ -259,10 +243,10 @@ fn failure_injection() -> Result<()> {
     assert!(rep.max_gap_ms >= 1400, "{rep:?}");
 
     // PPPoE session reset: new ppp0 ifindex, default route restored.
-    let before = ppp_ifindex(&t).expect("ppp0");
+    let before = t.ifindex("ppp0").expect("ppp0");
     t.pppoe_reset()?;
     t.wait_for("PPPoE reconnection", Duration::from_secs(20), || {
-        Ok(ppp_ifindex(&t).is_some_and(|i| i != before) && t.os_default_route(Uplink::C, Family::V4)?.is_some())
+        Ok(t.ifindex("ppp0").is_some_and(|i| i != before) && t.os_default_route(Uplink::C, Family::V4)?.is_some())
     })?;
     Ok(())
 }

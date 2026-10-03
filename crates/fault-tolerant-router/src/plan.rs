@@ -146,6 +146,11 @@ impl Layout {
         self.table_base + u32::from(id.get())
     }
 
+    /// A path table (not the balancing table, not a policy table).
+    pub fn is_path_table(self, table: u32) -> bool {
+        (self.table_base + 1..self.table_base + 64).contains(&table)
+    }
+
     pub fn policy_balance_table(self, id: UplinkId) -> u32 {
         self.table_base + 64 + u32::from(id.get())
     }

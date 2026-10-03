@@ -125,6 +125,11 @@ pub struct DiffInput<'a> {
     pub before_nft: &'a Desired,
     pub desired: &'a Desired,
     pub nft_pending: bool,
+    /// Cleanup (FR-REC-4): every route is withdrawn after the rules.
+    /// Otherwise balancing and policy routes are withdrawn first, so that a
+    /// removed uplink or family leaves the active set and its policy tables
+    /// before anything else changes (FR-REC-3, FR-REC-9).
+    pub teardown: bool,
 }
 
 /// Computes the ordered operations.
@@ -135,10 +140,9 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
             ops.push(Op::ReplaceRoute(r.clone()));
         }
     }
-    // Routes to withdraw. Balancing and policy tables are emptied first, so
-    // that a removed uplink or family leaves the active set and its policy
-    // tables before anything else changes (FR-REC-3, FR-REC-9); path tables
-    // are emptied last, after the rules that use them (FR-REC-4).
+    // Routes to withdraw: path tables last, after the rules that use them;
+    // balancing and policy tables first, except in a teardown.
+
     let mut tables = BTreeSet::new();
     for r in system.routes.values() {
         if r.protocol == d.protocol && d.layout.tables().contains(&r.table) && r.as_planned().is_some() {
@@ -148,7 +152,7 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
     let (early, late): (Vec<_>, Vec<_>) = tables
         .into_iter()
         .filter(|key| !d.desired.routes.contains_key(key))
-        .partition(|(_, t)| *t == d.layout.balancing_table() || *t >= d.layout.table_base + 65);
+        .partition(|(_, t)| !d.teardown && !d.layout.is_path_table(*t));
     for (family, table) in early {
         ops.push(Op::DeleteRoute { family, table });
     }
@@ -229,8 +233,7 @@ where
                 _ => None,
             },
         };
-        #[cfg(feature = "test-hooks")]
-        crate::test_hooks::step(&op.to_string()).map_err(fail)?;
+        crate::test_hooks::step(&op).map_err(fail)?;
         match &op {
             Op::ApplyNft => nft().await.map_err(fail)?,
             _ => {

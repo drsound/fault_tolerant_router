@@ -43,21 +43,25 @@ else
   # (crates/fault-tolerant-router/src/test_hooks.rs).
   cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router \
     --features fault-tolerant-router/test-hooks
-  test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
-    | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
-  # Acceptance scenarios with the daemon under test.
-  m1_bin=$(cargo test --target $target -p testbed --test m1 --no-run --message-format=json \
-    | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "m1") | .executable')
+  # Test executables by target name, one cargo call per package.
+  test_exes() { # PACKAGE TEST...
+    pkg=$1
+    shift
+    tests=
+    for t in "$@"; do tests="$tests --test $t"; done
+    cargo test --target $target -p "$pkg" $tests --no-run --message-format=json \
+      | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | "\(.target.name) \(.executable)"'
+  }
   rm -rf "$bindir"
   mkdir -p "$bindir"
-  cp "$target_dir/$target/debug/ftr-testbed" "$bindir/"
-  cp "$test_bin" "$bindir/netns"
-  cp "$m1_bin" "$bindir/m1"
-  cp "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
-  for t in $kernel_tests; do
-    bin=$(cargo test --target $target -p fault-tolerant-router --test "$t" --no-run --message-format=json \
-      | jq -r --arg t "$t" 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $t) | .executable')
-    cp "$bin" "$bindir/$t"
+  # Copied before the test builds: the daemon's integration tests rebuild
+  # its executable without the hooks.
+  cp "$target_dir/$target/debug/ftr-testbed" "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
+  # netns: the harness's own checks; m1: the acceptance scenarios.
+  { test_exes testbed netns m1; test_exes fault-tolerant-router $kernel_tests; } \
+    | while read -r name exe; do cp "$exe" "$bindir/$name"; done
+  for t in netns m1 $kernel_tests; do
+    [ -x "$bindir/$t" ] || { echo "test executable $t was not built" >&2; exit 1; }
   done
 fi
 if [ "$mode" = build ]; then

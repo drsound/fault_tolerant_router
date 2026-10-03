@@ -83,6 +83,7 @@ fn diff_for(system: &System, cfg: &Config, before: &Desired, desired: &Desired, 
             before_nft: before,
             desired,
             nft_pending,
+            teardown: false,
         },
     )
 }
@@ -144,6 +145,42 @@ fn cold_installation_follows_fr_rec_1() {
     let mut s = System::default();
     apply(&mut s, &cfg, &ops);
     assert!(diff_for(&s, &cfg, &desired, &desired, false).is_empty());
+}
+
+#[test]
+fn teardown_withdraws_every_route_after_the_rules() {
+    let cfg = config::parse(CONFIG).unwrap();
+    let desired = plan::plan(&cfg, &input(&[1, 2]));
+    let install = diff_for(&System::default(), &cfg, &desired, &desired, true);
+    let mut s = System::default();
+    apply(&mut s, &cfg, &install);
+    let empty = Desired::default();
+    let teardown = |teardown| {
+        rule_kinds(&diff(
+            &s,
+            &DiffInput {
+                layout: Layout::of(&cfg),
+                protocol: 249,
+                families: &[Family::V4],
+                before_nft: &empty,
+                desired: &empty,
+                nft_pending: false,
+                teardown,
+            },
+        ))
+    };
+    // FR-REC-4: final guard first, class guards last among the rules, then
+    // every route.
+    let v = teardown(true);
+    let last_rule = v.iter().rposition(|x| !x.starts_with("-route")).unwrap();
+    let first_route = v.iter().position(|x| x.starts_with("-route")).unwrap();
+    assert!(last_rule < first_route, "{v:?}");
+    assert_eq!(v[0], "-1699");
+    assert!(position(&v, "-1600") < position(&v, "-1064"), "{v:?}");
+    // At runtime the balancing route goes before the rules (FR-REC-3).
+    let v = teardown(false);
+    assert!(position(&v, "-route 1000") < position(&v, "-1699"), "{v:?}");
+    assert!(position(&v, "-1064") < position(&v, "-route 1001"), "{v:?}");
 }
 
 #[test]
@@ -343,6 +380,7 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &before,
             desired: &before,
             nft_pending: true,
+            teardown: false,
         },
     );
     apply(&mut s, &dual, &install);
@@ -361,6 +399,7 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &after,
             desired: &after,
             nft_pending: true,
+            teardown: false,
         },
     );
     // Nothing of IPv4 is touched.
@@ -398,6 +437,7 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &after,
             desired: &after,
             nft_pending: false,
+            teardown: false,
         },
     );
     assert!(again.is_empty(), "converged: {again:?}");

@@ -148,11 +148,11 @@ impl Topology {
     }
 
     /// Starts the daemon under test in the router namespace with `args`
-    /// (for example `run --config PATH`), logging to `daemon.log` in the run
-    /// directory.
-    pub fn start_daemon(&self, binary: &Path, args: &[&str]) -> Result<Daemon> {
+    /// (for example `run --config PATH`) and environment variables (its test
+    /// hooks), logging to `daemon.log` in the run directory.
+    pub fn start_daemon(&self, binary: &Path, args: &[&str], env: &[(String, String)]) -> Result<Daemon> {
         let log = self.dir().join("daemon.log");
-        let child = self.router().spawn(&binary.to_string_lossy(), args, &log)?;
+        let child = self.router().spawn_env(&binary.to_string_lossy(), args, env, &log)?;
         Ok(Daemon { child: Some(child) })
     }
 
