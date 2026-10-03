@@ -63,6 +63,15 @@ enum SysctlScope {
     Interface(String),
 }
 
+impl std::fmt::Display for SysctlScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SysctlScope::Global => f.write_str("global"),
+            SysctlScope::Interface(i) => f.write_str(i),
+        }
+    }
+}
+
 /// The attempt of a failed sysctl application.
 const SYSCTL_ATTEMPT: &str = "sysctls";
 
@@ -113,10 +122,11 @@ struct Daemon {
     /// Sysctls to apply before the next routes and rules (FR-REC-3), by
     /// interface (`None`: every setting); a failure is retried (FR-REC-5).
     sysctls_pending: BTreeSet<SysctlScope>,
-    /// Interfaces whose settings failed: their uplinks' paths are not ready
-    /// until a retry, with its own backoff, succeeds (FR-REC-5, FR-DISC-7).
+    /// Interfaces whose settings failed, and their retries, each with its
+    /// own backoff (FR-REC-5). An uplink whose interface has settings
+    /// pending is not ready (FR-DISC-7).
     sysctls_failed: BTreeMap<String, String>,
-    sysctl_retry: Option<Retry>,
+    sysctl_retries: BTreeMap<String, Retry>,
     /// The last prober generation: unique across paths, so that a round of
     /// a removed and re-added uplink's old prober is never taken as current.
     probe_generation: u64,
@@ -243,7 +253,7 @@ pub async fn run(opts: Options) -> Result<()> {
         full_pass: false,
         sysctls_pending: BTreeSet::new(),
         sysctls_failed: BTreeMap::new(),
-        sysctl_retry: None,
+        sysctl_retries: BTreeMap::new(),
         probe_generation: 0,
         probe_tx,
         boot_id: state::boot_id().unwrap_or_default(),
@@ -469,7 +479,7 @@ impl Daemon {
         }
         sysctl::record(&mut self.manifest, &diffs);
         self.state_dir.write_manifest(&self.manifest)?;
-        crate::test_hooks::step("set sysctls").map_err(|e| anyhow::anyhow!(e))?;
+        crate::test_hooks::step(format_args!("set sysctls ({scope})")).map_err(|e| anyhow::anyhow!(e))?;
         for d in diffs {
             sysctl::write(&d.setting.key, d.setting.value).with_context(|| d.setting.display())?;
             info!("set {} = {} (was {})", d.setting.display(), d.setting.value, d.current);
@@ -749,14 +759,21 @@ impl Daemon {
                 debug!("path {key:?} not ready: route installation failed ({e})");
                 d.ready = Err(Reason::RouteInstallFailed);
             }
-            // The interface's settings are part of the path's installation.
-            if let Some(e) = self
-                .cfg
-                .uplink(key.uplink)
-                .and_then(|u| self.sysctls_failed.get(&u.interface))
+            // The interface's settings are part of the path's installation:
+            // a path is not ready while they are pending, failed or not.
+            if let Some(u) = self.cfg.uplink(key.uplink)
+                && self
+                    .sysctls_pending
+                    .contains(&SysctlScope::Interface(u.interface.clone()))
                 && d.ready.is_ok()
             {
-                debug!("path {key:?} not ready: its interface's sysctls failed ({e})");
+                debug!(
+                    "path {key:?} not ready: sysctls of {} pending ({})",
+                    u.interface,
+                    self.sysctls_failed
+                        .get(&u.interface)
+                        .map_or("not applied yet", String::as_str)
+                );
                 d.ready = Err(Reason::RouteInstallFailed);
             }
             let p = self.paths.entry(key).or_insert_with(|| PathRuntime {
@@ -892,53 +909,50 @@ impl Daemon {
     /// Applies the pending sysctls before the routes and rules that rely on
     /// them (FR-REC-3). A failure of the global settings fails the pass:
     /// everything depends on them. A failure of an interface's settings
-    /// keeps them pending and its uplinks' paths not ready, retried with
-    /// their own backoff, and the rest of the pass goes on (FR-REC-5).
-    fn apply_pending_sysctls(&mut self) -> std::result::Result<(), Failure> {
-        if self.sysctls_pending.contains(&SysctlScope::Global) {
+    /// keeps them pending, retried with that interface's own backoff, and
+    /// the rest of the pass goes on (FR-REC-5); `evaluate` keeps the
+    /// uplinks of interfaces with pending settings not ready.
+    fn apply_pending_sysctls(&mut self, global: bool) -> std::result::Result<(), Failure> {
+        let pending: Vec<SysctlScope> = self.sysctls_pending.iter().cloned().collect();
+        for scope in pending {
+            let SysctlScope::Interface(i) = &scope else { continue };
+            if self.sysctl_retries.get(i).is_some_and(|r| Instant::now() < r.at) {
+                continue;
+            }
+            match self.apply_sysctls(&scope) {
+                Ok(()) => {
+                    self.sysctls_pending.remove(&scope);
+                    self.sysctl_retries.remove(i);
+                    self.sysctls_failed.remove(i);
+                }
+                Err(e) => {
+                    error!(interface = %i, "apply_failed: set sysctls: {e:#}");
+                    self.sysctls_failed.insert(i.clone(), format!("{e:#}"));
+                    self.degrade("apply_failed");
+                    let backoff = self
+                        .sysctl_retries
+                        .get(i)
+                        .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
+                    self.sysctl_retries.insert(
+                        i.clone(),
+                        Retry {
+                            at: Instant::now() + backoff,
+                            backoff,
+                            attempt: SYSCTL_ATTEMPT.to_owned(),
+                        },
+                    );
+                }
+            }
+        }
+        // Interfaces first: a failure of the global settings does not keep
+        // them from their own.
+        if global && self.sysctls_pending.contains(&SysctlScope::Global) {
             self.apply_sysctls(&SysctlScope::Global).map_err(|e| Failure {
                 op: "set sysctls".into(),
                 error: format!("{e:#}"),
                 route: None,
             })?;
             self.sysctls_pending.remove(&SysctlScope::Global);
-        }
-        if self.sysctl_retry.as_ref().is_some_and(|r| Instant::now() < r.at) {
-            return Ok(());
-        }
-        let pending: Vec<SysctlScope> = self.sysctls_pending.iter().cloned().collect();
-        let mut failed = false;
-        for scope in pending {
-            let SysctlScope::Interface(i) = &scope else { continue };
-            match self.apply_sysctls(&scope) {
-                Ok(()) => {
-                    self.sysctls_pending.remove(&scope);
-                    if self.sysctls_failed.remove(i).is_some() {
-                        self.dirty = true;
-                    }
-                }
-                Err(e) => {
-                    error!(interface = %i, "apply_failed: set sysctls: {e:#}");
-                    if self.sysctls_failed.insert(i.clone(), format!("{e:#}")).is_none() {
-                        self.dirty = true;
-                    }
-                    failed = true;
-                }
-            }
-        }
-        if failed {
-            self.degrade("apply_failed");
-            let backoff = self
-                .sysctl_retry
-                .as_ref()
-                .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
-            self.sysctl_retry = Some(Retry {
-                at: Instant::now() + backoff,
-                backoff,
-                attempt: SYSCTL_ATTEMPT.to_owned(),
-            });
-        } else {
-            self.sysctl_retry = None;
         }
         Ok(())
     }
@@ -953,12 +967,12 @@ impl Daemon {
             .map(|r| r.attempt.clone());
         // FR-REC-3: sysctls before the routes and rules that rely on them.
         if !self.sysctls_pending.is_empty() {
-            if self.sysctls_pending.contains(&SysctlScope::Global) && waiting.as_deref() == Some(SYSCTL_ATTEMPT) {
-                self.evaluate();
-                return;
-            }
-            if let Err(f) = self.apply_pending_sysctls() {
+            let global = waiting.as_deref() != Some(SYSCTL_ATTEMPT);
+            if let Err(f) = self.apply_pending_sysctls(global) {
                 self.failed(f, SYSCTL_ATTEMPT.to_owned());
+            }
+            // Everything depends on the global settings.
+            if self.sysctls_pending.contains(&SysctlScope::Global) {
                 self.evaluate();
                 return;
             }
@@ -1255,9 +1269,10 @@ impl Daemon {
                 info!("a netlink dump was still interrupted after its retries: full resynchronisation");
                 next_full = next_full.min(Instant::now() + RESYNC_AFTER_INTERRUPTED);
             }
-            let wake = [&self.retry, &self.sysctl_retry]
-                .into_iter()
-                .flatten()
+            let wake = self
+                .retry
+                .iter()
+                .chain(self.sysctl_retries.values())
                 .map(|r| r.at)
                 .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);

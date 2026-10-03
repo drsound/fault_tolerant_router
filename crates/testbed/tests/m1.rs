@@ -2458,6 +2458,45 @@ fn as27_a_failing_interface_setting_does_not_hold_back_failover() -> Result<()> 
     Ok(())
 }
 
+/// AS-27, an uplink added while another interface's settings keep
+/// failing gets its own settings before it carries traffic: the backoff of
+/// C's settings does not hold back B's (FR-REC-3, FR-REC-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()> {
+    let t = build();
+    let (a, b, c) = (
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2),
+        UplinkSpec::new(Uplink::C, 3),
+    );
+    let mut f = t.prepare_ftr(&ftr::ipv4(&[a, c]))?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["ppp0", "wana"], Duration::from_secs(15))?;
+    faults.arm_matching("sysctls (ppp0)")?;
+    t.pppoe_reset()?;
+    // Four failures: C's retry now waits about 8 s.
+    t.wait_for("C's settings failing repeatedly", Duration::from_secs(40), || {
+        Ok(faults.steps().iter().filter(|s| s.ends_with(" failed")).count() >= 4)
+    })?;
+    assert_eq!(balancing_members(&t)?, ["wana"], "C is not ready");
+    let svm = || t.router().sysctl_get("net.ipv4.conf.wanb.src_valid_mark");
+    assert_eq!(svm()?, "0", "B is not FTR's yet");
+    f.write_config(&ftr::ipv4(&[a, b, c]))?;
+    f.reload()?;
+    t.wait_for("B in the balancing route", Duration::from_secs(15), || {
+        let joined = balancing_members(&t)?.contains(&"wanb".to_owned());
+        assert!(!joined || svm()? == "1", "B carries traffic without its settings");
+        Ok(joined)
+    })?;
+    faults.disarm()?;
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(70))?;
+    f.stop()?;
+    Ok(())
+}
+
 /// AS-27, cleanup step by step: a failure injected after each step of
 /// `cleanup` leaves the artifacts not yet removed in place, a second
 /// `cleanup` completes, and foreign objects are untouched; the steps follow
