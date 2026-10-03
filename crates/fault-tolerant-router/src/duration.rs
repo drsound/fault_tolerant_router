@@ -35,7 +35,7 @@ pub fn parse(text: &str) -> Result<Duration, String> {
 /// Formats a duration the way the configuration writes it.
 pub fn format(d: Duration) -> String {
     let ms = d.as_millis();
-    if ms % 1000 != 0 {
+    if !ms.is_multiple_of(1000) {
         format!("{ms}ms")
     } else {
         format!("{}s", ms / 1000)

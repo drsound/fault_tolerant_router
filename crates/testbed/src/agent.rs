@@ -42,10 +42,10 @@ struct Log(Option<Mutex<File>>);
 
 impl Log {
     fn write<T: Serialize>(&self, ev: &T) {
-        if let Some(f) = &self.0 {
-            if let (Ok(mut f), Ok(line)) = (f.lock(), serde_json::to_string(ev)) {
-                let _ = writeln!(f, "{line}");
-            }
+        if let Some(f) = &self.0
+            && let (Ok(mut f), Ok(line)) = (f.lock(), serde_json::to_string(ev))
+        {
+            let _ = writeln!(f, "{line}");
         }
     }
 }

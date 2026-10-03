@@ -501,14 +501,14 @@ fn path(cx: &mut Ctx, raw: Spanned<raw::Path>, family: Family, key: &str) -> Pat
     };
     let source = addr(cx, p.source, "source");
     let gateway = addr(cx, p.gateway, "gateway");
-    if let AutoOr::Static(a) = source {
-        if !is_usable_source(a) {
-            cx.err(
-                Some(&span),
-                format!("{key}.source"),
-                format!("{a} cannot be a source address"),
-            );
-        }
+    if let AutoOr::Static(a) = source
+        && !is_usable_source(a)
+    {
+        cx.err(
+            Some(&span),
+            format!("{key}.source"),
+            format!("{a} cannot be a source address"),
+        );
     }
     let gateway_onlink = p.gateway_onlink.unwrap_or(false);
     if gateway_onlink && gateway == AutoOr::Auto {
@@ -661,10 +661,10 @@ fn health(cx: &mut Ctx, h: &raw::Health, families: &[Family], span: Option<&Rang
             .map(|t| cx.duration(Some(t), Duration::ZERO, span, &k("quality.max_jitter"))),
         max_loss: q.max_loss,
     };
-    if let Some(l) = quality.max_loss {
-        if !(0.0..=1.0).contains(&l) {
-            cx.err(span, k("quality.max_loss"), format!("{l} is out of range 0–1"));
-        }
+    if let Some(l) = quality.max_loss
+        && !(0.0..=1.0).contains(&l)
+    {
+        cx.err(span, k("quality.max_loss"), format!("{l} is out of range 0–1"));
     }
     let quality_window = cx.int::<u8>(h.quality_window, 6, 2..=100, span, &k("quality_window"));
     let quality_min_samples = cx.int::<u16>(h.quality_min_samples, 10, 1..=10_000, span, &k("quality_min_samples"));
@@ -751,14 +751,14 @@ fn policy(
             None
         }
     };
-    if let Some(i) = &p.input_interface {
-        if !downlinks.contains(i) {
-            cx.err(
-                Some(&span),
-                format!("{key}.input_interface"),
-                format!("{i:?} is not a downlink"),
-            );
-        }
+    if let Some(i) = &p.input_interface
+        && !downlinks.contains(i)
+    {
+        cx.err(
+            Some(&span),
+            format!("{key}.input_interface"),
+            format!("{i:?} is not a downlink"),
+        );
     }
     let prefix = |cx: &mut Ctx, v: &Option<String>, what: &str| -> Option<IpNet> {
         let text = v.as_deref()?;
@@ -875,10 +875,10 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
         if e.to.is_empty() {
             cx.err(Some(&span), "notify.email.to", "at least one recipient is required");
         }
-        if let Some(p) = &e.password_file {
-            if !p.is_absolute() {
-                cx.err(Some(&span), "notify.email.password_file", "must be an absolute path");
-            }
+        if let Some(p) = &e.password_file
+            && !p.is_absolute()
+        {
+            cx.err(Some(&span), "notify.email.password_file", "must be an absolute path");
         }
         Email {
             from: e.from,

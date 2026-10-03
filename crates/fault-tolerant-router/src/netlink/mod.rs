@@ -12,8 +12,8 @@ pub mod msg;
 use std::fmt;
 use std::io;
 
-use futures_util::StreamExt;
 use futures_channel::mpsc::UnboundedReceiver;
+use futures_util::StreamExt;
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
     NetlinkPayload,
@@ -282,7 +282,7 @@ mod tests {
         payload.extend_from_slice(&len.to_ne_bytes());
         payload.extend_from_slice(&1u16.to_ne_bytes());
         payload.extend_from_slice(msg);
-        while payload.len() % 4 != 0 {
+        while !payload.len().is_multiple_of(4) {
             payload.push(0);
         }
         assert_eq!(parse_extack(&payload).as_deref(), Some("Nexthop has invalid gateway"));

@@ -144,12 +144,13 @@ impl System {
     pub fn replace_table(&mut self, scope: &Scope, family: Family, table: u32, dump: &[RouteNetlinkMessage]) {
         self.routes.retain(|(f, t, _, _), _| !(*f == family && *t == table));
         for m in dump {
-            if let RouteNetlinkMessage::NewRoute(r) = m {
-                if let Some(r) = ObservedRoute::parse(r) {
-                    if r.family == family && r.table == table && scope.keeps(&r) {
-                        self.routes.insert(route_key(&r), r);
-                    }
-                }
+            if let RouteNetlinkMessage::NewRoute(r) = m
+                && let Some(r) = ObservedRoute::parse(r)
+                && r.family == family
+                && r.table == table
+                && scope.keeps(&r)
+            {
+                self.routes.insert(route_key(&r), r);
             }
         }
     }

@@ -165,6 +165,7 @@ dependencies = [
  "netlink-proto",
  "netlink-sys",
  "serde",
+ "serde_json",
  "socket2",
  "tokio",
  "toml",

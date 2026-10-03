@@ -309,10 +309,8 @@ impl Icmp {
         let matches =
             st.1.get(&reply.seq)
                 .is_some_and(|w| w.target == reply.source && w.token == reply.token);
-        if matches {
-            if let Some(w) = st.1.remove(&reply.seq) {
-                let _ = w.reply.send(w.sent.elapsed());
-            }
+        if matches && let Some(w) = st.1.remove(&reply.seq) {
+            let _ = w.reply.send(w.sent.elapsed());
         }
     }
 }

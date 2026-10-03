@@ -28,6 +28,7 @@ netlink-packet-route = "=0.33.0"
 netlink-proto = { version = "=0.13.0", default-features = false, features = ["tokio_socket"] }
 netlink-sys = { version = "=0.9.0", features = ["tokio_socket"] }
 serde.workspace = true
+serde_json.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "process", "signal", "io-util"] }
 toml.workspace = true
