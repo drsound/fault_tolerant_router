@@ -149,6 +149,71 @@ pub fn restore(manifest: &Manifest, keys: impl Fn(&str) -> bool) -> Vec<(String,
     v
 }
 
+/// Outcome of handing a family's settings back (FR-REC-9 step 4).
+#[derive(Debug, Default)]
+pub struct Handoff {
+    /// Restored to the baseline.
+    pub restored: Vec<String>,
+    /// Changed by someone else since FTR set them: left as they are.
+    pub released: Vec<String>,
+    /// Not restored; kept in the manifest and retried (FR-REC-5).
+    pub failed: Vec<(String, io::Error)>,
+}
+
+/// Restores the recorded settings of a family that is no longer managed,
+/// only where the current value is still the one FTR set, and forgets them
+/// in the manifest; failures stay recorded for a retry.
+pub fn hand_back(
+    manifest: &mut Manifest,
+    family: Family,
+    read: impl Fn(&str) -> io::Result<String>,
+    write: impl Fn(&str, &str) -> io::Result<()>,
+) -> Handoff {
+    let mut h = Handoff::default();
+    let keys: Vec<String> = manifest
+        .sysctl_set
+        .keys()
+        .filter(|k| family_of(k) == Some(family))
+        .cloned()
+        .collect();
+    for key in keys {
+        let set = manifest.sysctl_set[&key].clone();
+        let baseline = manifest.sysctl_baseline.get(&key).cloned();
+        let outcome = match read(&key) {
+            // The interface is gone: nothing left to restore.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+            Ok(current) if current != set => Ok(false),
+            Ok(_) => match baseline {
+                Some(b) if b != set => write(&key, &b).map(|()| true),
+                _ => Ok(true),
+            },
+        };
+        match outcome {
+            Ok(restored) => {
+                manifest.sysctl_set.remove(&key);
+                manifest.sysctl_baseline.remove(&key);
+                if restored {
+                    h.restored.push(key)
+                } else {
+                    h.released.push(key)
+                }
+            }
+            Err(e) => h.failed.push((key, e)),
+        }
+    }
+    h
+}
+
+/// Families whose settings are recorded but that the configuration no
+/// longer manages.
+pub fn departed(manifest: &Manifest, config: &Config) -> Vec<Family> {
+    Family::ALL
+        .into_iter()
+        .filter(|f| !config.manages(*f) && manifest.sysctl_set.keys().any(|k| family_of(k) == Some(*f)))
+        .collect()
+}
+
 /// The family a recorded key belongs to.
 pub fn family_of(key: &str) -> Option<Family> {
     if key.starts_with("net/ipv4/") {
@@ -213,5 +278,61 @@ interface = "wan0.100"
         record(&mut m, &d);
         assert_eq!(m.sysctl_baseline["net/ipv4/ip_forward"], "0");
         assert_eq!(family_of("net/ipv6/conf/all/forwarding"), Some(Family::V6));
+    }
+
+    #[test]
+    fn hand_back_restores_only_untouched_settings_of_the_family() {
+        use std::cell::RefCell;
+        let cfg = config::parse(CONFIG).unwrap();
+        let mut m = Manifest::new(&cfg);
+        m.record_sysctl("net/ipv4/ip_forward", "0", "1");
+        m.record_sysctl("net/ipv6/conf/all/forwarding", "0", "1");
+        m.record_sysctl("net/ipv6/conf/wana/ignore_routes_with_linkdown", "0", "1");
+        m.record_sysctl("net/ipv6/fib_multipath_hash_policy", "0", "1");
+        m.record_sysctl("net/ipv6/conf/gone/ignore_routes_with_linkdown", "0", "1");
+        let current: RefCell<HashMap<String, String>> = RefCell::new(
+            [
+                ("net/ipv4/ip_forward", "1"),
+                ("net/ipv6/conf/all/forwarding", "1"),
+                // Changed by the administrator since FTR set it.
+                ("net/ipv6/conf/wana/ignore_routes_with_linkdown", "2"),
+                ("net/ipv6/fib_multipath_hash_policy", "1"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        );
+        let read = |k: &str| {
+            current
+                .borrow()
+                .get(k)
+                .cloned()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        };
+        let fail_hash = |k: &str, v: &str| {
+            if k.contains("hash") {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            current.borrow_mut().insert(k.to_owned(), v.to_owned());
+            Ok(())
+        };
+        let h = hand_back(&mut m, Family::V6, read, fail_hash);
+        assert_eq!(h.restored, ["net/ipv6/conf/all/forwarding"]);
+        assert_eq!(h.released.len(), 2, "administrator change and vanished interface");
+        assert_eq!(h.failed.len(), 1);
+        assert_eq!(current.borrow()["net/ipv6/conf/all/forwarding"], "0");
+        assert_eq!(current.borrow()["net/ipv6/conf/wana/ignore_routes_with_linkdown"], "2");
+        // The failure stays recorded for a retry; IPv4 is untouched.
+        assert!(m.sysctl_set.contains_key("net/ipv6/fib_multipath_hash_policy"));
+        assert_eq!(m.sysctl_baseline["net/ipv4/ip_forward"], "0");
+        assert_eq!(departed(&m, &cfg), [Family::V6]);
+        // A retry that succeeds empties the family.
+        let h = hand_back(&mut m, Family::V6, read, |k: &str, v: &str| {
+            current.borrow_mut().insert(k.to_owned(), v.to_owned());
+            Ok(())
+        });
+        assert_eq!(h.restored, ["net/ipv6/fib_multipath_hash_policy"]);
+        assert!(departed(&m, &cfg).is_empty());
+        assert_eq!(current.borrow()["net/ipv4/ip_forward"], "1");
     }
 }

@@ -32,7 +32,7 @@ cargo build --target $target -p testbed --bin ftr-testbed
 test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
   | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
 # The daemon's kernel tests (crates/fault-tolerant-router/tests/kernel_*.rs).
-kernel_tests="kernel_netlink kernel_probe"
+kernel_tests="kernel_netlink kernel_probe kernel_handoff"
 rm -rf "$bindir"
 mkdir -p "$bindir"
 cp "$target_dir/$target/debug/ftr-testbed" "$bindir/"

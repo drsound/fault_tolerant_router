@@ -743,6 +743,12 @@ impl Daemon {
             },
         );
         if ops.is_empty() {
+            // Routing and nftables no longer hold a departed family's
+            // artifacts: its settings go back last (FR-REC-9 step 4).
+            if let Err(f) = self.hand_back_families() {
+                self.failed(f);
+                return;
+            }
             self.applied();
             return;
         }
@@ -772,6 +778,41 @@ impl Daemon {
                 self.dirty = true;
             }
             Err(f) => self.failed(f),
+        }
+    }
+
+    fn hand_back_families(&mut self) -> std::result::Result<(), Failure> {
+        let departed = sysctl::departed(&self.manifest, &self.cfg);
+        if departed.is_empty() || !self.cfg.routing.manage_sysctls {
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        for family in departed {
+            let h = sysctl::hand_back(&mut self.manifest, family, sysctl::read, sysctl::write);
+            for k in &h.restored {
+                info!("restored {} (family {family} handed back)", k.replace('/', "."));
+            }
+            for k in &h.released {
+                info!(
+                    "{} left as it is: changed since FTR set it, or gone",
+                    k.replace('/', ".")
+                );
+            }
+            for (k, e) in h.failed {
+                failures.push(format!("{}: {e}", k.replace('/', ".")));
+            }
+        }
+        if let Err(e) = self.state_dir.write_manifest(&self.manifest) {
+            failures.push(format!("manifest: {e}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Failure {
+                op: "restore sysctls of a handed-back family".into(),
+                error: failures.join("; "),
+                route: None,
+            })
         }
     }
 

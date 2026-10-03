@@ -3,7 +3,8 @@
 //! keeps the invariants (FR-REC-1 to FR-REC-5):
 //!
 //! 1. routes (path tables; balancing and policy tables without uplinks whose
-//!    mark assignments are not installed yet);
+//!    mark assignments are not installed yet), and the withdrawal of
+//!    balancing and policy routes that must go;
 //! 2. rule additions, guards first, then lookup rules in decreasing
 //!    precedence, each source rule followed by its source guard, the final
 //!    guard last;
@@ -11,7 +12,7 @@
 //! 4. routes that include the uplinks just given mark assignments;
 //! 5. rule deletions in increasing precedence, each source guard before its
 //!    source rule, class guards last;
-//! 6. route deletions.
+//! 6. deletion of path routes.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -134,6 +135,23 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
             ops.push(Op::ReplaceRoute(r.clone()));
         }
     }
+    // Routes to withdraw. Balancing and policy tables are emptied first, so
+    // that a removed uplink or family leaves the active set and its policy
+    // tables before anything else changes (FR-REC-3, FR-REC-9); path tables
+    // are emptied last, after the rules that use them (FR-REC-4).
+    let mut tables = BTreeSet::new();
+    for r in system.routes.values() {
+        if r.protocol == d.protocol && d.layout.tables().contains(&r.table) && r.as_planned().is_some() {
+            tables.insert((r.family, r.table));
+        }
+    }
+    let (early, late): (Vec<_>, Vec<_>) = tables
+        .into_iter()
+        .filter(|key| !d.desired.routes.contains_key(key))
+        .partition(|(_, t)| *t == d.layout.balancing_table() || *t >= d.layout.table_base + 65);
+    for (family, table) in early {
+        ops.push(Op::DeleteRoute { family, table });
+    }
     let observed = observed_rules(system, d.layout, d.protocol);
     let mut adds: Vec<&Rule> = d
         .desired
@@ -171,16 +189,8 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
         )
     });
     ops.extend(deletes.into_iter().cloned().map(Op::DeleteRule));
-    let mut tables = BTreeSet::new();
-    for r in system.routes.values() {
-        if r.protocol == d.protocol && d.layout.tables().contains(&r.table) && r.as_planned().is_some() {
-            tables.insert((r.family, r.table));
-        }
-    }
-    for (family, table) in tables {
-        if !d.desired.routes.contains_key(&(family, table)) {
-            ops.push(Op::DeleteRoute { family, table });
-        }
+    for (family, table) in late {
+        ops.push(Op::DeleteRoute { family, table });
     }
     ops
 }

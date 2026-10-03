@@ -188,6 +188,11 @@ fn a_removed_uplink_loses_rules_in_increasing_precedence_then_routes() {
     assert!(nft < guard && guard < source, "{v:?}");
     assert!(position(&v, "-1402") < position(&v, "-1202") && position(&v, "-1202") < position(&v, "-1002"));
     assert!(position(&v, "-1002") < position(&v, "-route 1002"));
+    // Policy tables are emptied before the nftables replacement (FR-REC-3).
+    assert!(
+        position(&v, "-route 1066") < nft && position(&v, "-route 1130") < nft,
+        "{v:?}"
+    );
     assert!(!v.iter().any(|x| x == "-1264" || x == "-1699"), "guards stay: {v:?}");
 }
 
@@ -275,4 +280,125 @@ fn classification_by_offset() {
     assert_eq!(classify(l, 1564), Some(RuleKind::SourceGuard));
     assert_eq!(classify(l, 1200), None);
     assert_eq!(classify(l, 999), None);
+}
+
+const DUAL: &str = r#"version = 2
+[[downlink]]
+interface = "lan"
+[[uplink]]
+id = 1
+name = "a"
+interface = "wana"
+priority = 1
+[uplink.ipv4]
+[uplink.ipv6]
+nat = "masquerade"
+[[uplink]]
+id = 2
+name = "b"
+interface = "wanb"
+priority = 1
+[uplink.ipv4]
+[uplink.ipv6]
+nat = "masquerade"
+"#;
+
+fn dual_input() -> Input {
+    let mut i = input(&[1, 2]);
+    for n in [1u8, 2] {
+        let src: IpAddr = format!("2001:db8:{n}::2").parse().unwrap();
+        i.paths.insert(
+            PathKey {
+                uplink: id(n),
+                family: Family::V6,
+            },
+            PathInput {
+                ready: Some(ReadyPath {
+                    ifindex: 4 + u32::from(n),
+                    gateway: Some("fe80::1".parse().unwrap()),
+                    onlink: false,
+                    source: src,
+                }),
+                local_addresses: [src].into(),
+                healthy: true,
+                drained: false,
+            },
+        );
+    }
+    i.active.insert(Family::V6, [id(1), id(2)].into());
+    i
+}
+
+#[test]
+fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
+    let dual = config::parse(DUAL).unwrap();
+    let before = plan::plan(&dual, &dual_input());
+    let mut s = System::default();
+    let install = diff(
+        &System::default(),
+        &DiffInput {
+            layout: Layout::of(&dual),
+            protocol: 249,
+            families: &[Family::V4, Family::V6],
+            before_nft: &before,
+            desired: &before,
+            nft_pending: true,
+        },
+    );
+    apply(&mut s, &dual, &install);
+    let v4_only = config::parse(&DUAL.replace("[uplink.ipv6]\nnat = \"masquerade\"\n", "")).unwrap();
+    assert!(!v4_only.manages(Family::V6));
+    let mut i = dual_input();
+    i.paths.retain(|k, _| k.family == Family::V4);
+    i.active.remove(&Family::V6);
+    let after = plan::plan(&v4_only, &i);
+    let ops = diff(
+        &s,
+        &DiffInput {
+            layout: Layout::of(&v4_only),
+            protocol: 249,
+            families: &[Family::V4],
+            before_nft: &after,
+            desired: &after,
+            nft_pending: true,
+        },
+    );
+    // Nothing of IPv4 is touched.
+    let family = |o: &Op| match o {
+        Op::ReplaceRoute(r) => Some(r.family),
+        Op::AddRule(r) => Some(r.family),
+        Op::DeleteRule(r) => Some(r.family),
+        Op::DeleteRoute { family, .. } => Some(*family),
+        Op::ApplyNft => None,
+    };
+    assert!(ops.iter().all(|o| family(o) != Some(Family::V4)), "{ops:?}");
+    // (1) balancing and policy tables, (2) nftables, (3) rules, then path tables.
+    let v = rule_kinds(&ops);
+    let nft = position(&v, "nft");
+    for t in ["1000", "1065", "1066", "1129", "1130"] {
+        assert!(position(&v, &format!("-route {t}")) < nft, "{v:?}");
+    }
+    assert!(nft < position(&v, "-1699"));
+    assert!(
+        position(&v, "-1064") < position(&v, "-route 1001"),
+        "class guards before path routes: {v:?}"
+    );
+    assert!(
+        v.iter().filter(|x| x.starts_with("-1")).count()
+            == before.rules.iter().filter(|r| r.family == Family::V6).count()
+    );
+    let mut done = s.clone();
+    apply(&mut done, &v4_only, &ops);
+    let again = diff(
+        &done,
+        &DiffInput {
+            layout: Layout::of(&v4_only),
+            protocol: 249,
+            families: &[Family::V4],
+            before_nft: &after,
+            desired: &after,
+            nft_pending: false,
+        },
+    );
+    assert!(again.is_empty(), "converged: {again:?}");
 }
