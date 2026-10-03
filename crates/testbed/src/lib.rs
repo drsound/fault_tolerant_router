@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod ftr;
 pub mod inject;
 pub mod netns;
 pub mod plan;

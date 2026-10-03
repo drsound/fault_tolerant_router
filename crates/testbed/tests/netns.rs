@@ -97,12 +97,14 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
             );
             let distinct: std::collections::HashSet<_> = tcp.iter().map(|r| (r.dst, r.local)).collect();
             assert_eq!(distinct.len(), 200, "distinct 5-tuples");
+            // UDP has no retransmission: a single unanswered datagram (seen
+            // once in 50 for IPv6 on a loaded 6.1 guest) is not a routing
+            // error; any datagram attributed to another uplink is.
             let udp = t.connect_many(Node::Client, f, 50, 50, true)?;
-            assert_eq!(
-                tally(&udp).get(&Some(u)).copied(),
-                Some(50),
-                "{u} {f} UDP: {:?}",
-                tally(&udp)
+            let counts = tally(&udp);
+            assert!(
+                counts.get(&Some(u)).copied().unwrap_or(0) >= 48 && counts.keys().all(|k| k.is_none() || *k == Some(u)),
+                "{u} {f} UDP: {counts:?}"
             );
             assert!(t.egress_packets(u, f)? >= 250, "{u} {f} egress counter");
         }

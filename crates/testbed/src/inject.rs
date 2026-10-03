@@ -189,6 +189,13 @@ impl Daemon {
         Ok(())
     }
 
+    /// Whether the process has ended (a zombie counts as ended).
+    pub fn exited(&self) -> bool {
+        self.child.as_ref().is_some_and(|c| {
+            std::fs::read_to_string(format!("/proc/{}/stat", c.id())).map_or(true, |s| s.contains(") Z "))
+        })
+    }
+
     /// Sends SIGTERM and waits for the exit status.
     pub fn stop(mut self) -> Result<std::process::ExitStatus> {
         self.signal("TERM")?;

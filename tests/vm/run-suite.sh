@@ -28,15 +28,20 @@ target_dir=${CARGO_TARGET_DIR:-$repo/target}
 bindir=$target_dir/netns-suite
 cd "$repo"
 
-cargo build --target $target -p testbed --bin ftr-testbed
+cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router
 test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
   | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
+# Acceptance scenarios with the daemon under test.
+m1_bin=$(cargo test --target $target -p testbed --test m1 --no-run --message-format=json \
+  | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "m1") | .executable')
 # The daemon's kernel tests (crates/fault-tolerant-router/tests/kernel_*.rs).
 kernel_tests="kernel_netlink kernel_probe kernel_handoff"
 rm -rf "$bindir"
 mkdir -p "$bindir"
 cp "$target_dir/$target/debug/ftr-testbed" "$bindir/"
 cp "$test_bin" "$bindir/netns"
+cp "$m1_bin" "$bindir/m1"
+cp "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
 for t in $kernel_tests; do
   bin=$(cargo test --target $target -p fault-tolerant-router --test "$t" --no-run --message-format=json \
     | jq -r --arg t "$t" 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $t) | .executable')
@@ -57,7 +62,9 @@ case $mode in
     for t in $kernel_tests; do
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
-    exec $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
+    $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
+    exec $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
+      "$bindir/m1" --ignored "$@"
     ;;
   vm)
     rootfs=$(cd "$rootfs" && pwd)
@@ -70,6 +77,6 @@ case $mode in
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \
       --rodir "/mnt=$bindir" \
-      --exec "uname -r && nft --version && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+      --exec "uname -r && nft --version && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
     ;;
 esac
