@@ -435,7 +435,11 @@ pub fn boottime_ms() -> io::Result<u64> {
     let frac: u64 = format!("{frac:0<3}")[..3]
         .parse()
         .map_err(|_| io::Error::other("bad /proc/uptime"))?;
-    Ok(int * 1000 + frac)
+    #[cfg(feature = "test-hooks")]
+    let shift = crate::test_hooks::boottime_shift_ms();
+    #[cfg(not(feature = "test-hooks"))]
+    let shift = 0;
+    Ok(int * 1000 + frac + shift)
 }
 
 /// The exclusive instance lock (IMPL-6), held while the value lives.

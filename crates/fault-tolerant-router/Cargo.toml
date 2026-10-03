@@ -15,6 +15,10 @@ name = "fault_tolerant_router"
 name = "fault-tolerant-router"
 path = "src/main.rs"
 
+[features]
+# Hooks for the acceptance scenarios (src/test_hooks.rs); never in releases.
+test-hooks = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

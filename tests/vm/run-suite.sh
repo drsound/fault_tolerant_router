@@ -28,7 +28,10 @@ target_dir=${CARGO_TARGET_DIR:-$repo/target}
 bindir=$target_dir/netns-suite
 cd "$repo"
 
-cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router
+# The daemon under test has the hooks of the acceptance scenarios
+# (crates/fault-tolerant-router/src/test_hooks.rs).
+cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router \
+  --features fault-tolerant-router/test-hooks
 test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
   | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
 # Acceptance scenarios with the daemon under test.

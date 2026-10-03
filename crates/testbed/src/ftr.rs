@@ -139,6 +139,8 @@ pub struct Ftr {
     pub log: PathBuf,
     bin: PathBuf,
     router_ns: String,
+    /// Environment of the next starts (test hooks of the daemon).
+    env: Vec<(String, String)>,
 }
 
 impl Topology {
@@ -170,6 +172,7 @@ impl Topology {
             dir,
             bin: daemon_bin()?,
             router_ns: self.router().name().to_owned(),
+            env: Vec::new(),
         };
         f.write_config(config)?;
         Ok(f)
@@ -199,11 +202,20 @@ impl Ftr {
     /// Starts `run --config` (again, after a stop).
     pub fn start(&mut self, t: &Topology) -> Result<()> {
         let config = self.config.display().to_string();
-        let args = self.args(&["run", "--config", &config]);
+        let mut args: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        args.push(self.bin.display().to_string());
+        args.extend(self.args(&["run", "--config", &config]));
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.log_start = fs::metadata(&self.log).map(|m| m.len() as usize).unwrap_or(0);
-        self.daemon = Some(t.start_daemon(&self.bin, &args)?);
+        self.daemon = Some(t.start_daemon(Path::new("env"), &args)?);
         Ok(())
+    }
+
+    /// Sets an environment variable for the next starts, for the daemon's
+    /// test hooks (built with the `test-hooks` feature by `run-suite.sh`).
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_owned(), value.to_owned()));
     }
 
     /// Runs a CLI command in the router namespace (with this run's lock).

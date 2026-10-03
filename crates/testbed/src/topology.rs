@@ -44,6 +44,11 @@ pub struct Options {
     pub ipv6: bool,
     /// Bring up provider C (PPPoE).
     pub pppoe: bool,
+    /// Start the router's uplink clients (`udhcpc`, `pppd`) and wait for
+    /// their configuration while building. When false, the router has no
+    /// lease, no global address and no default route on its uplinks until
+    /// [`Topology::start_uplink_clients`] (AS-44).
+    pub uplink_clients: bool,
     /// How long to wait for leases, addresses and default routes.
     pub ready_timeout: Duration,
     /// Value of `net.ipv4.conf.default.rp_filter` in the router namespace
@@ -72,6 +77,7 @@ impl Default for Options {
             agent_bin: default_agent_bin(),
             ipv6: true,
             pppoe: true,
+            uplink_clients: true,
             ready_timeout: Duration::from_secs(45),
             router_default_rp_filter: 2,
             icmp_ratelimit: false,
@@ -226,9 +232,12 @@ impl Topology {
             self.provider_c()?;
         }
         self.lan()?;
-        self.router_uplinks()?;
+        self.router_uplink_settings()?;
         self.observability()?;
-        self.wait_ready()?;
+        if self.opts.uplink_clients {
+            self.start_uplink_clients()?;
+            self.wait_ready()?;
+        }
         self.warm_up()?;
         Ok(())
     }
@@ -469,11 +478,8 @@ impl Topology {
         Ok(())
     }
 
-    fn router_uplinks(&self) -> Result<()> {
+    fn router_uplink_settings(&self) -> Result<()> {
         let r = self.router();
-        let script = self.dir.join("udhcpc-script");
-        fs::write(&script, udhcpc_script())?;
-        chmod_x(&script)?;
         for u in [Uplink::A, Uplink::B] {
             let ifc = u.carrier_iface();
             if self.opts.ipv6 {
@@ -484,6 +490,23 @@ impl Topology {
                     &format!("net.ipv6.conf.{ifc}.autoconf=0"),
                 ])?;
             }
+        }
+        if self.opts.pppoe {
+            r.sysctl(&["net.ipv6.conf.wanc.disable_ipv6=1"])?;
+        }
+        Ok(())
+    }
+
+    /// Starts the router's DHCPv4 clients and, with provider C, `pppd`; the
+    /// build does it unless [`Options::uplink_clients`] is false. Use
+    /// [`Topology::wait_ready`] to wait for their configuration.
+    pub fn start_uplink_clients(&self) -> Result<()> {
+        let r = self.router();
+        let script = self.dir.join("udhcpc-script");
+        fs::write(&script, udhcpc_script())?;
+        chmod_x(&script)?;
+        for u in [Uplink::A, Uplink::B] {
+            let ifc = u.carrier_iface();
             let mut c = r.command("env");
             c.arg(format!("TB_METRIC={}", u.os_metric()))
                 .arg(format!("TB_REALM={OS_ROUTE_REALM}"))
@@ -499,7 +522,6 @@ impl Topology {
             }
         }
         if self.opts.pppoe {
-            r.sysctl(&["net.ipv6.conf.wanc.disable_ipv6=1"])?;
             let up = self.dir.join("pppd-ip-up");
             fs::write(&up, ppp_ip_up_script(Uplink::C.os_metric()))?;
             chmod_x(&up)?;

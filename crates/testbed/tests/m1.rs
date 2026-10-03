@@ -1594,13 +1594,11 @@ fn as47_startup_with_existing_artifacts() -> Result<()> {
     )?;
     std::thread::sleep(Duration::from_millis(500));
 
-    // (1) Intact artifacts, checkpoint older than 10 minutes: adopted, cold start.
+    // (1) Intact artifacts, checkpoint older than 10 minutes: adopted, cold
+    // start. The daemon's boot-time clock moves 11 minutes ahead (a test
+    // hook): the host may have booted less than 10 minutes ago.
     f.kill()?;
-    let checkpoint = f.dir.join("state/health.json");
-    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&checkpoint)?)?;
-    let ms = v["boottime_ms"].as_u64().unwrap_or(0);
-    v["boottime_ms"] = serde_json::json!(ms.saturating_sub(11 * 60 * 1000));
-    std::fs::write(&checkpoint, serde_json::to_string(&v)?)?;
+    f.set_env("FTR_TEST_BOOTTIME_SHIFT_MS", &(11 * 60 * 1000).to_string());
     f.start(&t)?;
     f.wait_log(
         &t,
@@ -1704,5 +1702,104 @@ fn as31_path_mtu_discovery_through_pppoe_and_a_provider_bottleneck() -> Result<(
         "through the provider bottleneck: {r:?}"
     );
     assert_eq!(r.uplink(), Some(Uplink::A));
+    Ok(())
+}
+
+/// Valid lifetime in seconds of the IPv4 address of an uplink.
+fn valid_lft(t: &Topology, u: Uplink) -> Result<Option<u64>> {
+    let v = t
+        .router()
+        .ip_json(&format!("-4 addr show dev {} scope global", u.l3_iface()))?;
+    Ok(v.as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|l| l["addr_info"].as_array().cloned().unwrap_or_default())
+        .find_map(|a| a["valid_life_time"].as_u64()))
+}
+
+/// A packet counter `c` in table `ip t44` of a provider namespace.
+fn provider_counter(t: &Topology, node: Node, name: &str) -> Result<u64> {
+    let out = t.ns(node).run("nft", ["-j", "list", "counter", "ip", "t44", name])?;
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    Ok(v["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|o| o["counter"]["packets"].as_u64())
+        .unwrap_or(0))
+}
+
+/// AS-44 (IPv4 parts): the router boots with FTR installed before any uplink
+/// is configured (no lease, no global address, no default route, empty
+/// active set); then DHCPv4 acquisition (A, B) and PPPoE negotiation (C)
+/// succeed, the unicast renewal to the on-link server succeeds (A), and with
+/// unicast renewals dropped by the provider the broadcast rebinding succeeds
+/// (B), all before the 2-minute leases expire (FR-CT-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
+    assert!(testbed::is_root(), "these tests need root: tests/vm/run-suite.sh");
+    let bin = std::env::var_os("FTR_TESTBED_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ftr-testbed")));
+    let t = Topology::build(Options {
+        agent_bin: bin,
+        uplink_clients: false,
+        ..Options::default()
+    })
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    for u in [Uplink::A, Uplink::B, Uplink::C] {
+        assert_eq!(t.uplink_address(u, Family::V4)?, None, "{u} has no address yet");
+        assert_eq!(t.os_default_route(u, Family::V4)?, None, "{u} has no default route yet");
+    }
+    let f = t.start_ftr(&ftr::ipv4_config(&abc(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert!(balancing_members(&t)?.is_empty(), "empty active set");
+    assert!(!ftr_rules(&t)?.is_empty(), "FTR's rules are installed");
+    // Requests to the DHCP servers, by destination: unicast (renewals) and
+    // broadcast (discovery, selection, rebinding). Provider B drops unicast
+    // renewals, so its client must rebind.
+    for (node, server, drop) in [(Node::IspA, "192.0.2.1", ""), (Node::IspB, "100.64.0.1", " drop")] {
+        t.ns(node).nft(&format!(
+            "table ip t44 {{\n  counter uni {{}}\n  counter bc {{}}\n  chain in {{\n    type filter hook input priority -10; policy accept;\n    udp dport 67 ip daddr {server} counter name uni{drop}\n    udp dport 67 ip daddr 255.255.255.255 counter name bc\n  }}\n}}\n"
+        ))?;
+    }
+
+    t.start_uplink_clients()?;
+    t.wait_ready()?;
+    let acquired = Instant::now();
+    let leased: Vec<String> = [Uplink::A, Uplink::B]
+        .into_iter()
+        .map(|u| address(&t, u))
+        .collect::<Result<_>>()?;
+    let bc_b = provider_counter(&t, Node::IspB, "bc")?;
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(15))?;
+    assert!(path_route(&t, 1003)?.contains("dev ppp0"), "C's path route");
+    t.reset_counters()?;
+    let r = t.connect_many(Node::Client, Family::V4, 20, 60, false)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
+
+    // Renewal at T1 (half of the 2-minute lease); rebinding once the
+    // renewal goes unanswered, before the lease expires.
+    let lease = Duration::from_secs(120);
+    let renewed = |u: Uplink| -> Result<bool> { Ok(valid_lft(&t, u)?.is_some_and(|l| l >= 100)) };
+    t.wait_for("A's unicast renewal", lease, || {
+        Ok(provider_counter(&t, Node::IspA, "uni")? > 0)
+    })?;
+    t.wait_for("A's renewed lease", Duration::from_secs(5), || renewed(Uplink::A))?;
+    let left = lease.saturating_sub(acquired.elapsed());
+    t.wait_for("B's broadcast rebinding", left, || {
+        Ok(provider_counter(&t, Node::IspB, "bc")? > bc_b)
+    })?;
+    t.wait_for("B's rebound lease", Duration::from_secs(5), || renewed(Uplink::B))?;
+    assert!(
+        provider_counter(&t, Node::IspB, "uni")? > 0,
+        "B tried a unicast renewal first"
+    );
+    for (u, a) in [Uplink::A, Uplink::B].into_iter().zip(&leased) {
+        assert_eq!(&address(&t, u)?, a, "{u} kept its lease");
+    }
+    assert_eq!(balancing_members(&t)?, ["ppp0", "wana", "wanb"]);
     Ok(())
 }
