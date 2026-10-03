@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+# Runners use a fixed image: the namespace suite depends on its kernel and
+# packages, and ubuntu-latest moves between releases over several weeks.
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -16,9 +19,9 @@ env:
 jobs:
   checks:
     name: fmt, clippy, unit tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,18 +33,18 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
 
   netns-current:
     name: namespace suite (runner kernel, current nftables)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -61,10 +64,10 @@ jobs:
           fi
       - name: Cache the upstream nftables build
         id: nft-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ftr-nftables
-          key: nftables-${{ runner.os }}-${{ hashFiles('tests/ci/build-nftables.sh') }}
+          key: nftables-ubuntu-26.04-${{ hashFiles('tests/ci/build-nftables.sh') }}
       - name: Build the newest upstream nftables
         # The runner's distribution ships an older nftables; §14.1 asks for a
         # current one. It is installed in /usr/local/sbin, which comes before
@@ -80,9 +83,9 @@ jobs:
 
   netns-minimum:
     name: namespace suite (Linux 6.1, nftables 1.0.6)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -112,7 +115,7 @@ jobs:
     # pure Rust; rust-lld links them against the self-contained musl objects
     # of each target, so no cross C toolchain is needed.
     name: release build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -121,7 +124,7 @@ jobs:
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-musleabihf
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -134,7 +137,7 @@ jobs:
             --config 'target.${{ matrix.target }}.linker="rust-lld"'
           file target/${{ matrix.target }}/release/fault-tolerant-router
           file target/${{ matrix.target }}/release/fault-tolerant-router | grep -Eq 'statically linked|static-pie linked'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fault-tolerant-router-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/fault-tolerant-router
