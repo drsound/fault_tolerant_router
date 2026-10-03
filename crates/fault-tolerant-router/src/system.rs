@@ -114,20 +114,19 @@ impl System {
             },
             RouteNetlinkMessage::NewRule(r) => match ObservedRule::parse(r) {
                 Some(r) => {
+                    // The same rule arrives from a dump, from FTR's own
+                    // mutation and from its notification, with slightly
+                    // different attributes: one entry per identity.
                     let family = r.family;
-                    if !self.rules.iter().any(|o| o.message == r.message) {
-                        self.rules.push(r);
-                    }
+                    self.rules.retain(|o| !same_rule(o, &r));
+                    self.rules.push(r);
                     Change::Rule { family, removed: false }
                 }
                 None => Change::None,
             },
             RouteNetlinkMessage::DelRule(r) => match ObservedRule::parse(r) {
                 Some(r) => {
-                    // Notifications of deletions carry the full rule.
-                    if let Some(pos) = self.rules.iter().position(|o| same_rule(o, &r)) {
-                        self.rules.remove(pos);
-                    }
+                    self.rules.retain(|o| !same_rule(o, &r));
                     Change::Rule {
                         family: r.family,
                         removed: true,
@@ -162,12 +161,51 @@ impl System {
     }
 }
 
+/// Rule identity: the fields FTR's rules use, plus the protocol; rules with
+/// other selectors are compared by their whole message.
 fn same_rule(a: &ObservedRule, b: &ObservedRule) -> bool {
+    if a.foreign_selectors || b.foreign_selectors {
+        return a.message == b.message;
+    }
     a.family == b.family
         && a.priority == b.priority
         && a.protocol == b.protocol
         && a.fwmark == b.fwmark
         && a.source == b.source
         && a.action == b.action
-        && a.foreign_selectors == b.foreign_selectors
+}
+
+#[cfg(test)]
+mod tests {
+    use netlink_packet_route::rule::RuleAttribute;
+
+    use super::*;
+    use crate::netlink::msg;
+    use crate::plan::{Action, Rule, RuleKind};
+
+    #[test]
+    fn a_rule_is_kept_once_whatever_its_source() {
+        let scope = Scope {
+            ftr_tables: 1000..=1191,
+            discovery_tables: vec![254],
+        };
+        let rule = Rule {
+            family: Family::V4,
+            priority: 1600,
+            fwmark: None,
+            source: None,
+            action: Action::Lookup(1000),
+            kind: RuleKind::Balance,
+        };
+        let ours = msg::rule_message(&rule, 249);
+        // The kernel's notification carries attributes FTR did not send.
+        let mut notified = ours.clone();
+        notified.attributes.push(RuleAttribute::SuppressPrefixLen(u32::MAX));
+        let mut s = System::default();
+        s.apply(&scope, &RouteNetlinkMessage::NewRule(ours.clone()));
+        s.apply(&scope, &RouteNetlinkMessage::NewRule(notified.clone()));
+        assert_eq!(s.rules.len(), 1);
+        s.apply(&scope, &RouteNetlinkMessage::DelRule(notified));
+        assert!(s.rules.is_empty(), "a third-party deletion removes it");
+    }
 }

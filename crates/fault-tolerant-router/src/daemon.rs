@@ -80,6 +80,13 @@ struct Daemon {
     retry: Option<Retry>,
     degraded: BTreeSet<&'static str>,
     ownership: BTreeMap<&'static str, Ownership>,
+    /// Artifacts removed by a third party while immediate repairs of their
+    /// kind are suspended (FR-COEX-4): re-created only by a full
+    /// reconciliation.
+    held_rules: Vec<crate::netlink::msg::ObservedRule>,
+    held_routes: BTreeSet<(Family, u32)>,
+    /// The next pass is part of a full reconciliation: no repair is held.
+    full_pass: bool,
     probe_tx: mpsc::Sender<probe::Report>,
     boot_id: String,
     dirty: bool,
@@ -188,6 +195,9 @@ pub async fn run(opts: Options) -> Result<()> {
         retry: None,
         degraded: BTreeSet::new(),
         ownership: BTreeMap::new(),
+        held_rules: Vec::new(),
+        held_routes: BTreeSet::new(),
+        full_pass: false,
         probe_tx,
         boot_id: state::boot_id().unwrap_or_default(),
         dirty: true,
@@ -469,24 +479,41 @@ impl Daemon {
 
     /// Notification handling (§12.2, FR-COEX-3).
     fn notification(&mut self, message: RouteNetlinkMessage, port: u32) {
-        let removed_ours = match &message {
+        let removed_rule = match &message {
             RouteNetlinkMessage::DelRule(r) => crate::netlink::msg::ObservedRule::parse(r)
-                .is_some_and(|o| o.protocol == self.protocol && self.layout.priorities().contains(&o.priority))
-                .then_some("rules"),
+                .filter(|o| o.protocol == self.protocol && self.layout.priorities().contains(&o.priority)),
+            _ => None,
+        };
+        let removed_route = match &message {
             RouteNetlinkMessage::DelRoute(r) => crate::netlink::msg::ObservedRoute::parse(r)
-                .is_some_and(|o| o.protocol == self.protocol && self.layout.tables().contains(&o.table))
-                .then_some("routes"),
+                .filter(|o| o.protocol == self.protocol && self.layout.tables().contains(&o.table))
+                .map(|o| (o.family, o.table)),
             _ => None,
         };
         let change = self.system.apply(&self.scope, &message);
-        if let Some(kind) = removed_ours
-            && port != 0
-            && port != self.client.port()
-        {
-            warn!(kind, port, "FTR artifact removed by a third party");
-            self.count_removal(kind);
-            if !self.immediate_repairs(kind) {
-                return;
+        let third_party = port != 0 && port != self.client.port();
+        if third_party && let Some(r) = removed_rule {
+            warn!(
+                kind = "rules",
+                port,
+                priority = r.priority,
+                "FTR artifact removed by a third party"
+            );
+            self.count_removal("rules");
+            if !self.immediate_repairs("rules") {
+                self.held_rules.push(r);
+            }
+        }
+        if third_party && let Some(key) = removed_route {
+            warn!(
+                kind = "routes",
+                port,
+                table = key.1,
+                "FTR artifact removed by a third party"
+            );
+            self.count_removal("routes");
+            if !self.immediate_repairs("routes") {
+                self.held_routes.insert(key);
             }
         }
         match change {
@@ -779,6 +806,28 @@ impl Daemon {
                 nft_pending,
             },
         );
+        // FR-COEX-4: while repairs of a kind are suspended, artifacts that a
+        // third party removed come back only with a full reconciliation.
+        let full = std::mem::take(&mut self.full_pass);
+        if full {
+            self.held_rules.clear();
+            self.held_routes.clear();
+        }
+        let held = ops.len();
+        let ops: Vec<Op> = ops
+            .into_iter()
+            .filter(|op| match op {
+                Op::AddRule(r) => !self.held_rules.iter().any(|h| h.is(r, self.protocol)),
+                Op::ReplaceRoute(r) => !self.held_routes.contains(&(r.family, r.table)),
+                _ => true,
+            })
+            .collect();
+        if ops.len() != held {
+            debug!(
+                held = held - ops.len(),
+                "repairs held until the next full reconciliation (FR-COEX-4)"
+            );
+        }
         if ops.is_empty() {
             // Routing and nftables no longer hold a departed family's
             // artifacts: its settings go back last (FR-REC-9 step 4).
@@ -904,6 +953,7 @@ impl Daemon {
             self.recover("ownership_conflict");
         }
         self.route_failed.clear();
+        self.full_pass = true;
         self.dirty = true;
     }
 

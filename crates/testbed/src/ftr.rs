@@ -104,6 +104,8 @@ pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, e
 /// The daemon under test and its files.
 pub struct Ftr {
     daemon: Option<Daemon>,
+    /// Length of the log when the daemon was last started.
+    log_start: usize,
     pub dir: PathBuf,
     pub config: PathBuf,
     pub lock: PathBuf,
@@ -134,6 +136,7 @@ impl Topology {
         }
         let f = Ftr {
             daemon: None,
+            log_start: 0,
             config: dir.join("config.toml"),
             lock: dir.join("lock"),
             log: self.dir().join("daemon.log"),
@@ -171,6 +174,7 @@ impl Ftr {
         let config = self.config.display().to_string();
         let args = self.args(&["run", "--config", &config]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.log_start = fs::metadata(&self.log).map(|m| m.len() as usize).unwrap_or(0);
         self.daemon = Some(t.start_daemon(&self.bin, &args)?);
         Ok(())
     }
@@ -185,9 +189,10 @@ impl Ftr {
             .output()?)
     }
 
-    /// The daemon's log so far.
+    /// The log of the daemon since its last start.
     pub fn log(&self) -> String {
-        fs::read_to_string(&self.log).unwrap_or_default()
+        let all = fs::read(&self.log).unwrap_or_default();
+        String::from_utf8_lossy(all.get(self.log_start..).unwrap_or_default()).into_owned()
     }
 
     /// Waits until the log contains `needle` `count` times or more.

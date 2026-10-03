@@ -38,7 +38,9 @@ fn abc() -> Vec<UplinkSpec> {
 
 /// The members of the IPv4 balancing route (table 1000), by interface name.
 fn balancing_members(t: &Topology) -> Result<Vec<String>> {
-    let text = t.router().run("ip", ["-4", "route", "show", "table", "1000"])?;
+    // A table without routes does not exist: an empty set.
+    let out = t.router().output("ip", ["-4", "route", "show", "table", "1000"])?;
+    let text = String::from_utf8_lossy(&out.stdout);
     let mut v: Vec<String> = text
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -548,5 +550,340 @@ fn as40_foreign_earlier_rule_and_missing_local_rule() -> Result<()> {
         f.log()
     );
     t.router().ip("rule add pref 0 lookup local")?;
+    Ok(())
+}
+
+/// Starts the test servers in another node (ports 7000/tcp and 7001/udp).
+fn serve_in(t: &Topology, node: Node) -> Result<std::process::Child> {
+    let log = t.dir().join(format!("server-{}.log", node.short()));
+    t.ns(node)
+        .spawn(&t.agent_bin().to_string_lossy(), ["agent", "serve"], &log)
+}
+
+/// Rules of FTR (protocol 249) in the router, as `ip rule` lines.
+fn ftr_rules(t: &Topology) -> Result<Vec<String>> {
+    Ok(t.router()
+        .run("ip", ["-4", "rule", "show"])?
+        .lines()
+        .filter(|l| l.contains("proto 249"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// AS-09: inbound connections through port forwarding on each uplink,
+/// including one outside the active set, are answered through the uplink
+/// they arrived on (INV-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as09_inbound_replies_leave_through_the_arrival_uplink() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2),
+        UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let _server = serve_in(&t, Node::Client)?;
+    t.router().nft(&format!(
+        "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname {{ \"wana\", \"wanb\", \"ppp0\" }} tcp dport 8007 dnat to {}:{}\n  }}\n}}\n",
+        testbed::plan::LAN_CLIENT_V4,
+        testbed::plan::TCP_PORT
+    ))?;
+    // Provider B (CGNAT) forwards its public port 8007 to the router.
+    let b = address(&t, Uplink::B)?;
+    t.ns(Node::IspB).nft(&format!(
+        "table ip tb_in {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"core\" tcp dport 8007 dnat to {b}\n  }}\n}}\n"
+    ))?;
+    for (u, iface) in [(Uplink::A, "wana"), (Uplink::B, "wanb"), (Uplink::C, "ppp0")] {
+        let public = if u == Uplink::B {
+            "198.18.0.6".to_owned()
+        } else {
+            address(&t, u)?
+        };
+        counter(
+            &t,
+            &format!("in{iface}"),
+            &format!("oifname \"{iface}\" tcp sport 8007"),
+        )?;
+        counter(
+            &t,
+            &format!("out{iface}"),
+            &format!("oifname != \"{iface}\" oifname != \"lan\" tcp sport 8007"),
+        )?;
+        let r = t.connect_to(
+            Node::Inet,
+            &[format!("{public}:8007")],
+            10,
+            false,
+            Duration::from_secs(2),
+        )?;
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok),
+            "{u}: {:?}",
+            r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+        );
+        assert!(
+            counter_value(&t, &format!("in{iface}"))? >= 20,
+            "{u}: replies leave through {iface}"
+        );
+        assert_eq!(
+            counter_value(&t, &format!("out{iface}"))?,
+            0,
+            "{u}: no reply through another uplink"
+        );
+    }
+    Ok(())
+}
+
+/// AS-17: rules and routes deleted by a third party come back within 1 s,
+/// the nftables table at the next full reconciliation; repeated deletions
+/// lead to `ownership_conflict` and later recovery (FR-COEX-3, FR-COEX-4).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as17_third_party_deletions_are_repaired() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(
+        &ab(),
+        &HealthSpec::fast(),
+        "reconcile_interval = \"10s\"",
+        "",
+    ))?;
+    f.wait_installed(&t)?;
+    let rules = ftr_rules(&t)?;
+    let r = t.router();
+    let start = Instant::now();
+    r.ip("rule del pref 1600")?;
+    t.wait_for("the balancing rule back", Duration::from_secs(2), || {
+        Ok(ftr_rules(&t)? == rules)
+    })?;
+    assert!(
+        start.elapsed() <= Duration::from_secs(1),
+        "rule repaired after {:?}",
+        start.elapsed()
+    );
+    let path = r.run("ip", ["route", "show", "table", "1001"])?;
+    let start = Instant::now();
+    r.ip("route del default table 1001")?;
+    t.wait_for("the path route back", Duration::from_secs(2), || {
+        Ok(r.run("ip", ["route", "show", "table", "1001"])? == path)
+    })?;
+    assert!(
+        start.elapsed() <= Duration::from_secs(1),
+        "route repaired after {:?}",
+        start.elapsed()
+    );
+    r.run("nft", ["delete", "table", "inet", "fault_tolerant_router"])?;
+    t.wait_for("the nftables table back", Duration::from_secs(13), || {
+        Ok(r.output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
+            .status
+            .success())
+    })?;
+    // Repeated deletions: after the fourth rule removal in five minutes (the
+    // balancing rule above counts) immediate repairs stop until a full
+    // reconciliation.
+    for n in 1..=3 {
+        r.ip("rule del pref 1699")?;
+        if n < 3 {
+            t.wait_for("the final guard back", Duration::from_secs(2), || {
+                Ok(ftr_rules(&t)? == rules)
+            })?;
+        }
+    }
+    f.wait_log(&t, "ownership_conflict", 1, Duration::from_secs(3))?;
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_ne!(ftr_rules(&t)?, rules, "no immediate repair during the conflict");
+    t.wait_for(
+        "the final guard back at a full reconciliation",
+        Duration::from_secs(12),
+        || Ok(ftr_rules(&t)? == rules),
+    )?;
+    f.wait_log(&t, "ownership conflict cleared", 1, Duration::from_secs(25))?;
+    f.wait_log(&t, "status_recovered", 1, Duration::from_secs(2))?;
+    Ok(())
+}
+
+/// AS-18: `kill -9` while a long-lived connection runs on healthy B and A
+/// is probe-unhealthy: the connection continues, A stays out of the active
+/// set after the restart, no duplicate artifacts.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as18_crash_and_restart_keep_state_and_connections() -> Result<()> {
+    let t = build();
+    let mut f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(10))?;
+    let flow = t.start_flow(
+        Node::Client,
+        testbed::plan::server(Family::V4, 9),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_millis(500));
+    let rules = ftr_rules(&t)?;
+    f.kill()?;
+    f.start(&t)?;
+    f.wait_log(&t, "warm=true", 2, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        assert_eq!(balancing_members(&t)?, ["wanb"], "A never re-enters the active set");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(ftr_rules(&t)?, rules, "no duplicate or missing rule");
+    let report = flow.stop()?;
+    assert_eq!(report.uplink(), Some(Uplink::B));
+    assert!(report.continuous(Duration::from_millis(1000)), "{report:?}");
+    t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+/// AS-19: a reload adding, removing and reordering uplinks leaves the
+/// connections of unchanged uplinks alone; reusing the id of a removed
+/// uplink is refused until `forget-uplink`.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as19_reload_adds_removes_reorders_and_protects_ids() -> Result<()> {
+    let t = build();
+    let mut f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let flows: Vec<_> = (20..26)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect::<Result<_>>()?;
+    std::thread::sleep(Duration::from_millis(500));
+    // C added first in the file, A removed, B unchanged.
+    f.write_config(&ftr::ipv4_config(
+        &[UplinkSpec::new(Uplink::C, 3), UplinkSpec::new(Uplink::B, 2)],
+        &HealthSpec::fast(),
+        "",
+        "",
+    ))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    wait_members(&t, &["ppp0", "wanb"], Duration::from_secs(10))?;
+    std::thread::sleep(Duration::from_secs(1));
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
+        assert!(
+            r.continuous(Duration::from_millis(1000)),
+            "flow on B interrupted: {r:?}"
+        );
+    }
+    // Id 1 belonged to A: reusing it for another name is refused.
+    let reuse = [UplinkSpec::new(Uplink::A, 1), UplinkSpec::new(Uplink::B, 2)];
+    let text = ftr::ipv4_config(&reuse, &HealthSpec::fast(), "", "").replace("name = \"a\"", "name = \"fiber\"");
+    f.write_config(&text)?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert!(f.log().contains("forget-uplink a"), "{}", f.log());
+    f.stop()?;
+    let out = f.cli(&["forget-uplink", "a", "--config", &f.config.display().to_string()])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    Ok(())
+}
+
+/// AS-32: a conntrack flush during a long-lived connection leaves the
+/// daemon unaffected (FR-CT-3).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as32_conntrack_flush() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let rules = ftr_rules(&t)?;
+    let flow = t.start_flow(
+        Node::Client,
+        testbed::plan::server(Family::V4, 30),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_millis(500));
+    t.router().run("conntrack", ["-F"])?;
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = flow.stop()?;
+    assert_eq!(ftr_rules(&t)?, rules);
+    assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
+    let r = t.connect_many(Node::Client, Family::V4, 10, 50, false)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    Ok(())
+}
+
+/// AS-41: a downlink prefix missing from main is warned about; a static
+/// off-subnet gateway makes the path ready only with `gateway_onlink`.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as41_downlink_prefix_and_off_subnet_gateway() -> Result<()> {
+    let t = build();
+    t.router().ip("route del 198.51.100.0/24 dev lan")?;
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert!(
+        f.log().contains("the prefix 198.51.100.0/24 is not in the main table"),
+        "{}",
+        f.log()
+    );
+    drop(f);
+    t.router()
+        .ip("route add 198.51.100.0/24 dev lan proto kernel scope link src 198.51.100.1")?;
+    // Provider A answers on an address outside the customer subnet.
+    t.ns(Node::IspA).ip("addr add 10.99.0.1/32 dev wan")?;
+    let off = |onlink: bool| {
+        let extra = if onlink { "gateway_onlink = true\n" } else { "" };
+        ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", "").replacen(
+            "[uplink.ipv4]\n",
+            &format!("[uplink.ipv4]\ngateway = \"10.99.0.1\"\n{extra}"),
+            1,
+        )
+    };
+    let f = t.start_ftr(&off(false))?;
+    f.wait_installed(&t)?;
+    assert_eq!(balancing_members(&t)?, ["wanb"], "A not ready without gateway_onlink");
+    drop(f);
+    let f = t.start_ftr(&off(true))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(5))?;
+    let route = t.router().run("ip", ["route", "show", "table", "1001"])?;
+    assert!(route.contains("via 10.99.0.1") && route.contains("onlink"), "{route}");
+    Ok(())
+}
+
+/// AS-42: a router service answers from a secondary address of A through A
+/// while the active set is empty (INV-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as42_router_reply_from_a_secondary_address() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1).priority(None),
+        UplinkSpec::new(Uplink::B, 2).priority(None),
+    ];
+    t.router().ip("addr add 192.0.2.250/24 dev wana")?;
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert!(balancing_members(&t)?.is_empty(), "empty active set");
+    let _server = serve_in(&t, Node::Router)?;
+    counter(&t, "a", "oifname \"wana\" ip saddr 192.0.2.250 tcp sport 7000")?;
+    counter(&t, "other", "oifname != \"wana\" ip saddr 192.0.2.250")?;
+    let r = t.connect_to(
+        Node::Inet,
+        &["192.0.2.250:7000".to_owned()],
+        10,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        r.iter().all(|c| c.outcome == Outcome::Ok),
+        "{:?}",
+        r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+    );
+    assert!(counter_value(&t, "a")? >= 20);
+    assert_eq!(counter_value(&t, "other")?, 0);
     Ok(())
 }
