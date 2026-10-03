@@ -5,17 +5,29 @@ S2TOOL="python3 $S2_DIR/s2tool.py"
 # Refined §4.7 ruleset. Differences from ftr_nft_text in ../lib/netns.sh:
 # untracked and non-unicast packets are skipped (§4.7 last paragraph, §4.8);
 # policies (S2_POLICIES, one rule per line, already encoded) end with return;
-# S2_NO_OUTPUT=1 omits the output chain (control experiments only).
+# the postrouting assignment applies only in the original direction (§4.7 3.2).
+# Control experiments only: S2_NO_OUTPUT=1 omits the output chain;
+# S2_NO_DIRECTION=1 omits "ct direction original" from postrouting;
+# S2_NO_NONUNICAST=1 omits the non-unicast skips of both chains.
+# S2_NONUNICAST_ADDR=1 adds the address-based skips proposed by t9: in
+# prerouting multicast, limited and subnet-directed broadcast destinations
+# (tunnels deliver them as pkttype host), in postrouting subnet-directed
+# broadcast destinations of the egress interface.
 s2_nft_text() {
   local id
   echo "table inet fault_tolerant_router {"
   echo "  chain prerouting {"
   echo "    type filter hook prerouting priority -150; policy accept;"
   echo "    ct state untracked return"
-  echo "    meta pkttype != host return"
+  [ "${S2_NO_NONUNICAST:-0}" = 1 ] || echo "    meta pkttype != host return"
   for id in $(seq 1 63); do
     echo "    ct mark & $MASK == $(enc "$id") meta mark set meta mark & $NOTMASK | $(enc "$id") return"
   done
+  if [ "${S2_NONUNICAST_ADDR:-0}" = 1 ]; then
+    echo "    ip daddr { 224.0.0.0/4, 255.255.255.255 } return"
+    echo "    ip6 daddr ff00::/8 return"
+    echo "    meta nfproto ipv4 fib daddr type broadcast return"
+  fi
   for id in "$@"; do
     echo "    iifname \"${IFACE[$id]}\" ct direction original ct mark set ct mark & $NOTMASK | $(enc "$id") meta mark set meta mark & $NOTMASK | $(enc "$id") return"
   done
@@ -35,11 +47,16 @@ s2_nft_text() {
   echo "    type filter hook postrouting priority -150; policy accept;"
   echo "    meta mark & $CLASS == $(enc 0x40) return"
   echo "    ct state untracked return"
-  echo "    ip daddr { 224.0.0.0/4, 255.255.255.255 } return"
-  echo "    ip6 daddr ff00::/8 return"
+  if [ "${S2_NO_NONUNICAST:-0}" != 1 ]; then
+    echo "    ip daddr { 224.0.0.0/4, 255.255.255.255 } return"
+    echo "    ip6 daddr ff00::/8 return"
+  fi
   echo "    ct mark & $MASK != 0 return"
+  [ "${S2_NONUNICAST_ADDR:-0}" != 1 ] || echo "    meta nfproto ipv4 fib daddr . oif type broadcast return"
+  local dir="ct direction original "
+  [ "${S2_NO_DIRECTION:-0}" != 1 ] || dir=
   for id in "$@"; do
-    echo "    oifname \"${IFACE[$id]}\" ct mark set ct mark & $NOTMASK | $(enc "$id") meta mark set meta mark & $NOTMASK | $(enc "$id") return"
+    echo "    oifname \"${IFACE[$id]}\" ${dir}ct mark set ct mark & $NOTMASK | $(enc "$id") meta mark set meta mark & $NOTMASK | $(enc "$id") return"
   done
   echo "  }"
   echo "  chain nat {"

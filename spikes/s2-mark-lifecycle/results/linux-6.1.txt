@@ -8,8 +8,8 @@ PASS no bitwise operation combines two registers
 PASS no accept, drop or reject verdict in any rule (FR-FW-4)
      rules in the table: 151
 == traffic over every uplink (including the point-to-point one) with the refined ruleset
-PASS v4 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 9, "B": 11, "C": 10}})
-PASS v6 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 11, "B": 9, "C": 10}})
+PASS v4 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 6, "B": 13, "C": 11}})
+PASS v6 forwarded connections balanced over A, B, C ({"errors": {}, "peers": {"A": 9, "B": 12, "C": 9}})
 == JSON listing stability for FR-REC-6
 PASS raw listings differ after re-applying identical text
      keys that differ: ['table.handle'] objects 152 152
@@ -25,7 +25,7 @@ t1-ruleset.sh: 13 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lest
 ######## t2-lifecycle.sh
 == IPv4 outbound forwarded connection, active set {B}
 PASS v4 connection works via B ({"errors": {}, "peers": {"B": 1}})
-     o_fin_all=5 o_fin_c2=5 o_fin_if_wanb=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_wanb=5 o_post_m2=5 o_pre_all=5 o_pre_c0=1 o_pre_c2=4 o_pre_m0=1 o_pre_m2=4 r_fin_all=3 r_fin_c2=3 r_fin_if_lan=3 r_fin_m2=3 r_post_all=3 r_post_c2=3 r_post_if_lan=3 r_post_m2=3 r_pre_all=3 r_pre_c2=3 r_pre_m2=3
+     o_fin_all=5 o_fin_c2=5 o_fin_if_wanb=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_wanb=5 o_post_m2=5 o_pre_all=5 o_pre_c0=1 o_pre_c2=4 o_pre_m0=1 o_pre_m2=4 r_fin_all=4 r_fin_c2=4 r_fin_if_lan=4 r_fin_m2=4 r_post_all=4 r_post_c2=4 r_post_if_lan=4 r_post_m2=4 r_pre_all=4 r_pre_c2=4 r_pre_m2=4
 PASS v4 first packet unmarked in prerouting (no assignment before routing)
 PASS v4 every later original packet restored in prerouting
 PASS v4 every reply packet restored in prerouting
@@ -42,7 +42,7 @@ PASS v4 policy table of A empty: connection balanced via B ({"errors": {}, "peer
 PASS v4 ... and its conntrack mark is path 2, the actual egress (FR-POL-2)
 == IPv4 inbound connection through B, active set {A}
 PASS v4 inbound connection answered
-     o_fin_all=5 o_fin_c2=5 o_fin_if_lan=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_lan=5 o_post_m2=5 o_pre_all=5 o_pre_c2=5 o_pre_m2=5 r_fin_all=4 r_fin_c2=4 r_fin_if_wanb=4 r_fin_m2=4 r_post_all=4 r_post_c2=4 r_post_if_wanb=4 r_post_m2=4 r_pre_all=4 r_pre_c2=4 r_pre_m2=4
+     o_fin_all=5 o_fin_c2=5 o_fin_if_lan=5 o_fin_m2=5 o_post_all=5 o_post_c2=5 o_post_if_lan=5 o_post_m2=5 o_pre_all=5 o_pre_c2=5 o_pre_m2=5 r_fin_all=3 r_fin_c2=3 r_fin_if_wanb=3 r_fin_m2=3 r_post_all=3 r_post_c2=3 r_post_if_wanb=3 r_post_m2=3 r_pre_all=3 r_pre_c2=3 r_pre_m2=3
 PASS v4 every original packet carries path 2 after prerouting, the first included
 PASS v4 every reply packet restored on the downlink
 PASS v4 every reply leaves through B
@@ -153,7 +153,7 @@ PASS v6 probe conntrack mark has only the foreign conntrack bits
 t3-foreign.sh: 18 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
 ######## t4-flows.sh
 == AS-22: unanswered SYNs and one-way UDP while the active set changes
-     flows {('IP', 'tcp'): 10, ('IP', 'udp'): 10, ('IP6', 'tcp'): 10, ('IP6', 'udp'): 10} split 0 min_packets 4; syn sockets: {"pending": 10} {"pending": 10}; udp: {"errors": {}, "sent": 400} {"errors": {}, "sent": 400}
+     flows {('IP', 'tcp'): 10, ('IP', 'udp'): 10, ('IP6', 'udp'): 10, ('IP6', 'tcp'): 10} split 0 min_packets 4; syn sockets: {"pending": 10} {"pending": 10}; udp: {"errors": {}, "sent": 400} {"errors": {}, "sent": 400}
 PASS 40 flows observed (10 per family and protocol)
 PASS every packet of every flow left through a single uplink
 PASS every SYN flow was retransmitted at least 3 times (4 SYNs)
@@ -176,7 +176,7 @@ t4-flows.sh: 11 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester
 ######## t5-output.sh
      v4 with-output-chain: {"errors": {}, "peers": {"198.18.1.1": 5}}; replies via a=15 b=0; conntrack path 0x1 0x1 0x1 0x1 0x1 
 PASS v4 replies of the router leave through the arrival uplink A
-     v6 with-output-chain: {"errors": {}, "peers": {"2001:db8:ff01::1": 5}}; replies via a=16 b=0; conntrack path 0x1 0x1 0x1 0x1 0x1 
+     v6 with-output-chain: {"errors": {}, "peers": {"2001:db8:ff01::1": 5}}; replies via a=15 b=0; conntrack path 0x1 0x1 0x1 0x1 0x1 
 PASS v6 replies of the router leave through the arrival uplink A
      v4 without-output-chain: {"errors": {}, "peers": {"198.18.1.1": 5}}; replies via a=0 b=15; conntrack path 0x1 0x1 0x1 0x1 0x1 
 PASS v4 control without the output chain: replies follow balancing through B
@@ -192,8 +192,8 @@ PASS v4 flows opened before stay alive on A
 PASS v4 balance policy, A's table empty: new connections balanced over B, C ({"errors": {}, "peers": {"B": 5, "C": 3}})
 PASS v4 block policy, A's table empty: new connections fail ({"errors": {"ENETUNREACH": 2, "timeout": 2}, "peers": {}})
 PASS v4 ... and none of their packets leaves through any uplink
-     flow opened during the fallback pinned to path 0x2
-PASS v4 after A's tables return, the fallback flow is still on path 0x2
+     flow opened during the fallback pinned to path 0x3
+PASS v4 after A's tables return, the fallback flow is still on path 0x3
 PASS v4 new balance-policy connections via A again
 PASS v4 balance-policy flow on A: no error
 PASS v4 block-policy flow on A: no error
@@ -202,7 +202,7 @@ PASS v4 fallback flow: no error, not on A
 PASS v6 balance policy: new connections via A although A is not in the active set ({"errors": {}, "peers": {"A": 8}})
 PASS v6 block policy: new connections via A ({"errors": {}, "peers": {"A": 8}})
 PASS v6 flows opened before stay alive on A
-PASS v6 balance policy, A's table empty: new connections balanced over B, C ({"errors": {}, "peers": {"B": 7, "C": 1}})
+PASS v6 balance policy, A's table empty: new connections balanced over B, C ({"errors": {}, "peers": {"B": 6, "C": 2}})
 PASS v6 block policy, A's table empty: new connections fail ({"errors": {"ENETUNREACH": 4}, "peers": {}})
 PASS v6 ... and none of their packets leaves through any uplink
      flow opened during the fallback pinned to path 0x2
@@ -238,6 +238,370 @@ PASS v6 src_valid_mark=0: inbound DNAT through A -> ok
 PASS v6 src_valid_mark=0: connection to a router listener through A -> ok
 PASS v6 src_valid_mark=0: ICMP probe of A answered -> ok
 PASS v6 src_valid_mark=0: TCP probe of A answered -> ok
-     v4 reverse-path drops with src_valid_mark=0: 10
+     v4 reverse-path drops with src_valid_mark=0: 11
 
 t7-as30.sh: 21 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t8-original-direction.sh
+######## amended generator (ct direction original in postrouting)
+PASS postrouting assignment rules carry the direction condition
+== IPv4 connection from an unmanaged interface to the router, replies through A
+PASS v4 router: connections from R through wanx answered
+     o_pre_all=15 o_pre_c0=15 o_pre_m0=15 r_fin_all=9 r_fin_c0=9 r_fin_if_wana=9 r_fin_m0=9 r_out_all=9 r_out_c0=9 r_out_if_wana=9 r_out_m0=9 r_post_all=9 r_post_c0=9 r_post_if_wana=9 r_post_m0=9
+PASS v4 router: replies leave through uplink A
+PASS v4 router: replies carry no path value after postrouting (packet and conntrack mark)
+PASS v4 router: conntrack entries carry no path value
+== IPv4 connection from an unmanaged interface to a LAN host, replies forwarded through A
+PASS v4 forwarded: connections from R through wanx answered
+     o_fin_all=15 o_fin_c0=15 o_fin_if_lan=15 o_fin_m0=15 o_post_all=15 o_post_c0=15 o_post_if_lan=15 o_post_m0=15 o_pre_all=15 o_pre_c0=15 o_pre_m0=15 r_fin_all=9 r_fin_c0=9 r_fin_if_wana=9 r_fin_m0=9 r_post_all=9 r_post_c0=9 r_post_if_wana=9 r_post_m0=9 r_pre_all=9 r_pre_c0=9 r_pre_m0=9
+PASS v4 forwarded: replies leave through uplink A
+PASS v4 forwarded: original packets never marked
+PASS v4 forwarded: replies carry no path value after postrouting (packet and conntrack mark)
+PASS v4 forwarded: conntrack entries carry no path value
+== IPv4 long flow from R to the LAN host while A leaves the active set and becomes not ready
+     {"error": null, "max_gap": 0.1, "peer": "198.18.150.5", "received": 37, "sent": 37} replies-after-change a=0 b=31
+PASS v4 unassigned flow survives: its replies follow the balancing route to B
+== IPv4 controls
+PASS v4 outbound from the LAN via A ({"errors": {}, "peers": {"A": 2}})
+PASS v4 outbound: path 1 assigned in postrouting (first packet unmarked in prerouting)
+PASS v4 outbound: conntrack entries carry path 1
+PASS v4 inbound through B answered
+PASS v4 inbound: every original packet carries path 2 after prerouting, replies leave through B
+PASS v4 ICMP and TCP probes answered
+PASS v4 probes keep the probe value after postrouting; replies unmarked
+PASS v4 probes: conntrack entries carry no path value
+== IPv6 connection from an unmanaged interface to the router, replies through A
+PASS v6 router: connections from R through wanx answered
+     o_pre_all=15 o_pre_c0=15 o_pre_m0=15 r_fin_all=9 r_fin_c0=9 r_fin_if_wana=9 r_fin_m0=9 r_out_all=9 r_out_c0=9 r_out_if_wana=9 r_out_m0=9 r_post_all=9 r_post_c0=9 r_post_if_wana=9 r_post_m0=9
+PASS v6 router: replies leave through uplink A
+PASS v6 router: replies carry no path value after postrouting (packet and conntrack mark)
+PASS v6 router: conntrack entries carry no path value
+== IPv6 connection from an unmanaged interface to a LAN host, replies forwarded through A
+PASS v6 forwarded: connections from R through wanx answered
+     o_fin_all=15 o_fin_c0=15 o_fin_if_lan=15 o_fin_m0=15 o_post_all=15 o_post_c0=15 o_post_if_lan=15 o_post_m0=15 o_pre_all=15 o_pre_c0=15 o_pre_m0=15 r_fin_all=9 r_fin_c0=9 r_fin_if_wana=9 r_fin_m0=9 r_post_all=9 r_post_c0=9 r_post_if_wana=9 r_post_m0=9 r_pre_all=9 r_pre_c0=9 r_pre_m0=9
+PASS v6 forwarded: replies leave through uplink A
+PASS v6 forwarded: original packets never marked
+PASS v6 forwarded: replies carry no path value after postrouting (packet and conntrack mark)
+PASS v6 forwarded: conntrack entries carry no path value
+== IPv6 long flow from R to the LAN host while A leaves the active set and becomes not ready
+     {"error": null, "max_gap": 0.108, "peer": "2001:db8:150::5", "received": 37, "sent": 37} replies-after-change a=0 b=31
+PASS v6 unassigned flow survives: its replies follow the balancing route to B
+== IPv6 controls
+PASS v6 outbound from the LAN via A ({"errors": {}, "peers": {"A": 2}})
+PASS v6 outbound: path 1 assigned in postrouting (first packet unmarked in prerouting)
+PASS v6 outbound: conntrack entries carry path 1
+PASS v6 inbound through B answered
+PASS v6 inbound: every original packet carries path 2 after prerouting, replies leave through B
+PASS v6 ICMP and TCP probes answered
+PASS v6 probes keep the probe value after postrouting; replies unmarked
+PASS v6 probes: conntrack entries carry no path value
+######## negative control: postrouting assignment without the direction condition
+== IPv4 (control) connection from an unmanaged interface to the router
+PASS v4 router: connections from R through wanx answered
+     o_pre_all=15 o_pre_c0=3 o_pre_c1=12 o_pre_m0=3 o_pre_m1=12 r_fin_all=9 r_fin_c1=9 r_fin_if_wana=9 r_fin_m1=9 r_out_all=9 r_out_c0=3 r_out_c1=6 r_out_if_wana=9 r_out_m0=3 r_out_m1=6 r_post_all=9 r_post_c1=9 r_post_if_wana=9 r_post_m1=9
+PASS v4 router: replies leave through uplink A
+PASS v4 router (control): replies are assigned path 1 in postrouting
+PASS v4 router (control): conntrack entries carry path 1
+== IPv4 (control) connection from an unmanaged interface to a LAN host
+PASS v4 forwarded: connections from R through wanx answered
+     o_fin_all=15 o_fin_c0=3 o_fin_c1=12 o_fin_if_lan=15 o_fin_m0=3 o_fin_m1=12 o_post_all=15 o_post_c0=3 o_post_c1=12 o_post_if_lan=15 o_post_m0=3 o_post_m1=12 o_pre_all=15 o_pre_c0=3 o_pre_c1=12 o_pre_m0=3 o_pre_m1=12 r_fin_all=9 r_fin_c1=9 r_fin_if_wana=9 r_fin_m1=9 r_post_all=9 r_post_c1=9 r_post_if_wana=9 r_post_m1=9 r_pre_all=9 r_pre_c0=3 r_pre_c1=6 r_pre_m0=3 r_pre_m1=6
+PASS v4 forwarded: replies leave through uplink A
+PASS v4 forwarded (control): the first reply is assigned path 1, later packets restored
+PASS v4 forwarded (control): conntrack entries carry path 1
+== IPv4 (control) long flow while A leaves the active set and becomes not ready
+     {"error": "timeout", "max_gap": 0.101, "peer": "198.18.150.5", "received": 7, "sent": 26} replies-after-change a=0 b=0
+PASS v4 control: the flow is pinned to A and fails at the path guard
+== IPv6 (control) connection from an unmanaged interface to the router
+PASS v6 router: connections from R through wanx answered
+     o_pre_all=15 o_pre_c0=3 o_pre_c1=12 o_pre_m0=3 o_pre_m1=12 r_fin_all=10 r_fin_c1=10 r_fin_if_wana=10 r_fin_m1=10 r_out_all=10 r_out_c0=3 r_out_c1=7 r_out_if_wana=10 r_out_m0=3 r_out_m1=7 r_post_all=10 r_post_c1=10 r_post_if_wana=10 r_post_m1=10
+PASS v6 router: replies leave through uplink A
+PASS v6 router (control): replies are assigned path 1 in postrouting
+PASS v6 router (control): conntrack entries carry path 1
+== IPv6 (control) connection from an unmanaged interface to a LAN host
+PASS v6 forwarded: connections from R through wanx answered
+     o_fin_all=15 o_fin_c0=3 o_fin_c1=12 o_fin_if_lan=15 o_fin_m0=3 o_fin_m1=12 o_post_all=15 o_post_c0=3 o_post_c1=12 o_post_if_lan=15 o_post_m0=3 o_post_m1=12 o_pre_all=15 o_pre_c0=3 o_pre_c1=12 o_pre_m0=3 o_pre_m1=12 r_fin_all=9 r_fin_c1=9 r_fin_if_wana=9 r_fin_m1=9 r_post_all=9 r_post_c1=9 r_post_if_wana=9 r_post_m1=9 r_pre_all=9 r_pre_c0=3 r_pre_c1=6 r_pre_m0=3 r_pre_m1=6
+PASS v6 forwarded: replies leave through uplink A
+PASS v6 forwarded (control): the first reply is assigned path 1, later packets restored
+PASS v6 forwarded (control): conntrack entries carry path 1
+== IPv6 (control) long flow while A leaves the active set and becomes not ready
+     {"error": "timeout", "max_gap": 0.1, "peer": "2001:db8:150::5", "received": 7, "sent": 26} replies-after-change a=0 b=0
+PASS v6 control: the flow is pinned to A and fails at the path guard
+
+t8-original-direction.sh: 55 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t9-nonunicast.sh
+     multicast routing: (10.1.0.2,239.1.2.3) Iif: lan Oifs: wana State: resolved  | (fd00:1::2,ff0e::db8:1) Iif: lan Oifs: wana State: resolved 
+######## generator: current
+     v4 5001 pkttype: pre_broadcast=1; egress: 
+PASS current v4 5001 LAN host -> 255.255.255.255: FTR values {-}
+     v4 5002 pkttype: pre_broadcast=1; egress: 
+PASS current v4 5002 LAN host -> 10.1.0.255 (LAN subnet broadcast): FTR values {-}
+     v4 5003 pkttype: pre_multicast=1; egress: 
+PASS current v4 5003 LAN host -> 224.0.0.251: FTR values {-}
+     v4 5004 pkttype: pre_broadcast=1; egress: 
+PASS current v4 5004 provider A -> 255.255.255.255 on wana: FTR values {-}
+     v4 5005 pkttype: pre_broadcast=1; egress: 
+PASS current v4 5005 provider A -> 192.0.2.255 (subnet broadcast of wana): FTR values {-}
+     v4 5006 pkttype: pre_multicast=1; egress: 
+PASS current v4 5006 provider A -> 224.0.0.251 on wana: FTR values {-}
+     v4 5007 pkttype: pre_host=1; egress: 
+PASS current v4 5007 provider C -> 224.0.0.251 through GRE (wanc): FTR values {3}
+     v4 5008 pkttype: pre_host=1; egress: 
+PASS current v4 5008 provider C -> 255.255.255.255 through GRE (wanc): FTR values {3}
+     v4 5009 pkttype: post_host=2 pre_broadcast=1; egress: o_fin_if_wana=2
+PASS current v4 5009 router -> 255.255.255.255 out of wana: FTR values {-}
+     v4 5010 pkttype: post_host=2 pre_broadcast=1; egress: o_fin_if_wana=2
+PASS current v4 5010 router -> 192.0.2.255 (subnet broadcast) out of wana: FTR values {1}
+     v4 5011 pkttype: post_host=1; egress: o_fin_if_wana=1
+PASS current v4 5011 router -> 224.0.0.251 out of wana: FTR values {-}
+     v4 5012 pkttype: post_host=1; egress: o_fin_if_wanc=1
+PASS current v4 5012 router -> 224.0.0.251 out of wanc (GRE): FTR values {-}
+     v4 5013 pkttype: post_host=3 pre_broadcast=1; egress: o_fin_if_lan=3
+PASS current v4 5013 router -> 255.255.255.255 and 224.0.0.251 out of the LAN: FTR values {-}
+     v4 5014 pkttype: post_multicast=1 pre_multicast=1; egress: o_fin_if_wana=1
+PASS current v4 5014 routed multicast LAN host -> 239.1.2.3 forwarded out of wana: FTR values {-}
+     v4 5015 pkttype: pre_host=1; egress: 
+PASS current v4 5015 LAN host -> 192.0.2.255 (wana's subnet broadcast), delivered locally: FTR values {129}
+     v4 5016 pkttype: post_host=1 pre_host=1; egress: o_fin_if_wana=1
+PASS current v4 5016 same with bc_forwarding: forwarded out of wana: FTR values {1,129}
+     v4 5017 pkttype: pre_broadcast=1; egress: 
+PASS current v4 5017 provider A -> 192.0.2.2 (unicast) on the L2 broadcast address: FTR values {-}
+     v4 5018 pkttype: pre_host=1; egress: 
+PASS current v4 5018 control: provider A -> 192.0.2.2 unicast: FTR values {1}
+     v4 5019 pkttype: pre_host=1; egress: 
+PASS current v4 5019 control: provider C -> 203.0.113.2 unicast through GRE: FTR values {3}
+     v4 5020 pkttype: post_host=1 pre_host=1; egress: o_fin_if_wana=1
+PASS current v4 5020 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+     v6 6001 pkttype: pre_multicast=1; egress: 
+PASS current v6 6001 LAN host -> ff02::fb: FTR values {-}
+     v6 6002 pkttype: pre_multicast=1; egress: 
+PASS current v6 6002 LAN host -> ff02::1: FTR values {-}
+     v6 6003 pkttype: pre_multicast=1; egress: 
+PASS current v6 6003 provider A -> ff02::fb on wana: FTR values {-}
+     v6 6004 pkttype: pre_host=1; egress: 
+PASS current v6 6004 provider C -> ff02::fb through GRE (wanc): FTR values {3}
+     v6 6005 pkttype: post_host=2 pre_multicast=1; egress: o_fin_if_wana=2
+PASS current v6 6005 router -> ff02::fb out of wana: FTR values {-}
+     v6 6006 pkttype: post_host=2 pre_multicast=1; egress: o_fin_if_wanc=2
+PASS current v6 6006 router -> ff02::fb out of wanc (GRE): FTR values {-}
+     v6 6007 pkttype: post_host=2 pre_multicast=1; egress: o_fin_if_lan=2
+PASS current v6 6007 router -> ff02::fb out of the LAN: FTR values {-}
+     v6 6008 pkttype: post_multicast=1 pre_multicast=1; egress: o_fin_if_wana=1
+PASS current v6 6008 routed multicast LAN host -> ff0e::db8:1 forwarded out of wana: FTR values {-}
+     v6 6009 pkttype: pre_multicast=1; egress: 
+PASS current v6 6009 provider A -> 2001:db8:a::2 (unicast) on an L2 multicast address: FTR values {-}
+     v6 6010 pkttype: pre_host=1; egress: 
+PASS current v6 6010 control: provider A -> 2001:db8:a::2 unicast: FTR values {1}
+     v6 6011 pkttype: pre_host=1; egress: 
+PASS current v6 6011 control: provider C -> 2001:db8:c::2 unicast through GRE: FTR values {3}
+     v6 6012 pkttype: post_host=1 pre_host=1; egress: o_fin_if_wana=1
+PASS current v6 6012 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+######## generator: none
+PASS none v4 5001 LAN host -> 255.255.255.255: FTR values {129}
+PASS none v4 5002 LAN host -> 10.1.0.255 (LAN subnet broadcast): FTR values {129}
+PASS none v4 5003 LAN host -> 224.0.0.251: FTR values {129}
+PASS none v4 5004 provider A -> 255.255.255.255 on wana: FTR values {1}
+PASS none v4 5005 provider A -> 192.0.2.255 (subnet broadcast of wana): FTR values {1}
+PASS none v4 5006 provider A -> 224.0.0.251 on wana: FTR values {1}
+PASS none v4 5007 provider C -> 224.0.0.251 through GRE (wanc): FTR values {3}
+PASS none v4 5008 provider C -> 255.255.255.255 through GRE (wanc): FTR values {3}
+PASS none v4 5009 router -> 255.255.255.255 out of wana: FTR values {1}
+PASS none v4 5010 router -> 192.0.2.255 (subnet broadcast) out of wana: FTR values {1}
+PASS none v4 5011 router -> 224.0.0.251 out of wana: FTR values {1}
+PASS none v4 5012 router -> 224.0.0.251 out of wanc (GRE): FTR values {3}
+PASS none v4 5013 router -> 255.255.255.255 and 224.0.0.251 out of the LAN: FTR values {129}
+PASS none v4 5014 routed multicast LAN host -> 239.1.2.3 forwarded out of wana: FTR values {1,129}
+PASS none v4 5015 LAN host -> 192.0.2.255 (wana's subnet broadcast), delivered locally: FTR values {129}
+PASS none v4 5016 same with bc_forwarding: forwarded out of wana: FTR values {1,129}
+PASS none v4 5017 provider A -> 192.0.2.2 (unicast) on the L2 broadcast address: FTR values {1}
+PASS none v4 5018 control: provider A -> 192.0.2.2 unicast: FTR values {1}
+PASS none v4 5019 control: provider C -> 203.0.113.2 unicast through GRE: FTR values {3}
+PASS none v4 5020 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+PASS none v6 6001 LAN host -> ff02::fb: FTR values {129}
+PASS none v6 6002 LAN host -> ff02::1: FTR values {129}
+PASS none v6 6003 provider A -> ff02::fb on wana: FTR values {1}
+PASS none v6 6004 provider C -> ff02::fb through GRE (wanc): FTR values {3}
+PASS none v6 6005 router -> ff02::fb out of wana: FTR values {1}
+PASS none v6 6006 router -> ff02::fb out of wanc (GRE): FTR values {3}
+PASS none v6 6007 router -> ff02::fb out of the LAN: FTR values {129}
+PASS none v6 6008 routed multicast LAN host -> ff0e::db8:1 forwarded out of wana: FTR values {1,129}
+PASS none v6 6009 provider A -> 2001:db8:a::2 (unicast) on an L2 multicast address: FTR values {1}
+PASS none v6 6010 control: provider A -> 2001:db8:a::2 unicast: FTR values {1}
+PASS none v6 6011 control: provider C -> 2001:db8:c::2 unicast through GRE: FTR values {3}
+PASS none v6 6012 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+######## generator: proposed
+PASS proposed v4 5001 LAN host -> 255.255.255.255: FTR values {-}
+PASS proposed v4 5002 LAN host -> 10.1.0.255 (LAN subnet broadcast): FTR values {-}
+PASS proposed v4 5003 LAN host -> 224.0.0.251: FTR values {-}
+PASS proposed v4 5004 provider A -> 255.255.255.255 on wana: FTR values {-}
+PASS proposed v4 5005 provider A -> 192.0.2.255 (subnet broadcast of wana): FTR values {-}
+PASS proposed v4 5006 provider A -> 224.0.0.251 on wana: FTR values {-}
+PASS proposed v4 5007 provider C -> 224.0.0.251 through GRE (wanc): FTR values {-}
+PASS proposed v4 5008 provider C -> 255.255.255.255 through GRE (wanc): FTR values {-}
+PASS proposed v4 5009 router -> 255.255.255.255 out of wana: FTR values {-}
+PASS proposed v4 5010 router -> 192.0.2.255 (subnet broadcast) out of wana: FTR values {-}
+PASS proposed v4 5011 router -> 224.0.0.251 out of wana: FTR values {-}
+PASS proposed v4 5012 router -> 224.0.0.251 out of wanc (GRE): FTR values {-}
+PASS proposed v4 5013 router -> 255.255.255.255 and 224.0.0.251 out of the LAN: FTR values {-}
+PASS proposed v4 5014 routed multicast LAN host -> 239.1.2.3 forwarded out of wana: FTR values {-}
+PASS proposed v4 5015 LAN host -> 192.0.2.255 (wana's subnet broadcast), delivered locally: FTR values {-}
+PASS proposed v4 5016 same with bc_forwarding: forwarded out of wana: FTR values {-}
+PASS proposed v4 5017 provider A -> 192.0.2.2 (unicast) on the L2 broadcast address: FTR values {-}
+PASS proposed v4 5018 control: provider A -> 192.0.2.2 unicast: FTR values {1}
+PASS proposed v4 5019 control: provider C -> 203.0.113.2 unicast through GRE: FTR values {3}
+PASS proposed v4 5020 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+PASS proposed v6 6001 LAN host -> ff02::fb: FTR values {-}
+PASS proposed v6 6002 LAN host -> ff02::1: FTR values {-}
+PASS proposed v6 6003 provider A -> ff02::fb on wana: FTR values {-}
+PASS proposed v6 6004 provider C -> ff02::fb through GRE (wanc): FTR values {-}
+PASS proposed v6 6005 router -> ff02::fb out of wana: FTR values {-}
+PASS proposed v6 6006 router -> ff02::fb out of wanc (GRE): FTR values {-}
+PASS proposed v6 6007 router -> ff02::fb out of the LAN: FTR values {-}
+PASS proposed v6 6008 routed multicast LAN host -> ff0e::db8:1 forwarded out of wana: FTR values {-}
+PASS proposed v6 6009 provider A -> 2001:db8:a::2 (unicast) on an L2 multicast address: FTR values {-}
+PASS proposed v6 6010 control: provider A -> 2001:db8:a::2 unicast: FTR values {1}
+PASS proposed v6 6011 control: provider C -> 2001:db8:c::2 unicast through GRE: FTR values {3}
+PASS proposed v6 6012 control: LAN host -> internet unicast (forwarded, policy to A): FTR values {1,129}
+######## UDP and TCP to the router and to a port forwarding on an L2 broadcast / multicast address (current generator)
+PASS v4 UDP to the router answered
+PASS v4 ... never assigned (pkttype not host), replies leave through A by the source rule
+PASS v4 TCP to the router fails (TCP discards packets whose pkttype is not host)
+PASS v4 port forwarding fails (the kernel forwards only pkttype host)
+PASS v6 UDP to the router answered
+PASS v6 ... never assigned (pkttype not host), replies leave through A by the source rule
+PASS v6 TCP to the router fails (TCP discards packets whose pkttype is not host)
+PASS v6 port forwarding fails (the kernel forwards only pkttype host)
+
+t9-nonunicast.sh: 104 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
+######## t10-flowtable.sh
+######## flowtable devices: none
+== IPv4 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=39 ftr_post=39 lan_m=15 wana_m=27 offload=0 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=45 ftr_post=45 lan_m=15 wana_m=30 offload=0 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=45 ftr_post=45 lan_m=15 wana_m=30 offload=0 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=9 ftr_post=3 lan_m=1 wana_m=2 offload=0 ct=0x1 unreach=2 neigh=none
+     result  {"error": "timeout", "max_gap": 0.106, "peer": "192.0.2.2", "received": 44, "sent": 63}
+PASS v4 baseline: every packet traverses FTR's chains
+PASS v4 baseline: packets leave A with the FTR field set
+PASS v4 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv4 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=39 ftr_post=39 lan_m=27 wanb_m=15 offload=0 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=45 ftr_post=45 lan_m=30 wanb_m=15 offload=0 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=45 ftr_post=45 lan_m=30 wanb_m=15 offload=0 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=9 ftr_post=3 lan_m=2 wanb_m=1 offload=0 ct=0x2 unreach=0 neigh=none
+     result  {"error": "timeout", "max_gap": 0.105, "peer": "198.18.2.1", "received": 44, "sent": 63}
+PASS v4 baseline: replies leave B with the FTR field set
+PASS v4 after B stops being ready the pinned inbound flow fails, never moved
+== IPv6 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=39 ftr_post=39 lan_m=15 wana_m=27 offload=0 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=45 ftr_post=45 lan_m=15 wana_m=30 offload=0 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=48 ftr_post=48 lan_m=15 wana_m=30 offload=0 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=14 ftr_post=0  offload=0 ct=0x1 unreach=14 neigh=none
+     result  {"error": "timeout", "max_gap": 0.101, "peer": "2001:db8:a::2", "received": 43, "sent": 62}
+PASS v6 baseline: every packet traverses FTR's chains
+PASS v6 baseline: packets leave A with the FTR field set
+PASS v6 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv6 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=39 ftr_post=39 lan_m=27 wanb_m=15 offload=0 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=45 ftr_post=45 lan_m=30 wanb_m=15 offload=0 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=48 ftr_post=48 lan_m=32 wanb_m=16 offload=0 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=24 ftr_post=6 lan_m=6 offload=0 ct=0x2 unreach=15 neigh=none
+     result  {"error": "timeout", "max_gap": 0.101, "peer": "2001:db8:ff02::1", "received": 43, "sent": 62}
+PASS v6 baseline: replies leave B with the FTR field set
+PASS v6 after B stops being ready the pinned inbound flow fails, never moved
+######## flowtable devices: lan, wana, wanb
+     table inet admin { } table inet fault_tolerant_router { } table inet chk { } table netdev eg { } table inet adminft { flowtable ft { hook ingress priority filter devices = { lan, wana, wanb } } } 
+== IPv4 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=3 ftr_post=3 lan_m=1 lan_z=14 wana_m=2 wana_z=25 offload=1 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=0 ftr_post=0 lan_z=15 wana_z=30 offload=1 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=1 ftr_post=1 lan_z=15 wana_m=1 wana_z=29 offload=1 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=6 ftr_post=0  offload=0 ct=0x1 unreach=2 neigh=none
+     result  {"error": "timeout", "max_gap": 0.103, "peer": "192.0.2.2", "received": 44, "sent": 63}
+PASS v4 offloaded: conntrack entry flagged OFFLOAD, path 1
+PASS v4 offloaded: no packet traverses FTR's chains
+PASS v4 offloaded: packets leave A with the FTR field empty
+PASS v4 offloaded: after the active set change packets still leave through A only
+PASS v4 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv4 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=3 ftr_post=3 lan_m=2 lan_z=25 wanb_m=1 wanb_z=14 offload=1 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=0 ftr_post=0 lan_z=28 wanb_z=14 offload=1 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=1 ftr_post=1 lan_m=1 lan_z=31 wanb_z=16 offload=1 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=6 ftr_post=0 lan_z=2 wanb_z=1 offload=0 ct=0x2 unreach=0 neigh=none
+     result  {"error": "timeout", "max_gap": 0.196, "peer": "198.18.2.1", "received": 43, "sent": 62}
+PASS v4 offloaded: OFFLOAD, path 2, no packet in FTR's chains, replies leave B unmarked
+PASS v4 after B stops being ready the pinned inbound flow fails, never moved
+== IPv6 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=3 ftr_post=3 lan_m=1 lan_z=14 wana_m=2 wana_z=25 offload=1 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=0 ftr_post=0 lan_z=15 wana_z=30 offload=1 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=0 ftr_post=0 lan_z=15 wana_z=30 offload=1 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=13 ftr_post=0  offload=0 ct=0x1 unreach=14 neigh=none
+     result  {"error": "timeout", "max_gap": 0.1, "peer": "2001:db8:a::2", "received": 44, "sent": 63}
+PASS v6 offloaded: conntrack entry flagged OFFLOAD, path 1
+PASS v6 offloaded: no packet traverses FTR's chains
+PASS v6 offloaded: packets leave A with the FTR field empty
+PASS v6 offloaded: after the active set change packets still leave through A only
+PASS v6 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv6 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=3 ftr_post=3 lan_m=2 lan_z=25 wanb_m=1 wanb_z=14 offload=1 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=0 ftr_post=0 lan_z=30 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=0 ftr_post=0 lan_z=30 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=22 ftr_post=5 lan_m=5 lan_z=1 offload=0 ct=0x2 unreach=15 neigh=none
+     result  {"error": "timeout", "max_gap": 0.102, "peer": "2001:db8:ff02::1", "received": 44, "sent": 63}
+PASS v6 offloaded: OFFLOAD, path 2, no packet in FTR's chains, replies leave B unmarked
+PASS v6 after B stops being ready the pinned inbound flow fails, never moved
+######## flowtable devices: lan, dmz
+     table inet admin { } table inet fault_tolerant_router { } table inet chk { } table netdev eg { } table inet adminft { flowtable ft { hook ingress priority filter devices = { dmz, lan } } } 
+== IPv4 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=16 ftr_post=16 lan_m=15 wana_m=2 wana_z=25 offload=1 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=15 ftr_post=15 lan_m=16 wana_z=32 offload=1 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=16 ftr_post=16 lan_m=15 wana_m=1 wana_z=29 offload=1 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=6 ftr_post=0  offload=0 ct=0x1 unreach=2 neigh=none
+     result  {"error": "timeout", "max_gap": 0.1, "peer": "192.0.2.2", "received": 44, "sent": 63}
+PASS v4 downlinks only: conntrack entry flagged OFFLOAD
+PASS v4 downlinks only: original packets (LAN ingress) bypass FTR's chains, replies do not
+PASS v4 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv4 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=26 ftr_post=26 lan_m=27 wanb_m=1 wanb_z=14 offload=1 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=30 ftr_post=30 lan_m=30 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=31 ftr_post=31 lan_m=32 wanb_m=1 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=6 ftr_post=0  offload=1 ct=0x2 unreach=0 neigh=none
+     result  {"error": "timeout", "max_gap": 0.103, "peer": "198.18.2.1", "received": 44, "sent": 63}
+PASS v4 downlinks only: replies (LAN ingress) offloaded and leave B unmarked
+PASS v4 after B stops being ready the pinned inbound flow fails, never moved
+== IPv4 flow between the downlinks (LAN -> dmz)
+     start   ftr_pre=3 ftr_post=3 dmz_z=27 lan_z=15 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     steady  ftr_pre=0 ftr_post=0 dmz_z=32 lan_z=16 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     active  ftr_pre=0 ftr_post=0 dmz_z=30 lan_z=15 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     notrdy  ftr_pre=0 ftr_post=0 dmz_z=50 lan_z=25 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     result  {"error": null, "max_gap": 0.101, "peer": "10.1.0.2", "received": 70, "sent": 70}
+PASS v4 LAN -> dmz offloaded in both directions, no packet in FTR's chains
+== IPv6 outbound flow via A; active set {A} -> {B}; then A not ready
+     start   ftr_pre=16 ftr_post=16 lan_m=15 wana_m=2 wana_z=25 offload=1 ct=0x1 unreach=0 neigh=none
+     steady  ftr_pre=15 ftr_post=15 lan_m=15 wana_z=30 offload=1 ct=0x1 unreach=0 neigh=none
+     active  ftr_pre=15 ftr_post=15 lan_m=15 wana_z=30 offload=1 ct=0x1 unreach=0 neigh=none
+     notrdy  ftr_pre=13 ftr_post=0  offload=0 ct=0x1 unreach=14 neigh=none
+     result  {"error": "timeout", "max_gap": 0.1, "peer": "2001:db8:a::2", "received": 44, "sent": 63}
+PASS v6 downlinks only: conntrack entry flagged OFFLOAD
+PASS v6 downlinks only: original packets (LAN ingress) bypass FTR's chains, replies do not
+PASS v6 after A stops being ready the pinned flow fails (path guard), never moved to B
+== IPv6 inbound flow through B (port forwarding); active set {A} -> {C}; then B not ready
+     start   ftr_pre=26 ftr_post=26 lan_m=27 wanb_m=1 wanb_z=14 offload=1 ct=0x2 unreach=0 neigh=none
+     steady  ftr_pre=30 ftr_post=30 lan_m=30 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     active  ftr_pre=30 ftr_post=30 lan_m=30 wanb_z=15 offload=1 ct=0x2 unreach=0 neigh=none
+     notrdy  ftr_pre=23 ftr_post=6 lan_m=6 offload=0 ct=0x2 unreach=15 neigh=none
+     result  {"error": "timeout", "max_gap": 0.102, "peer": "2001:db8:ff02::1", "received": 44, "sent": 63}
+PASS v6 downlinks only: replies (LAN ingress) offloaded and leave B unmarked
+PASS v6 after B stops being ready the pinned inbound flow fails, never moved
+== IPv6 flow between the downlinks (LAN -> dmz)
+     start   ftr_pre=3 ftr_post=3 dmz_z=27 lan_z=15 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     steady  ftr_pre=0 ftr_post=0 dmz_z=32 lan_z=16 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     active  ftr_pre=0 ftr_post=0 dmz_z=32 lan_z=16 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     notrdy  ftr_pre=0 ftr_post=0 dmz_z=50 lan_z=25 offload=1 ct=0x0 unreach=0 neigh=dev_dmz_REACHABLE
+     result  {"error": null, "max_gap": 0.101, "peer": "fd00:1::2", "received": 70, "sent": 70}
+PASS v6 LAN -> dmz offloaded in both directions, no packet in FTR's chains
+######## flowtable device names: JSON form, wildcard, missing device
+     JSON with one device: "lan"
+     { lan, "wan*" } rejected: /dev/stdin:2:13-14: Error: Could not process rule: No such file or directory
+PASS { lan, "wan*" } rejected by this kernel or nftables version
+     { lan, "nosuch0" } rejected: /dev/stdin:2:13-14: Error: Could not process rule: No such file or directory
+PASS { lan, "nosuch0" } rejected by this kernel or nftables version
+
+t10-flowtable.sh: 38 passed, 0 failed (kernel 6.1.0-53-amd64, nftables v1.0.6 (Lester Gooch #5))
