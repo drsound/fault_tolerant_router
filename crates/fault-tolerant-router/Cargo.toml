@@ -36,5 +36,8 @@ toml.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 
+[dev-dependencies]
+tokio = { version = "1.53", features = ["test-util", "macros", "rt"] }
+
 [lints]
 workspace = true

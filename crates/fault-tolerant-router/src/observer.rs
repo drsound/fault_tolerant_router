@@ -10,12 +10,31 @@
 //! deletion notification is removed only when a confirming read also lacks
 //! it.
 
+use std::future::Future;
+
 use netlink_packet_route::RouteNetlinkMessage;
 
 use crate::model::Family;
 use crate::netlink::msg;
 use crate::netlink::{Client, Dump, KernelError};
 use crate::system::{Scope, System};
+
+/// Where dumps come from: a netlink socket, or a scripted source in tests.
+pub trait Dumper: Sized {
+    fn dump(&self, filter: RouteNetlinkMessage) -> impl Future<Output = Result<Dump, KernelError>> + Send;
+    /// A new source for a retry after a deadline (a new socket).
+    fn fresh(&self) -> std::io::Result<Self>;
+}
+
+impl Dumper for Client {
+    fn dump(&self, filter: RouteNetlinkMessage) -> impl Future<Output = Result<Dump, KernelError>> + Send {
+        Client::dump(self, filter)
+    }
+
+    fn fresh(&self) -> std::io::Result<Client> {
+        Client::new()
+    }
+}
 
 const INTERRUPTED_RETRIES: usize = 5;
 
@@ -25,7 +44,7 @@ pub const DUMP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 const DEADLINE_RETRIES: usize = 3;
 
 /// One dump within the deadline, on `c` first and then on new sockets.
-async fn bounded(c: &Client, filter: &RouteNetlinkMessage) -> Result<Dump, KernelError> {
+async fn bounded<D: Dumper>(c: &D, filter: &RouteNetlinkMessage) -> Result<Dump, KernelError> {
     match tokio::time::timeout(DUMP_DEADLINE, c.dump(filter.clone())).await {
         Ok(r) => return r,
         Err(_) => tracing::warn!(
@@ -34,7 +53,7 @@ async fn bounded(c: &Client, filter: &RouteNetlinkMessage) -> Result<Dump, Kerne
         ),
     }
     for _ in 0..DEADLINE_RETRIES {
-        let fresh = Client::new().map_err(KernelError::transport)?;
+        let fresh = c.fresh().map_err(KernelError::transport)?;
         if let Ok(r) = tokio::time::timeout(DUMP_DEADLINE, fresh.dump(filter.clone())).await {
             return r;
         }
@@ -46,7 +65,7 @@ async fn bounded(c: &Client, filter: &RouteNetlinkMessage) -> Result<Dump, Kerne
 }
 
 /// A dump, retried while the kernel flags it as interrupted.
-async fn dump(c: &Client, filter: RouteNetlinkMessage) -> Result<Dump, KernelError> {
+async fn dump<D: Dumper>(c: &D, filter: RouteNetlinkMessage) -> Result<Dump, KernelError> {
     let mut last = bounded(c, &filter).await?;
     for _ in 0..INTERRUPTED_RETRIES {
         if !last.interrupted {
@@ -58,7 +77,7 @@ async fn dump(c: &Client, filter: RouteNetlinkMessage) -> Result<Dump, KernelErr
 }
 
 /// The complete view: links, addresses, rules and routes of both families.
-pub async fn full(c: &Client, scope: &Scope) -> Result<System, KernelError> {
+pub async fn full<D: Dumper>(c: &D, scope: &Scope) -> Result<System, KernelError> {
     let mut s = System::default();
     let mut filters = vec![msg::link_dump()];
     for f in Family::ALL {
@@ -76,7 +95,7 @@ pub async fn full(c: &Client, scope: &Scope) -> Result<System, KernelError> {
 
 /// A full resynchronisation: a new full dump, with every route, rule and
 /// address of the old view that the dump lacks confirmed by a second read.
-pub async fn resync(c: &Client, scope: &Scope, old: &System) -> Result<System, KernelError> {
+pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<System, KernelError> {
     let mut new = full(c, scope).await?;
     let missing_tables: std::collections::BTreeSet<(Family, u32)> = old
         .routes
@@ -119,8 +138,8 @@ pub async fn resync(c: &Client, scope: &Scope, old: &System) -> Result<System, K
 /// removes IPv4 routes and changes nexthop flags without notification (S3).
 /// A route missing from the re-read is removed only when a second read
 /// agrees.
-pub async fn reread(
-    c: &Client,
+pub async fn reread<D: Dumper>(
+    c: &D,
     scope: &Scope,
     system: &mut System,
     tables: &[(Family, u32)],
@@ -141,3 +160,6 @@ pub async fn reread(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
