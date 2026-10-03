@@ -76,10 +76,37 @@ impl HealthSpec {
     }
 }
 
+/// The `fwmark_mask` the scenarios run with: `FTR_TEST_FWMARK_MASK` (for
+/// example `0xff`, `0x00ff0000`, `0xff000000`, AS-43), the default otherwise.
+pub fn mask() -> u32 {
+    std::env::var("FTR_TEST_FWMARK_MASK")
+        .ok()
+        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x00ff_0000)
+}
+
+/// A field value placed in the FTR field of the mark (FR-MARK-3).
+pub fn encode(value: u8) -> u32 {
+    u32::from(value) << mask().trailing_zeros()
+}
+
+/// A bit outside the FTR field, for foreign-mark checks (AS-24).
+pub fn foreign_bit(n: u32) -> u32 {
+    (0..32)
+        .map(|b| 1u32 << b)
+        .filter(|b| b & mask() == 0)
+        .nth(n as usize)
+        .unwrap_or(0)
+}
+
 /// An IPv4 configuration over the given uplinks, with `lan` as downlink.
 /// `extra` is appended verbatim (other tables, routing settings).
 pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
     let mut s = String::from("version = 2\n");
+    let mut routing = routing.to_owned();
+    if mask() != 0x00ff_0000 {
+        routing = format!("fwmark_mask = {:#x}\n{routing}", mask());
+    }
     if !routing.is_empty() {
         let _ = writeln!(s, "[routing]\n{routing}");
     }

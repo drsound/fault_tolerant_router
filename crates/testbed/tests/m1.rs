@@ -377,13 +377,23 @@ fn as24_foreign_mark_bits_are_preserved() -> Result<()> {
     let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
     t.router().nft(
-        "table inet admin {\n  chain pre {\n    type filter hook prerouting priority -300; policy accept;\n    iifname \"lan\" meta mark set meta mark | 0x00000001\n  }\n  chain ctmark {\n    type filter hook prerouting priority -190; policy accept;\n    iifname \"lan\" ct state new ct mark set ct mark | 0x01000000\n  }\n}\n",
+        &format!(
+            "table inet admin {{\n  chain pre {{\n    type filter hook prerouting priority -300; policy accept;\n    iifname \"lan\" meta mark set meta mark | {p:#010x}\n  }}\n  chain ctmark {{\n    type filter hook prerouting priority -190; policy accept;\n    iifname \"lan\" ct state new ct mark set ct mark | {c:#010x}\n  }}\n}}\n",
+            p = ftr::foreign_bit(0),
+            c = ftr::foreign_bit(8)
+        ),
     )?;
     counter(&t, "all", "oifname { \"wana\", \"wanb\" } ip daddr 198.18.100.0/24")?;
     counter(
         &t,
         "kept",
-        "oifname { \"wana\", \"wanb\" } ip daddr 198.18.100.0/24 meta mark & 0xff00ffff == 0x00000001 meta mark & 0x00ff0000 != 0 ct mark & 0x01000000 == 0x01000000 ct mark & 0x00ff0000 != 0",
+        &format!(
+            "oifname {{ \"wana\", \"wanb\" }} ip daddr 198.18.100.0/24 meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} != 0 ct mark & {c:#010x} == {c:#010x} ct mark & {m:#010x} != 0",
+            nm = !ftr::mask(),
+            m = ftr::mask(),
+            p = ftr::foreign_bit(0),
+            c = ftr::foreign_bit(8)
+        ),
     )?;
     let r = t.connect_many(Node::Client, Family::V4, 20, 100, false)?;
     assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
@@ -774,7 +784,8 @@ fn as19_reload_adds_removes_reorders_and_protects_ids() -> Result<()> {
     ))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
-    wait_members(&t, &["ppp0", "wanb"], Duration::from_secs(10))?;
+    // A path added by reload starts down and needs `rise` passed rounds.
+    wait_members(&t, &["ppp0", "wanb"], Duration::from_secs(20))?;
     std::thread::sleep(Duration::from_secs(1));
     let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
     for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
@@ -1149,7 +1160,7 @@ fn as30_replies_with_an_empty_active_set() -> Result<()> {
             "-I",
             "wana",
             "-m",
-            &(0x0041_0000u32).to_string(),
+            &ftr::encode(0x41).to_string(),
             "1.1.1.1",
         ],
     )?;
@@ -1338,7 +1349,7 @@ fn as50_unmanaged_interface_replies_are_not_pinned() -> Result<()> {
         !marks.is_empty()
             && marks
                 .iter()
-                .all(|m| m.trim_start_matches("mark=").parse::<u32>().unwrap_or(1) & 0x00ff_0000 == 0),
+                .all(|m| m.trim_start_matches("mark=").parse::<u32>().unwrap_or(1) & ftr::mask() == 0),
         "{ct}"
     );
     let (a, b) = (counter_value(&t, "a")?, counter_value(&t, "b")?);
@@ -1472,5 +1483,226 @@ fn as21_router_originated_traffic() -> Result<()> {
         &by_dev("ppp0"),
     )?;
     assert_eq!(counter_value(&t, "c_elsewhere")?, 0, "never through another interface");
+    Ok(())
+}
+
+/// AS-23: external firewall mode; the administrator loads the exported
+/// ruleset by hand; the results of AS-01, AS-03 and AS-09 hold.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as23_external_firewall_mode() -> Result<()> {
+    let t = build();
+    let config = ftr::ipv4_config(
+        &ab(),
+        &HealthSpec::fast(),
+        "reconcile_interval = \"10s\"",
+        "[firewall]\nmode = \"external\"\n",
+    );
+    let f = t.start_ftr(&config)?;
+    f.wait_installed(&t)?;
+    assert!(
+        f.log()
+            .contains("marking and NAT are the administrator's responsibility"),
+        "{}",
+        f.log()
+    );
+    f.wait_log(
+        &t,
+        "reason=\"external_ruleset_missing\" status_degraded",
+        1,
+        Duration::from_secs(2),
+    )
+    .or_else(|_| f.wait_log(&t, "external_ruleset_missing", 1, Duration::from_secs(2)))?;
+    assert!(
+        !t.router()
+            .output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
+            .status
+            .success(),
+        "FTR performs no nftables mutation"
+    );
+    let out = f.cli(&["export-nft", "--config", &f.config.display().to_string()])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    t.router().nft(&String::from_utf8_lossy(&out.stdout))?;
+    f.wait_log(&t, "status_recovered", 1, Duration::from_secs(13))?;
+    // AS-01 (one run).
+    let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
+    let a = share(&r, Uplink::A);
+    assert!(
+        r.iter().all(|c| c.outcome == Outcome::Ok) && (0.45..=0.55).contains(&a),
+        "A got {a:.3} ({:?})",
+        tally(&r)
+    );
+    // AS-03: connections on A survive a failure of B.
+    let flows: Vec<_> = (1..=6)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect::<Result<_>>()?;
+    std::thread::sleep(Duration::from_millis(500));
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, &["wana"], Duration::from_secs(3))?;
+    std::thread::sleep(Duration::from_secs(1));
+    t.carrier_up(Uplink::B)?;
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::A)) {
+        assert!(
+            r.continuous(Duration::from_millis(1000)),
+            "flow on A interrupted: {r:?}"
+        );
+    }
+    // AS-09 on A.
+    let _server = serve_in(&t, Node::Client)?;
+    t.router().nft(&format!(
+        "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" tcp dport 8007 dnat to {}:{}\n  }}\n}}\n",
+        testbed::plan::LAN_CLIENT_V4,
+        testbed::plan::TCP_PORT
+    ))?;
+    counter(&t, "in_a", "oifname \"wana\" tcp sport 8007")?;
+    let r = t.connect_to(
+        Node::Inet,
+        &[format!("{}:8007", address(&t, Uplink::A)?)],
+        10,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok));
+    assert!(counter_value(&t, "in_a")? >= 20);
+    Ok(())
+}
+
+/// AS-47: startup with intact artifacts and an expired checkpoint (adoption,
+/// cold start); with partial artifacts, live marks and a recent checkpoint
+/// (repair, connections routed again once repaired); in external mode with
+/// the administrator's ruleset already loaded (no degradation).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as47_startup_with_existing_artifacts() -> Result<()> {
+    let t = build();
+    let mut f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(10))?;
+    let rules = ftr_rules(&t)?;
+    let flow = t.start_flow(
+        Node::Client,
+        testbed::plan::server(Family::V4, 90),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // (1) Intact artifacts, checkpoint older than 10 minutes: adopted, cold start.
+    f.kill()?;
+    let checkpoint = f.dir.join("state/health.json");
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&checkpoint)?)?;
+    let ms = v["boottime_ms"].as_u64().unwrap_or(0);
+    v["boottime_ms"] = serde_json::json!(ms.saturating_sub(11 * 60 * 1000));
+    std::fs::write(&checkpoint, serde_json::to_string(&v)?)?;
+    f.start(&t)?;
+    f.wait_log(
+        &t,
+        "initial path state uplink=1 family=ipv4 state=Up warm=false",
+        1,
+        Duration::from_secs(10),
+    )?;
+    f.wait_installed(&t)?;
+    assert_eq!(ftr_rules(&t)?, rules, "adopted without duplicates");
+    wait_members(&t, &["wanb"], Duration::from_secs(5))?;
+
+    // (2) Partial artifacts with live marks and a recent checkpoint.
+    f.kill()?;
+    t.router().ip("rule del pref 1202")?;
+    t.router().ip("route del default table 1000")?;
+    std::thread::sleep(Duration::from_secs(1));
+    f.start(&t)?;
+    f.wait_log(
+        &t,
+        "initial path state uplink=2 family=ipv4 state=Up warm=true",
+        1,
+        Duration::from_secs(10),
+    )?;
+    f.wait_installed(&t)?;
+    t.wait_for("the layout repaired", Duration::from_secs(3), || {
+        Ok(ftr_rules(&t)? == rules)
+    })?;
+    wait_members(&t, &["wanb"], Duration::from_secs(3))?;
+    std::thread::sleep(Duration::from_secs(1));
+    let report = flow.stop()?;
+    assert_eq!(report.uplink(), Some(Uplink::B));
+    assert!(
+        report.error.is_none(),
+        "the connection on the damaged path recovers once repaired: {report:?}"
+    );
+    f.stop()?;
+    t.upstream_up(Uplink::A)?;
+
+    // (3) External mode with the administrator's ruleset already loaded.
+    let config = ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", "[firewall]\nmode = \"external\"\n");
+    let out = f.cli(&["cleanup", "--config", &f.config.display().to_string()])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    f.write_config(&config)?;
+    let out = f.cli(&["export-nft", "--config", &f.config.display().to_string()])?;
+    t.router().nft(&String::from_utf8_lossy(&out.stdout))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!f.log().contains("external_ruleset_missing"), "{}", f.log());
+    Ok(())
+}
+
+/// AS-31: RELATED ICMP errors and path MTU discovery through the PPPoE
+/// uplink (MTU 1492) and through a bottleneck inside provider A while the
+/// server advertises a full-size MSS: large transfers succeed (INV-2).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as31_path_mtu_discovery_through_pppoe_and_a_provider_bottleneck() -> Result<()> {
+    let t = build();
+    let c_first = [
+        UplinkSpec::new(Uplink::C, 3),
+        UplinkSpec::new(Uplink::A, 1).priority(Some(2)),
+        UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(&c_first, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert_eq!(balancing_members(&t)?, ["ppp0"]);
+    let r = t.bulk(
+        Node::Client,
+        testbed::plan::server(Family::V4, 95),
+        300_000,
+        Duration::from_secs(10),
+    )?;
+    assert!(r.error.is_none() && r.received == 300_000, "through PPPoE: {r:?}");
+    assert_eq!(r.uplink(), Some(Uplink::C));
+
+    // A 1300-byte link inside provider A; the server's route towards A's
+    // customers advertises a full-size MSS, so the client's segments are too
+    // big and provider A answers with "fragmentation needed".
+    let a_first = [
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
+        UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
+    ];
+    f.write_config(&ftr::ipv4_config(&a_first, &HealthSpec::fast(), "", ""))?;
+    f.reload()?;
+    wait_members(&t, &["wana"], Duration::from_secs(10))?;
+    t.ns(Node::IspA).ip("link set core mtu 1300")?;
+    t.inet().ip("link set isp-a mtu 1300")?;
+    let route = t.inet().run("ip", ["-4", "route", "show", "192.0.2.0/24"])?;
+    let route = route.lines().next().unwrap_or_default().trim().to_owned();
+    t.inet().ip(&format!("route change {route} advmss 1460"))?;
+    let r = t.bulk(
+        Node::Client,
+        testbed::plan::server(Family::V4, 96),
+        300_000,
+        Duration::from_secs(10),
+    )?;
+    assert!(
+        r.error.is_none() && r.received == 300_000,
+        "through the provider bottleneck: {r:?}"
+    );
+    assert_eq!(r.uplink(), Some(Uplink::A));
     Ok(())
 }

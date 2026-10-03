@@ -347,6 +347,56 @@ pub fn connect(
 }
 
 /// A long-lived TCP flow; stops when standard input closes or after `duration`.
+/// Sends `bytes` bytes to a test server and reads them back (the server
+/// echoes), in full-size segments both ways (path MTU discovery, AS-31).
+pub fn bulk(dst: SocketAddr, bytes: usize, timeout: Duration) -> FlowReport {
+    let mut rep = FlowReport::default();
+    let start = Instant::now();
+    let res: io::Result<()> = (|| {
+        let s = TcpStream::connect_timeout(&dst, Duration::from_secs(3))?;
+        rep.local = s.local_addr().ok();
+        s.set_read_timeout(Some(timeout))?;
+        s.set_write_timeout(Some(timeout))?;
+        let mut first = Vec::new();
+        let mut b = [0u8; 1];
+        while (&s).read(&mut b)? == 1 && b[0] != b'\n' {
+            first.push(b[0]);
+        }
+        rep.observed = String::from_utf8_lossy(&first).trim().parse().ok();
+        let reader = {
+            let mut r = s.try_clone()?;
+            thread::spawn(move || -> io::Result<u64> {
+                let mut buf = vec![0u8; 65536];
+                let mut got = 0u64;
+                while (got as usize) < bytes {
+                    let n = r.read(&mut buf)?;
+                    if n == 0 {
+                        return Err(io::Error::other("closed before the echo was complete"));
+                    }
+                    got += n as u64;
+                }
+                Ok(got)
+            })
+        };
+        let chunk = vec![0x5au8; 16384];
+        let mut sent = 0;
+        while sent < bytes {
+            let n = chunk.len().min(bytes - sent);
+            (&s).write_all(&chunk[..n])?;
+            sent += n;
+        }
+        rep.sent = sent as u64;
+        rep.received = reader.join().map_err(|_| io::Error::other("reader panicked"))??;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        rep.error = Some(e.to_string());
+        rep.errno = e.raw_os_error();
+    }
+    rep.millis = start.elapsed().as_millis() as u64;
+    rep
+}
+
 pub fn flow(dst: SocketAddr, interval: Duration, duration: Option<Duration>) -> FlowReport {
     let stop = Arc::new(AtomicBool::new(false));
     {

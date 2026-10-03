@@ -100,11 +100,17 @@ jobs:
       - name: Build the Debian 12 root filesystem
         run: sudo tests/vm/build-rootfs.sh "$RUNNER_TEMP/rootfs-bookworm"
       - run: tests/vm/run-suite.sh --vm "$RUNNER_TEMP/rootfs-bookworm"
+        env:
+          # The M1 scenarios run three times (AS-43); use the runner's cores.
+          VM_CPUS: 4
+          VM_MEMORY: 3G
+          VM_TEST_THREADS: 3
 
   release-targets:
-    # Placeholder until the daemon crate exists: checks that the workspace
-    # compiles for every PLAT-3 target. Static release builds replace it in M1.
-    name: build check (${{ matrix.target }})
+    # Static release builds for every PLAT-3 target (§14.4). The binaries are
+    # pure Rust; rust-lld links them against the self-contained musl objects
+    # of each target, so no cross C toolchain is needed.
+    name: release build (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -121,4 +127,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo check --workspace --release --target ${{ matrix.target }}
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p fault-tolerant-router \
+            --config 'target.${{ matrix.target }}.linker="rust-lld"'
+          file target/${{ matrix.target }}/release/fault-tolerant-router
+          file target/${{ matrix.target }}/release/fault-tolerant-router | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fault-tolerant-router-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/fault-tolerant-router
+          if-no-files-found: error

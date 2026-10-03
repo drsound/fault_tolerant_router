@@ -96,6 +96,13 @@ enum AgentCommand {
         duration_ms: Option<u64>,
         dst: SocketAddr,
     },
+    Bulk {
+        #[arg(long, default_value_t = 300_000)]
+        bytes: usize,
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
+        dst: SocketAddr,
+    },
     UdpSend {
         #[arg(long)]
         src_port: u16,
@@ -199,6 +206,10 @@ fn run(cli: Cli) -> Result<()> {
                     Duration::from_millis(interval_ms),
                     duration_ms.map(Duration::from_millis),
                 );
+                println!("{}", serde_json::to_string(&r)?);
+            }
+            AgentCommand::Bulk { bytes, timeout_ms, dst } => {
+                let r = agent::bulk(dst, bytes, Duration::from_millis(timeout_ms));
                 println!("{}", serde_json::to_string(&r)?);
             }
             AgentCommand::UdpSend {

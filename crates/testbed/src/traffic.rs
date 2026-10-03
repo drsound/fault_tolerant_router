@@ -195,6 +195,23 @@ impl Topology {
         serde_json::from_str(&out).context("parsing connect agent output")
     }
 
+    /// Transfers `bytes` bytes to a test server and back (`agent bulk`).
+    pub fn bulk(&self, node: Node, dst: IpAddr, bytes: usize, timeout: Duration) -> Result<FlowReport> {
+        let out = self.ns(node).run(
+            &self.agent_bin().to_string_lossy(),
+            [
+                "agent".to_owned(),
+                "bulk".into(),
+                "--bytes".into(),
+                bytes.to_string(),
+                "--timeout-ms".into(),
+                timeout.as_millis().to_string(),
+                SocketAddr::new(dst, plan::TCP_PORT).to_string(),
+            ],
+        )?;
+        serde_json::from_str(&out).context("parsing bulk agent output")
+    }
+
     /// Starts a long-lived TCP flow from `node` to `dst`.
     pub fn start_flow(&self, node: Node, dst: IpAddr, interval: Duration) -> Result<Flow> {
         let mut c = self.ns(node).command(self.agent_bin());

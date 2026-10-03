@@ -47,6 +47,13 @@ for t in $kernel_tests; do
     | jq -r --arg t "$t" 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $t) | .executable')
   cp "$bin" "$bindir/$t"
 done
+# The M1 scenarios run once per fwmark_mask (AS-43: offsets 16, 0 and 24);
+# FTR_TEST_MASKS narrows the list.
+masks=${FTR_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
+m1_in_vm=
+for mask in $masks; do
+  m1_in_vm="$m1_in_vm && echo '== M1 scenarios with fwmark_mask $mask' && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router FTR_TEST_FWMARK_MASK=$mask /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+done
 # They change rules and routes, so each runs in a private network namespace.
 kernel_in_vm=
 for t in $kernel_tests; do
@@ -63,8 +70,11 @@ case $mode in
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
     $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
-    exec $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
-      "$bindir/m1" --ignored "$@"
+    for mask in $masks; do
+      echo "== M1 scenarios with fwmark_mask $mask"
+      $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
+        FTR_TEST_FWMARK_MASK="$mask" "$bindir/m1" --ignored "$@"
+    done
     ;;
   vm)
     rootfs=$(cd "$rootfs" && pwd)
@@ -80,6 +90,6 @@ case $mode in
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \
       --rodir "/mnt=$bindir" \
-      --exec "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+      --exec "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm"
     ;;
 esac
