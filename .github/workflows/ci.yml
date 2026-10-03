@@ -80,6 +80,9 @@ jobs:
           sudo ln -sf ~/.cache/ftr-nftables/sbin/nft /usr/local/sbin/nft
       - run: uname -r && sudo nft --version
       - run: tests/vm/run-suite.sh --host
+        env:
+          # The scenarios wait more than they compute.
+          FTR_PARALLEL_MASKS: 1
 
   netns-minimum:
     name: namespace suite (Linux 6.1, nftables 1.0.6)

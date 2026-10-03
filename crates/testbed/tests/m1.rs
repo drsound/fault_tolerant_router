@@ -236,7 +236,8 @@ fn as03_connections_on_a_survive_failure_and_recovery_of_b() -> Result<()> {
     let t = build();
     let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
-    let flows: Vec<_> = (1..=8)
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    let flows: Vec<_> = (1..=16)
         .map(|n| {
             t.start_flow(
                 Node::Client,
@@ -626,7 +627,16 @@ fn as33_networkd_foreign_management() -> Result<()> {
     let enabled = |key: &str| format!("systemd-networkd is active with {key} enabled");
 
     // A networkd in another namespace manages other interfaces.
+    // `ip netns exec` runs first under its own name: wait for the stand-in.
+    let started = |ns: &testbed::netns::Ns| {
+        t.wait_for("the networkd stand-in", Duration::from_secs(5), || {
+            Ok(ns.pids()?.into_iter().any(|p| {
+                std::fs::read_to_string(format!("/proc/{p}/comm")).is_ok_and(|c| c.trim() == "systemd-network")
+            }))
+        })
+    };
     let mut other = t.client().spawn(&fake, [""; 0], &t.dir().join("networkd-client.log"))?;
+    started(&t.client())?;
     let (ok, text) = check(&f)?;
     assert!(ok, "{text}");
     f.start(&t)?;
@@ -636,6 +646,7 @@ fn as33_networkd_foreign_management() -> Result<()> {
     other.wait()?;
 
     let mut networkd = t.router().spawn(&fake, [""; 0], &t.dir().join("networkd-router.log"))?;
+    started(&t.router())?;
     // Defaults: both enabled.
     let (ok, text) = check(&f)?;
     assert!(!ok, "{text}");

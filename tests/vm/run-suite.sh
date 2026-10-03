@@ -4,19 +4,25 @@
 # machine booted with the kernel of a root filesystem made by build-rootfs.sh.
 #
 # Usage:
-#   tests/vm/run-suite.sh [--host | --vm ROOTFS] [-- TEST-ARGS...]
+#   tests/vm/run-suite.sh [--host | --vm ROOTFS | --build-only] [--bindir DIR] [-- TEST-ARGS...]
 #
 # The build runs as the invoking user; running the suite needs root, so the
 # script uses sudo when it is not already root. Extra arguments after "--"
-# go to the test binary (for example a test name filter).
+# go to the test binary (for example a test name filter). --build-only
+# leaves the binaries in the suite directory; --bindir runs binaries built
+# earlier (copied to a machine without a Rust toolchain, for example) and
+# skips the build.
 set -eu
 
 mode=host
 rootfs=
+prebuilt=
 while [ $# -gt 0 ]; do
   case $1 in
     --host) mode=host; shift ;;
     --vm) mode=vm; rootfs=${2:?--vm needs a root filesystem}; shift 2 ;;
+    --build-only) mode=build; shift ;;
+    --bindir) prebuilt=${2:?--bindir needs a directory}; shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -26,32 +32,41 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 target=x86_64-unknown-linux-musl
 target_dir=${CARGO_TARGET_DIR:-$repo/target}
 bindir=$target_dir/netns-suite
-cd "$repo"
-
-# The daemon under test has the hooks of the acceptance scenarios
-# (crates/fault-tolerant-router/src/test_hooks.rs).
-cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router \
-  --features fault-tolerant-router/test-hooks
-test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
-  | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
-# Acceptance scenarios with the daemon under test.
-m1_bin=$(cargo test --target $target -p testbed --test m1 --no-run --message-format=json \
-  | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "m1") | .executable')
 # The daemon's kernel tests (crates/fault-tolerant-router/tests/kernel_*.rs).
 kernel_tests="kernel_netlink kernel_probe kernel_handoff"
-rm -rf "$bindir"
-mkdir -p "$bindir"
-cp "$target_dir/$target/debug/ftr-testbed" "$bindir/"
-cp "$test_bin" "$bindir/netns"
-cp "$m1_bin" "$bindir/m1"
-cp "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
-for t in $kernel_tests; do
-  bin=$(cargo test --target $target -p fault-tolerant-router --test "$t" --no-run --message-format=json \
-    | jq -r --arg t "$t" 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $t) | .executable')
-  cp "$bin" "$bindir/$t"
-done
+cd "$repo"
+
+if [ -n "$prebuilt" ]; then
+  bindir=$(cd "$prebuilt" && pwd)
+else
+  # The daemon under test has the hooks of the acceptance scenarios
+  # (crates/fault-tolerant-router/src/test_hooks.rs).
+  cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router \
+    --features fault-tolerant-router/test-hooks
+  test_bin=$(cargo test --target $target -p testbed --test netns --no-run --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "netns") | .executable')
+  # Acceptance scenarios with the daemon under test.
+  m1_bin=$(cargo test --target $target -p testbed --test m1 --no-run --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "m1") | .executable')
+  rm -rf "$bindir"
+  mkdir -p "$bindir"
+  cp "$target_dir/$target/debug/ftr-testbed" "$bindir/"
+  cp "$test_bin" "$bindir/netns"
+  cp "$m1_bin" "$bindir/m1"
+  cp "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
+  for t in $kernel_tests; do
+    bin=$(cargo test --target $target -p fault-tolerant-router --test "$t" --no-run --message-format=json \
+      | jq -r --arg t "$t" 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $t) | .executable')
+    cp "$bin" "$bindir/$t"
+  done
+fi
+if [ "$mode" = build ]; then
+  echo "$bindir"
+  exit 0
+fi
 # The M1 scenarios run once per fwmark_mask (AS-43: offsets 16, 0 and 24);
-# FTR_TEST_MASKS narrows the list.
+# FTR_TEST_MASKS narrows the list; on the host, FTR_PARALLEL_MASKS=1 runs
+# them at the same time.
 masks=${FTR_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
 m1_in_vm=
 for mask in $masks; do
@@ -73,11 +88,34 @@ case $mode in
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
     $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
-    for mask in $masks; do
-      echo "== M1 scenarios with fwmark_mask $mask"
+    m1() { # m1 MASK TEST-ARGS...
+      m1_mask=$1
+      shift
       $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
-        FTR_TEST_FWMARK_MASK="$mask" "$bindir/m1" --ignored "$@"
-    done
+        FTR_TEST_FWMARK_MASK="$m1_mask" "$bindir/m1" --ignored "$@"
+    }
+    if [ "${FTR_PARALLEL_MASKS:-0}" = 1 ]; then
+      # The scenarios wait more than they compute: with enough cores, the
+      # masks can run at the same time, each in its own process.
+      out=$(mktemp -d)
+      for mask in $masks; do
+        m1 "$mask" "$@" > "$out/$mask" 2>&1 &
+        echo $! > "$out/$mask.pid"
+      done
+      failed=0
+      for mask in $masks; do
+        wait "$(cat "$out/$mask.pid")" || failed=1
+        echo "== M1 scenarios with fwmark_mask $mask"
+        cat "$out/$mask"
+      done
+      rm -rf "$out"
+      [ $failed = 0 ]
+    else
+      for mask in $masks; do
+        echo "== M1 scenarios with fwmark_mask $mask"
+        m1 "$mask" "$@"
+      done
+    fi
     ;;
   vm)
     rootfs=$(cd "$rootfs" && pwd)

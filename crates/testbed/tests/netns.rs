@@ -124,6 +124,25 @@ fn topology_comes_up_with_os_default_routes_and_tears_down() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
     let t = build();
+    // LAN traffic routed by an operating-system route. The harness's leak
+    // counter also sees the router's own packets (resets or ICMP errors for
+    // connections already closed), which these checks do not steer.
+    t.router().nft(&format!(
+        "table ip t_lan_leak {{\n  counter c {{}}\n  chain post {{\n    type filter hook postrouting priority 400; policy accept;\n    iifname \"lan\" meta rtclassid {} counter name c\n  }}\n}}\n",
+        plan::OS_ROUTE_REALM
+    ))?;
+    let lan_leaks = || -> Result<u64> {
+        let out = t
+            .router()
+            .run("nft", ["-j", "list", "counter", "ip", "t_lan_leak", "c"])?;
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        Ok(v["nftables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|o| o["counter"]["packets"].as_u64())
+            .unwrap_or(0))
+    };
     for u in t.uplinks() {
         steer_lan(&t, u)?;
         t.reset_counters()?;
@@ -148,7 +167,7 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
             );
             assert!(t.egress_packets(u, f)? >= 250, "{u} {f} egress counter");
         }
-        assert_eq!(t.ipv4_leaks()?, 0, "steering routes carry no OS realm");
+        assert_eq!(lan_leaks()?, 0, "steering routes carry no OS realm");
     }
 
     // One-way UDP flow, attributed from the server log.
