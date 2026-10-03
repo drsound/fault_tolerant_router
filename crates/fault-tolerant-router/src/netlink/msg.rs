@@ -107,6 +107,8 @@ pub struct ObservedRule {
     /// Selectors FTR never uses (destination, interfaces, ports, tos, uid,
     /// inverted match, l3mdev…).
     pub foreign_selectors: bool,
+    /// The kernel's VRF rule (`l3mdev`), not a collision (FR-ROUTE-6).
+    pub l3mdev: bool,
     pub message: RuleMessage,
 }
 
@@ -152,6 +154,7 @@ impl ObservedRule {
             source,
             action,
             foreign_selectors: foreign || l3mdev,
+            l3mdev,
             message: m.clone(),
         })
     }

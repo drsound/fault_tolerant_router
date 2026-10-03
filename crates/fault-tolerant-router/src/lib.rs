@@ -4,7 +4,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod checks;
+pub mod cleanup;
 pub mod config;
+pub mod daemon;
 pub mod discover;
 pub mod duration;
 pub mod health;
@@ -12,6 +15,7 @@ pub mod model;
 pub mod netlink;
 pub mod nft;
 pub mod nftctl;
+pub mod observer;
 pub mod plan;
 pub mod probe;
 pub mod reconcile;

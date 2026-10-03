@@ -32,6 +32,8 @@ serde_json.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "process", "signal", "io-util"] }
 toml.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 
 [lints]
 workspace = true
