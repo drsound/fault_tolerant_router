@@ -200,6 +200,14 @@ impl Ftr {
         })
     }
 
+    /// Waits until the daemon has exited (a refused startup).
+    pub fn wait_exit(&self, t: &Topology, timeout: Duration) -> Result<()> {
+        t.wait_for("the daemon to exit", timeout, || {
+            Ok(self.daemon.as_ref().is_none_or(Daemon::exited))
+        })
+        .map(|_| ())
+    }
+
     /// Waits for the first complete application of the desired state.
     pub fn wait_installed(&self, t: &Topology) -> Result<()> {
         self.wait_log(t, "applied", 1, Duration::from_secs(20)).map(|_| ())

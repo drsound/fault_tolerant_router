@@ -158,3 +158,395 @@ fn as45a_ipv4_only_leaves_ipv6_alone() -> Result<()> {
     assert_eq!(before, after, "IPv6 settings of {keys:?}");
     Ok(())
 }
+
+// ------------------------------------------------------------------ helpers
+
+fn wait_members(t: &Topology, expected: &[&str], timeout: Duration) -> Result<Duration> {
+    t.wait_for(&format!("balancing members {expected:?}"), timeout, || {
+        Ok(balancing_members(t)? == expected)
+    })
+}
+
+fn gateway(t: &Topology, u: Uplink) -> Result<String> {
+    Ok(t.os_default_route(u, Family::V4)?
+        .flatten()
+        .map(|g| g.to_string())
+        .unwrap_or_default())
+}
+
+fn address(t: &Topology, u: Uplink) -> Result<String> {
+    Ok(t.uplink_address(u, Family::V4)?
+        .map(|a| a.to_string())
+        .unwrap_or_default())
+}
+
+/// TCP destinations `ip:port` on test servers `first..first+count`.
+fn servers(first: u8, count: u8) -> Vec<String> {
+    (first..first + count)
+        .map(|n| format!("{}:{}", testbed::plan::server(Family::V4, n), testbed::plan::TCP_PORT))
+        .collect()
+}
+
+/// A counter in the router namespace (table `inet t_<name>`, postrouting
+/// priority 300) counting packets that match `selector`.
+fn counter(t: &Topology, name: &str, selector: &str) -> Result<()> {
+    t.router().nft(&format!(
+        "table inet t_{name} {{\n  counter c {{}}\n  chain post {{\n    type filter hook postrouting priority 300; policy accept;\n    {selector} counter name c\n  }}\n}}\n"
+    ))
+}
+
+fn counter_value(t: &Topology, name: &str) -> Result<u64> {
+    let out = t
+        .router()
+        .run("nft", ["-j", "list", "counter", "inet", &format!("t_{name}"), "c"])?;
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    Ok(v["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|o| o["counter"]["packets"].as_u64())
+        .unwrap_or(0))
+}
+
+// ---------------------------------------------------------------- scenarios
+
+/// AS-02: weights 3:1; the first uplink gets 70–80% of new connections.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as02_weights_three_to_one() -> Result<()> {
+    let t = build();
+    let ups = [UplinkSpec::new(Uplink::A, 1).weight(3), UplinkSpec::new(Uplink::B, 2)];
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    for run in 0..5 {
+        let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
+        let a = share(&r, Uplink::A);
+        assert!((0.70..=0.80).contains(&a), "run {run}: A got {a:.3} ({:?})", tally(&r));
+    }
+    Ok(())
+}
+
+/// AS-03: long-lived connections on A are never interrupted while B fails
+/// and recovers (INV-2).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as03_connections_on_a_survive_failure_and_recovery_of_b() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let flows: Vec<_> = (1..=8)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect::<Result<_>>()?;
+    std::thread::sleep(Duration::from_secs(1));
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, &["wana"], Duration::from_secs(3))?;
+    std::thread::sleep(Duration::from_secs(2));
+    t.carrier_up(Uplink::B)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(15))?;
+    std::thread::sleep(Duration::from_secs(1));
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    let on_a: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(Uplink::A)).collect();
+    assert!(!on_a.is_empty(), "no flow was hashed to A: {reports:?}");
+    for r in on_a {
+        assert!(
+            r.continuous(Duration::from_millis(1000)),
+            "flow on A interrupted: {r:?}"
+        );
+    }
+    Ok(())
+}
+
+/// AS-05: provider A disconnected upstream with the link up; A leaves the
+/// active set within (fall + 1) × interval + timeout × attempts = 17 s with
+/// the default health settings (FR-HEALTH-5), reason `probe_failed`.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as05_silent_upstream_failure_within_the_detection_bound() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::defaults(), "", ""))?;
+    f.wait_installed(&t)?;
+    // Past the cold start: the first rounds have completed.
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
+    let start = Instant::now();
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(25))?;
+    let took = start.elapsed();
+    assert!(took <= Duration::from_millis(17_500), "removed after {took:?}");
+    assert!(
+        f.log()
+            .contains("uplink=1 family=ipv4 from=Up to=Down reason=probe_failed"),
+        "{}",
+        f.log()
+    );
+    t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+/// AS-08: priority groups; group 2 takes over when all of group 1 fails and
+/// hands back after recovery.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as08_priority_groups_fail_over_and_back() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2),
+        UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(5))?;
+    t.upstream_down(Uplink::A)?;
+    t.upstream_down(Uplink::B)?;
+    wait_members(&t, &["ppp0"], Duration::from_secs(10))?;
+    let r = t.connect_many(Node::Client, Family::V4, 10, 50, false)?;
+    assert_eq!(tally(&r).get(&Some(Uplink::C)), Some(&50), "{:?}", tally(&r));
+    t.upstream_up(Uplink::A)?;
+    t.upstream_up(Uplink::B)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(15))?;
+    Ok(())
+}
+
+/// AS-13: every path fails its probes but stays ready; with
+/// `all_down_policy = "ready"` group 1 stays active, and recovers.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as13_all_probes_failing_keeps_the_best_group() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2),
+        UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(
+        &ups,
+        &HealthSpec::fast(),
+        "all_down_policy = \"ready\"",
+        "",
+    ))?;
+    f.wait_installed(&t)?;
+    for u in [Uplink::A, Uplink::B, Uplink::C] {
+        t.upstream_down(u)?;
+    }
+    f.wait_log(&t, "to=Down reason=probe_failed", 3, Duration::from_secs(15))?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        balancing_members(&t)?,
+        ["wana", "wanb"],
+        "group 1 candidates regardless of health"
+    );
+    for u in [Uplink::A, Uplink::B, Uplink::C] {
+        t.upstream_up(u)?;
+    }
+    f.wait_log(&t, "reason=probes_recovered", 3, Duration::from_secs(20))?;
+    assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
+    Ok(())
+}
+
+/// AS-20: an invalid configuration on reload keeps the running one.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as20_invalid_reload_keeps_the_running_configuration() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    f.write_config("version = 2\n[[bogus]]\n")?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
+    let r = t.connect_many(Node::Client, Family::V4, 10, 20, false)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    Ok(())
+}
+
+/// AS-24: mark bits outside `fwmark_mask` written by another table are
+/// preserved end to end (INV-7).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as24_foreign_mark_bits_are_preserved() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    t.router().nft(
+        "table inet admin {\n  chain pre {\n    type filter hook prerouting priority -300; policy accept;\n    iifname \"lan\" meta mark set meta mark | 0x00000001\n  }\n  chain ctmark {\n    type filter hook prerouting priority -190; policy accept;\n    iifname \"lan\" ct state new ct mark set ct mark | 0x01000000\n  }\n}\n",
+    )?;
+    counter(&t, "all", "oifname { \"wana\", \"wanb\" } ip daddr 198.18.100.0/24")?;
+    counter(
+        &t,
+        "kept",
+        "oifname { \"wana\", \"wanb\" } ip daddr 198.18.100.0/24 meta mark & 0xff00ffff == 0x00000001 meta mark & 0x00ff0000 != 0 ct mark & 0x01000000 == 0x01000000 ct mark & 0x00ff0000 != 0",
+    )?;
+    let r = t.connect_many(Node::Client, Family::V4, 20, 100, false)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    let (all, kept) = (counter_value(&t, "all")?, counter_value(&t, "kept")?);
+    assert!(all >= 300, "{all} packets");
+    assert_eq!(kept, all, "every packet keeps the foreign bits and carries its path");
+    Ok(())
+}
+
+/// AS-26: more-specific routes in main are followed (main bypass, INV-1).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as26_more_specific_main_routes_take_precedence() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let (gwa, gwb) = (gateway(&t, Uplink::A)?, gateway(&t, Uplink::B)?);
+    t.router()
+        .ip(&format!("route add 198.18.100.128/25 via {gwb} dev wanb"))?;
+    let r = t.connect_to(Node::Client, &servers(200, 50), 100, false, Duration::from_secs(2))?;
+    assert_eq!(
+        tally(&r).get(&Some(Uplink::B)),
+        Some(&100),
+        "static route via B: {:?}",
+        tally(&r)
+    );
+    let r = t.connect_to(Node::Client, &servers(1, 50), 200, false, Duration::from_secs(2))?;
+    let counts = tally(&r);
+    assert!(
+        counts.contains_key(&Some(Uplink::A)) && counts.contains_key(&Some(Uplink::B)),
+        "others balanced: {counts:?}"
+    );
+    // A VPN-style pair of /1 routes overrides FTR for everything (by design).
+    t.router().ip(&format!("route add 0.0.0.0/1 via {gwa} dev wana"))?;
+    t.router().ip(&format!("route add 128.0.0.0/1 via {gwa} dev wana"))?;
+    let r = t.connect_to(Node::Client, &servers(1, 50), 100, false, Duration::from_secs(2))?;
+    assert_eq!(
+        tally(&r).get(&Some(Uplink::A)),
+        Some(&100),
+        "/1 routes via A: {:?}",
+        tally(&r)
+    );
+    Ok(())
+}
+
+/// AS-29: probes of a path outside the active set, and of a target covered
+/// by a main route through another uplink, leave through the path (INV-6).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as29_probes_leave_through_their_path() -> Result<()> {
+    let t = build();
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1).priority(None),
+        UplinkSpec::new(Uplink::B, 2),
+    ];
+    let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert_eq!(balancing_members(&t)?, ["wanb"]);
+    let (gwb, a) = (gateway(&t, Uplink::B)?, address(&t, Uplink::A)?);
+    t.router().ip(&format!("route add 1.1.1.1/32 via {gwb} dev wanb"))?;
+    counter(&t, "wrong", &format!("oifname != \"wana\" ip saddr {a}"))?;
+    counter(&t, "probes", "oifname \"wana\" ip daddr 1.1.1.1 icmp type echo-request")?;
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(counter_value(&t, "probes")? >= 3, "probes to 1.1.1.1 leave through A");
+    assert_eq!(
+        counter_value(&t, "wrong")?,
+        0,
+        "nothing with A's address leaves elsewhere"
+    );
+    assert!(
+        !f.log().contains("uplink=1 family=ipv4 from=Up to=Down"),
+        "A stays healthy:\n{}",
+        f.log()
+    );
+    Ok(())
+}
+
+/// AS-33: startup refused with a colliding foreign rule and with flowtables
+/// on an uplink or a downlink; a flowtable created at runtime degrades the
+/// status until removed; a reload whose proposed configuration matches a
+/// flowtable is refused without degrading the running one (FR-CT-2).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as33_collisions_and_flowtables() -> Result<()> {
+    let t = build();
+    let only_a = ftr::ipv4_config(
+        &[UplinkSpec::new(Uplink::A, 1)],
+        &HealthSpec::fast(),
+        "reconcile_interval = \"10s\"",
+        "",
+    );
+    let refused = |setup: &str, undo: &str, needle: &str| -> Result<()> {
+        t.router().run("sh", ["-c", setup])?;
+        let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+        f.wait_exit(&t, Duration::from_secs(10))?;
+        assert!(f.log().contains(needle), "expected {needle:?} in:\n{}", f.log());
+        drop(f);
+        t.router().run("sh", ["-c", undo])?;
+        Ok(())
+    };
+    refused(
+        "ip rule add pref 1650 lookup 5",
+        "ip rule del pref 1650",
+        "collides with FTR",
+    )?;
+    let ft = |devs: &str| {
+        format!(
+            r"nft add table inet ft && nft add flowtable inet ft f {{ hook ingress priority 0 \; devices = {{ {devs} }} \; }}"
+        )
+    };
+    refused(&ft("wana"), "nft delete table inet ft", "matches the uplink wana")?;
+    refused(&ft("lan"), "nft delete table inet ft", "matches the downlink lan")?;
+
+    // Runtime detection and recovery.
+    let mut f = t.start_ftr(&only_a)?;
+    f.wait_installed(&t)?;
+    t.router().run("sh", ["-c", &ft("wana")])?;
+    f.wait_log(&t, "status_degraded", 1, Duration::from_secs(15))?;
+    assert!(f.log().contains("flowtable inet ft f"), "{}", f.log());
+    t.router().run("sh", ["-c", "nft delete table inet ft"])?;
+    f.wait_log(&t, "status_recovered", 1, Duration::from_secs(15))?;
+    // A flowtable on wanb matches only the proposed configuration.
+    t.router().run("sh", ["-c", &ft("wanb")])?;
+    f.write_config(&ftr::ipv4_config(
+        &ab(),
+        &HealthSpec::fast(),
+        "reconcile_interval = \"10s\"",
+        "",
+    ))?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert_eq!(
+        f.log().matches("status_degraded").count(),
+        1,
+        "the running configuration is not degraded"
+    );
+    assert_eq!(balancing_members(&t)?, ["wana"]);
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-40: a foreign rule below `rule_priority_base` is listed in a warning;
+/// a missing local rule refuses startup (FR-ROUTE-6).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as40_foreign_earlier_rule_and_missing_local_rule() -> Result<()> {
+    let t = build();
+    t.router().ip("rule add pref 500 lookup 5")?;
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    assert!(
+        f.log().contains("the rule at priority 500 precedes FTR's rules"),
+        "{}",
+        f.log()
+    );
+    drop(f);
+    t.router().ip("rule del pref 500")?;
+    t.router().ip("rule del pref 0")?;
+    let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    assert!(
+        f.log().contains("local-table rule at priority 0 is missing"),
+        "{}",
+        f.log()
+    );
+    t.router().ip("rule add pref 0 lookup local")?;
+    Ok(())
+}
