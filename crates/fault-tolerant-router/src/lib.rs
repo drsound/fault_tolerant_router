@@ -12,5 +12,6 @@ pub mod model;
 pub mod netlink;
 pub mod nft;
 pub mod plan;
+pub mod probe;
 pub mod select;
 pub mod system;

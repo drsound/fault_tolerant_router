@@ -15,6 +15,7 @@ use ipnet::IpNet;
 use crate::model::{Family, FwMask, UplinkId};
 
 pub use raw::{AllDownPolicy, Fallback, FirewallMode, Nat, OnShutdown, Protocol, Security};
+pub use validate::parse_target;
 
 /// Default location of the configuration file (FR-CFG-1).
 pub const DEFAULT_PATH: &str = "/etc/fault-tolerant-router/config.toml";
