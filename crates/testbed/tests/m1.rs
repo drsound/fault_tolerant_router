@@ -3,10 +3,10 @@
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use testbed::ftr::{self, HealthSpec, UplinkSpec};
 use testbed::plan::{Family, Node, Uplink};
 use testbed::traffic::tally;
@@ -383,23 +383,37 @@ fn as24_foreign_mark_bits_are_preserved() -> Result<()> {
             c = ftr::foreign_bit(8)
         ),
     )?;
-    counter(&t, "all", "oifname { \"wana\", \"wanb\" } ip daddr 198.18.100.0/24")?;
-    counter(
-        &t,
-        "kept",
-        &format!(
-            "oifname {{ \"wana\", \"wanb\" }} ip daddr 198.18.100.0/24 meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} != 0 ct mark & {c:#010x} == {c:#010x} ct mark & {m:#010x} != 0",
-            nm = !ftr::mask(),
-            m = ftr::mask(),
-            p = ftr::foreign_bit(0),
-            c = ftr::foreign_bit(8)
-        ),
-    )?;
+    // Packets to the test servers: with the foreign bits and a path in
+    // both marks; or invalid ones, which FTR leaves alone (§4.7): foreign
+    // bit kept, no path. Nothing else.
+    let (nm, m) = (!ftr::mask(), ftr::mask());
+    let (p, c) = (ftr::foreign_bit(0), ftr::foreign_bit(8));
+    t.router().nft(&format!(
+        "table inet t_as24 {{\n  counter total {{}}\n  counter kept {{}}\n  counter skipped {{}}\n  counter other {{}}\n  chain post {{\n    type filter hook postrouting priority 300; policy accept;\n    oifname {{ \"wana\", \"wanb\" }} ip daddr 198.18.100.0/24 jump count\n  }}\n  chain count {{\n    counter name total\n    meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} != 0 ct mark & {c:#010x} == {c:#010x} ct mark & {m:#010x} != 0 counter name kept return\n    ct state invalid meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} == 0 counter name skipped return\n    counter name other\n  }}\n}}\n"
+    ))?;
     let r = t.connect_many(Node::Client, Family::V4, 20, 100, false)?;
     assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
-    let (all, kept) = (counter_value(&t, "all")?, counter_value(&t, "kept")?);
-    assert!(all >= 300, "{all} packets");
-    assert_eq!(kept, all, "every packet keeps the foreign bits and carries its path");
+    std::thread::sleep(Duration::from_millis(500));
+    let value = |name: &str| -> Result<u64> {
+        let out = t
+            .router()
+            .run("nft", ["-j", "list", "counter", "inet", "t_as24", name])?;
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        Ok(v["nftables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|o| o["counter"]["packets"].as_u64())
+            .unwrap_or(0))
+    };
+    let table = t.router().run("nft", ["list", "table", "inet", "t_as24"])?;
+    let (kept, skipped, other) = (value("kept")?, value("skipped")?, value("other")?);
+    assert!(kept >= 300, "{table}");
+    assert_eq!(
+        other, 0,
+        "every packet keeps the foreign bits and carries its path:\n{table}"
+    );
+    assert!(skipped * 100 <= kept, "invalid packets are rare:\n{table}");
     Ok(())
 }
 
@@ -496,10 +510,17 @@ fn as33_collisions_and_flowtables() -> Result<()> {
     );
     let refused = |setup: &str, undo: &str, needle: &str| -> Result<()> {
         t.router().run("sh", ["-c", setup])?;
-        let f = t.start_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+        let before = foreign_objects(&t)?;
+        let f = t.prepare_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+        let check = f.cli(&["check-config", "--config", &f.config.display().to_string()])?;
+        let text = String::from_utf8_lossy(&check.stderr).into_owned() + &String::from_utf8_lossy(&check.stdout);
+        assert!(!check.status.success() && text.contains(needle), "check-config: {text}");
+        let mut f = f;
+        f.start(&t)?;
         f.wait_exit(&t, Duration::from_secs(10))?;
         assert!(f.log().contains(needle), "expected {needle:?} in:\n{}", f.log());
         drop(f);
+        assert_eq!(foreign_objects(&t)?, before, "foreign objects unchanged");
         t.router().run("sh", ["-c", undo])?;
         Ok(())
     };
@@ -508,11 +529,7 @@ fn as33_collisions_and_flowtables() -> Result<()> {
         "ip rule del pref 1650",
         "collides with FTR",
     )?;
-    let ft = |devs: &str| {
-        format!(
-            r"nft add table inet ft && nft add flowtable inet ft f {{ hook ingress priority 0 \; devices = {{ {devs} }} \; }}"
-        )
-    };
+    let ft = |devs: &str| flowtable("ft", devs);
     refused(&ft("wana"), "nft delete table inet ft", "matches the uplink wana")?;
     refused(&ft("lan"), "nft delete table inet ft", "matches the downlink lan")?;
 
@@ -540,6 +557,231 @@ fn as33_collisions_and_flowtables() -> Result<()> {
         "the running configuration is not degraded"
     );
     assert_eq!(balancing_members(&t)?, ["wana"]);
+    f.stop()?;
+    Ok(())
+}
+
+/// A shell command creating table `inet <table>` with flowtable `f` on `devs`.
+fn flowtable(table: &str, devs: &str) -> String {
+    format!(
+        r"nft add table inet {table} && nft add flowtable inet {table} f {{ hook ingress priority 0 \; devices = {{ {devs} }} \; }}"
+    )
+}
+
+/// The router's rules and its nftables ruleset without FTR's table and the
+/// harness's counters, for checks that foreign objects stay unchanged.
+fn foreign_objects(t: &Topology) -> Result<String> {
+    let rules = t.router().run("ip", ["-4", "rule", "show"])?;
+    let rules: Vec<&str> = rules.lines().filter(|l| !l.contains("proto 249")).collect();
+    let nft = t.router().run("nft", ["list", "ruleset"])?;
+    let mut tables = String::new();
+    let mut keep = false;
+    for l in nft.lines() {
+        if l.starts_with("table ") {
+            keep = !l.contains("fault_tolerant_router") && !l.contains(" tb_");
+        }
+        if keep {
+            tables.push_str(l);
+            tables.push('\n');
+        }
+    }
+    Ok(format!("{}\n{tables}", rules.join("\n")))
+}
+
+/// A directory removed when the value is dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// AS-33, systemd-networkd (FR-COEX-1): a networkd in the router's namespace
+/// with foreign-rule or foreign-route management enabled (both default to
+/// yes) makes online `check-config` fail and startup be refused, naming each
+/// setting; a networkd in another namespace is not considered; a drop-in
+/// disabling both lets FTR start. The networkd process is a stand-in with its
+/// name, and the configuration is the router namespace's `/etc/systemd`
+/// (`ip netns exec` mounts it): the check is by process and configuration.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as33_networkd_foreign_management() -> Result<()> {
+    let t = build();
+    let fake = t.dir().join("systemd-networkd");
+    std::fs::copy("/bin/sleep", &fake)?;
+    let fake = fake.display().to_string();
+    let dropins = t.netns_etc(Node::Router).join("systemd/networkd.conf.d");
+    std::fs::create_dir_all(&dropins)?;
+    let mut f = t.prepare_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    let config = f.config.display().to_string();
+    let check = |f: &ftr::Ftr| -> Result<(bool, String)> {
+        let out = f.cli(&["check-config", "--config", &config])?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+        Ok((out.status.success(), text))
+    };
+    let enabled = |key: &str| format!("systemd-networkd is active with {key} enabled");
+
+    // A networkd in another namespace manages other interfaces.
+    let mut other = t
+        .client()
+        .spawn(&fake, ["infinity"], &t.dir().join("networkd-client.log"))?;
+    let (ok, text) = check(&f)?;
+    assert!(ok, "{text}");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    f.stop()?;
+    other.kill()?;
+    other.wait()?;
+
+    let mut networkd = t
+        .router()
+        .spawn(&fake, ["infinity"], &t.dir().join("networkd-router.log"))?;
+    // Defaults: both enabled.
+    let (ok, text) = check(&f)?;
+    assert!(!ok, "{text}");
+    for key in ["ManageForeignRoutingPolicyRules", "ManageForeignRoutes"] {
+        assert!(text.contains(&enabled(key)), "{key}: {text}");
+    }
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    for key in ["ManageForeignRoutingPolicyRules", "ManageForeignRoutes"] {
+        assert!(f.log().contains(&enabled(key)), "{key}: {}", f.log());
+    }
+    // Rules disabled, routes still enabled.
+    std::fs::write(
+        dropins.join("50-ftr.conf"),
+        "[Network]\nManageForeignRoutingPolicyRules=no\n",
+    )?;
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    assert!(f.log().contains(&enabled("ManageForeignRoutes")), "{}", f.log());
+    assert!(
+        !f.log().contains(&enabled("ManageForeignRoutingPolicyRules")),
+        "{}",
+        f.log()
+    );
+    // Both disabled.
+    std::fs::write(
+        dropins.join("50-ftr.conf"),
+        "[Network]\nManageForeignRoutingPolicyRules=no\nManageForeignRoutes=no\n",
+    )?;
+    let (ok, text) = check(&f)?;
+    assert!(ok, "{text}");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    f.stop()?;
+    networkd.kill()?;
+    networkd.wait()?;
+    Ok(())
+}
+
+/// AS-33, during active operation and in external firewall mode (FR-CT-2):
+/// an unrelated flowtable alone refuses nothing; a matching flowtable with
+/// several devices degrades the status, and a failed inspection keeps
+/// `flow_offload` after the flowtable is gone, until an inspection succeeds;
+/// in external mode a matching flowtable refuses startup and `check-config`,
+/// and while `external_ruleset_missing` remains, clearing `flow_offload`
+/// emits no `status_recovered`.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
+    let t = build();
+    let r = t.router();
+    r.ip("link add ftx type dummy")?;
+    r.ip("link set ftx up")?;
+    r.sh(&flowtable("unrelated", "ftx"))?;
+    let only_a = |extra: &str| {
+        ftr::ipv4_config(
+            &[UplinkSpec::new(Uplink::A, 1)],
+            &HealthSpec::fast(),
+            "reconcile_interval = \"10s\"",
+            extra,
+        )
+    };
+    let mut f = t.prepare_ftr(&only_a(""))?;
+    // An nft wrapper whose ruleset listings fail while a flag file exists.
+    // `firewall.nft_path` must be owned by root and not writable by others
+    // up to `/` (FR-CFG-5), and `/run` may be mounted `noexec`.
+    let nft = r.sh("command -v nft")?.trim().to_owned();
+    let flag = f.dir.join("fail-inspection");
+    let bin = RemoveOnDrop(PathBuf::from("/var/lib/ftr-tests").join(t.run_id()));
+    std::fs::create_dir_all(&bin.0)?;
+    for d in [Path::new("/var/lib/ftr-tests"), bin.0.as_path()] {
+        std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    }
+    let wrapper = bin.0.join("nft");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in *\" list ruleset \"*) echo 'injected inspection failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
+            flag = flag.display()
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let managed = only_a(&format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display()));
+    f.write_config(&managed)?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!f.log().contains("status_degraded"), "{}", f.log());
+
+    // A matching flowtable with several devices, then a failed inspection.
+    r.sh(&flowtable("ftm", "ftx, wana"))?;
+    f.wait_log(&t, "status_degraded", 1, Duration::from_secs(15))?;
+    assert!(f.log().contains("flowtable inet ftm f"), "{}", f.log());
+    std::fs::write(&flag, "")?;
+    r.sh("nft delete table inet ftm")?;
+    f.wait_log(&t, "flowtable inspection failed", 2, Duration::from_secs(25))?;
+    assert!(
+        !f.log().contains("status_recovered"),
+        "a failed inspection keeps flow_offload"
+    );
+    std::fs::remove_file(&flag)?;
+    f.wait_log(&t, "status_recovered", 1, Duration::from_secs(15))?;
+    f.stop()?;
+    r.run("nft", ["list", "table", "inet", "unrelated"])?;
+    let out = f.cli(&["cleanup", "--config", &f.config.display().to_string()])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // External mode: a matching flowtable refuses startup and check-config.
+    let external = only_a("[firewall]\nmode = \"external\"\n");
+    f.write_config(&external)?;
+    r.sh(&flowtable("ftm", "lan"))?;
+    let out = f.cli(&["check-config", "--config", &f.config.display().to_string()])?;
+    let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success() && text.contains("matches the downlink lan"),
+        "{text}"
+    );
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    assert!(f.log().contains("matches the downlink lan"), "{}", f.log());
+    r.sh("nft delete table inet ftm")?;
+
+    // External mode without the administrator's ruleset, then a flowtable:
+    // two reasons. A reload inspects at once (and is refused while the
+    // flowtable matches).
+    f.start(&t)?;
+    f.wait_log(&t, "status_degraded", 1, Duration::from_secs(15))?;
+    assert!(f.log().contains("external_ruleset_missing"), "{}", f.log());
+    r.sh(&flowtable("ftm", "wana"))?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert!(f.log().contains("flowtable inet ftm f"), "{}", f.log());
+    r.sh("nft delete table inet ftm")?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !f.log().contains("status_recovered"),
+        "external_ruleset_missing remains: {}",
+        f.log()
+    );
+    let out = f.cli(&["export-nft", "--config", &f.config.display().to_string()])?;
+    r.nft(&String::from_utf8_lossy(&out.stdout))?;
+    f.wait_log(&t, "status_recovered", 1, Duration::from_secs(15))?;
+    assert_eq!(f.log().matches("status_degraded").count(), 1, "{}", f.log());
     f.stop()?;
     Ok(())
 }
@@ -1801,5 +2043,479 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
         assert_eq!(&address(&t, u)?, a, "{u} kept its lease");
     }
     assert_eq!(balancing_members(&t)?, ["ppp0", "wana", "wanb"]);
+    Ok(())
+}
+
+/// The daemon's failure-injection control file (`FTR_TEST_FAULTS`, a test
+/// hook of the `test-hooks` build): armed with n, the next n steps of the
+/// reconciler or of cleanup succeed and the following ones fail until it is
+/// disarmed; the steps are listed in `<file>.steps`.
+struct Faults {
+    path: PathBuf,
+}
+
+impl Faults {
+    fn new(f: &mut ftr::Ftr) -> Faults {
+        let path = f.dir.join("faults");
+        f.set_env("FTR_TEST_FAULTS", &path.display().to_string());
+        Faults { path }
+    }
+
+    fn steps_path(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".steps");
+        PathBuf::from(p)
+    }
+
+    fn arm(&self, n: usize) -> Result<()> {
+        let _ = std::fs::remove_file(self.steps_path());
+        std::fs::write(&self.path, n.to_string())?;
+        Ok(())
+    }
+
+    fn disarm(&self) -> Result<()> {
+        let _ = std::fs::remove_file(&self.path);
+        Ok(())
+    }
+
+    fn steps(&self) -> Vec<String> {
+        std::fs::read_to_string(self.steps_path())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn injected(&self) -> bool {
+        self.steps().iter().any(|l| l.ends_with(" failed"))
+    }
+}
+
+/// Counts, in table `inet t_wrong`, packets of connections assigned to a
+/// path that leave through another uplink (INV-2, INV-5).
+fn wrong_uplink_counter(t: &Topology) -> Result<()> {
+    let mut rules = String::new();
+    for (u, id) in [(Uplink::A, 1), (Uplink::B, 2), (Uplink::C, 3)] {
+        let others: Vec<String> = Uplink::ALL
+            .into_iter()
+            .filter(|o| *o != u)
+            .map(|o| format!("\"{}\"", o.l3_iface()))
+            .collect();
+        rules += &format!(
+            "    ct mark & {:#x} == {:#x} oifname {{ {} }} counter name c\n",
+            ftr::mask(),
+            ftr::encode(id),
+            others.join(", ")
+        );
+    }
+    t.router().nft(&format!(
+        "table inet t_wrong {{\n  counter c {{}}\n  chain post {{\n    type filter hook postrouting priority 300; policy accept;\n{rules}  }}\n}}\n"
+    ))
+}
+
+/// State for an AS-27 failure message.
+fn diagnose(t: &Topology, f: &ftr::Ftr, faults: &Faults, k: usize) -> String {
+    let log = f.log();
+    let tail: Vec<&str> = log.lines().rev().take(40).collect();
+    format!(
+        "after {k} steps\nsteps: {:#?}\nmembers: {:?}\nC's path route: {:?}\nrules:\n{}\ndaemon log (tail):\n{}",
+        faults.steps(),
+        balancing_members(t),
+        path_route(t, 1003),
+        ftr_rules(t).map(|r| r.join("\n")).unwrap_or_default(),
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    )
+}
+
+/// A change of AS-27: an uplink order of FR-REC-3 or a runtime update.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    /// Reload removing C.
+    RemoveC,
+    /// Reload adding C back.
+    AddC,
+    /// A leaves the active set (its provider stops forwarding).
+    AOut,
+    /// A secondary address on C: a new source rule and guard.
+    AddressOnC,
+    /// C's PPP session reconnects: a new interface, whose sysctls, path
+    /// route and source rules are applied again.
+    ReconnectC,
+}
+
+/// AS-27: a failure injected after each step of the uplink addition and
+/// removal orders (FR-REC-3) and of runtime updates (an active-set change,
+/// a new source address, a recreated interface), with continuous traffic: pinned client
+/// connections, a router-originated connection, an inbound connection. While
+/// the failed generation is held and after its retry, no packet is routed by
+/// an operating-system route (INV-3) and no packet of a pinned or inbound
+/// connection leaves through another uplink; connections on B, which no
+/// change touches, are uninterrupted.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_failure_after_each_step() -> Result<()> {
+    let t = build();
+    let health = HealthSpec::fast();
+    // A path whose route failed is not ready until a discovery change or the
+    // next full reconciliation (FR-DISC-7).
+    let routing = "reconcile_interval = \"10s\"";
+    let with_c = ftr::ipv4_config(&abc(), &health, routing, "");
+    let without_c = ftr::ipv4_config(&ab(), &health, routing, "");
+    let mut f = t.prepare_ftr(&with_c)?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let all = ["ppp0", "wana", "wanb"];
+    wait_members(&t, &all, Duration::from_secs(15))?;
+    wrong_uplink_counter(&t)?;
+
+    // Continuous traffic.
+    let _server = serve_in(&t, Node::Client)?;
+    let a = address(&t, Uplink::A)?;
+    t.router().nft(&format!(
+        "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" ip daddr {a} tcp dport {} dnat to {}\n  }}\n}}\n",
+        testbed::plan::TCP_PORT,
+        testbed::plan::LAN_CLIENT_V4
+    ))?;
+    let mut flows = Vec::new();
+    for n in 60..69 {
+        flows.push(t.start_flow(
+            Node::Client,
+            testbed::plan::server(Family::V4, n),
+            Duration::from_millis(50),
+        )?);
+    }
+    flows.push(t.start_flow(
+        Node::Router,
+        testbed::plan::server(Family::V4, 70),
+        Duration::from_millis(50),
+    )?);
+    flows.push(t.start_flow(Node::Inet, a.parse()?, Duration::from_millis(50))?);
+    std::thread::sleep(Duration::from_secs(1));
+    t.reset_counters()?;
+
+    let reload = |config: &str| -> Result<()> {
+        f.write_config(config)?;
+        f.reload()
+    };
+    let c_gone = || -> Result<bool> {
+        Ok(path_route(&t, 1003)?.is_empty() && !ftr_rules(&t)?.iter().any(|r| r.contains("lookup 1003")))
+    };
+    let has_source = || -> Result<bool> { Ok(ftr_rules(&t)?.iter().any(|r| r.contains("from 203.0.113.77"))) };
+    let timeout = Duration::from_secs(20);
+    let ppp_index = || -> Option<u64> {
+        t.router()
+            .ip_json("link show dev ppp0")
+            .ok()
+            .and_then(|v| v[0]["ifindex"].as_u64())
+    };
+    let ppp_ready = |before: Option<u64>| -> Result<bool> {
+        let now = ppp_index();
+        Ok(now.is_some()
+            && now != before
+            && t.router()
+                .output("cat", ["/proc/sys/net/ipv4/conf/ppp0/src_valid_mark"])?
+                .stdout
+                .starts_with(b"1")
+            && path_route(&t, 1003)?.contains("dev ppp0")
+            && balancing_members(&t)? == all)
+    };
+    for change in [
+        Change::RemoveC,
+        Change::AddC,
+        Change::AOut,
+        Change::AddressOnC,
+        Change::ReconnectC,
+    ] {
+        for k in 0.. {
+            if let Change::AddC = change {
+                reload(&without_c)?;
+                t.wait_for("C removed", timeout, &c_gone)?;
+            }
+            let recovered = f.log().matches("desired state fully applied").count();
+            let index = ppp_index();
+            faults.arm(k)?;
+            match change {
+                Change::RemoveC => reload(&without_c)?,
+                Change::AddC => reload(&with_c)?,
+                Change::AOut => t.upstream_down(Uplink::A)?,
+                Change::AddressOnC => {
+                    t.router().ip("addr add 203.0.113.77/32 dev ppp0")?;
+                }
+                Change::ReconnectC => t.pppoe_reset()?,
+            }
+            let done = || -> Result<bool> {
+                match change {
+                    Change::RemoveC => c_gone(),
+                    Change::AddC => Ok(balancing_members(&t)? == all),
+                    Change::AOut => Ok(balancing_members(&t)? == ["ppp0", "wanb"]),
+                    Change::AddressOnC => has_source(),
+                    Change::ReconnectC => ppp_ready(index),
+                }
+            };
+            let timeout = if let Change::ReconnectC = change {
+                Duration::from_secs(40)
+            } else {
+                timeout
+            };
+            t.wait_for(
+                &format!("{change:?} applied or failed after {k} steps"),
+                timeout,
+                || Ok(faults.injected() || done()?),
+            )
+            .with_context(|| diagnose(&t, &f, &faults, k))?;
+            let injected = faults.injected();
+            if injected {
+                // Hold the partial generation under new connections (with A
+                // out but still in the unchanged active set, some time out).
+                t.connect_many(Node::Client, Family::V4, 20, 40, false)?;
+                assert_eq!(t.ipv4_leaks()?, 0, "INV-3, {change:?} after {k} steps");
+                assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2, {change:?} after {k} steps");
+                faults.disarm()?;
+                f.wait_log(
+                    &t,
+                    "desired state fully applied",
+                    recovered + 1,
+                    Duration::from_secs(70),
+                )?;
+                t.wait_for(
+                    &format!("{change:?} applied after the retry"),
+                    Duration::from_secs(30),
+                    &done,
+                )
+                .with_context(|| diagnose(&t, &f, &faults, k))?;
+            }
+            faults.disarm()?;
+            assert_eq!(t.ipv4_leaks()?, 0, "INV-3, {change:?} after {k} steps");
+            assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2, {change:?} after {k} steps");
+            // Back to the base state.
+            match change {
+                Change::RemoveC => reload(&with_c)?,
+                Change::AddC => {}
+                Change::AOut => t.upstream_up(Uplink::A)?,
+                Change::AddressOnC => {
+                    t.router().ip("addr del 203.0.113.77/32 dev ppp0")?;
+                    t.wait_for("the source rule removed", timeout, || Ok(!has_source()?))?;
+                }
+                Change::ReconnectC => {}
+            }
+            wait_members(&t, &all, timeout)?;
+            if !injected {
+                eprintln!("{change:?}: {k} steps");
+                break;
+            }
+        }
+    }
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
+        assert!(r.continuous(Duration::from_secs(1)), "flow on B interrupted: {r:?}");
+    }
+    assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2");
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, cleanup step by step: a failure injected after each step of
+/// `cleanup` leaves the artifacts not yet removed in place, a second
+/// `cleanup` completes, and foreign objects are untouched; the steps follow
+/// FR-REC-4: nftables table, final guard, lookup rules by increasing
+/// precedence (each source guard before its source rule), class guards,
+/// routes, sysctls, state files and manifest.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_cleanup_step_by_step() -> Result<()> {
+    let t = build();
+    t.router().ip("rule add pref 950 lookup 5")?;
+    t.router().sh(&flowtable("unrelated", "lo"))?;
+    let foreign = foreign_objects(&t)?;
+    let config = ftr::ipv4_config(&abc(), &HealthSpec::fast(), "", "");
+    let mut f = t.prepare_ftr(&config)?;
+    let faults = Faults::new(&mut f);
+    let path = f.config.display().to_string();
+    let mut order = Vec::new();
+    for k in 0.. {
+        f.start(&t)?;
+        f.wait_installed(&t)?;
+        f.stop()?;
+        let installed = ftr_rules(&t)?.len();
+        faults.arm(k)?;
+        let out = f.cli(&["cleanup", "--config", &path])?;
+        let steps = faults.steps();
+        faults.disarm()?;
+        if out.status.success() {
+            assert!(!steps.iter().any(|s| s.ends_with(" failed")), "{steps:?}");
+            order = steps;
+            assert!(ftr_rules(&t)?.is_empty());
+            break;
+        }
+        assert_eq!(steps.len(), k + 1, "{steps:?}");
+        let removed = steps.iter().filter(|s| s.starts_with("delete ipv4 rule")).count();
+        let removed = removed - usize::from(steps[k].starts_with("delete ipv4 rule"));
+        assert_eq!(ftr_rules(&t)?.len(), installed - removed, "after {k} steps: {steps:?}");
+        let nft_gone = k > 0;
+        assert_eq!(
+            t.router()
+                .output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
+                .status
+                .success(),
+            !nft_gone,
+            "the nftables table goes first"
+        );
+        let out = f.cli(&["cleanup", "--config", &path])?;
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(ftr_rules(&t)?.is_empty(), "a second cleanup completes");
+        assert_eq!(foreign_objects(&t)?, foreign, "foreign objects untouched");
+    }
+    assert_eq!(foreign_objects(&t)?, foreign, "foreign objects untouched");
+    // FR-REC-4 order. Rule offsets from rule_priority_base (1000): final
+    // guard 699, balancing 600, source rules 501-563 each preceded by its
+    // source guard 564 (source rules match disjoint addresses, so their
+    // relative order is free), policy 3xx-4xx, path 2xx, main bypass 100,
+    // probe 1-63, class guards 64, 264, 464.
+    let stage = |s: &str| -> u8 {
+        match s
+            .strip_prefix("delete ipv4 rule ")
+            .map(|p| p.parse::<u32>().unwrap_or(0) - 1000)
+        {
+            Some(64 | 264 | 464) => 2,
+            Some(_) => 1,
+            None if s == "remove the nftables table" => 0,
+            None if s.starts_with("delete ipv4 route") => 3,
+            None if s == "restore sysctls" => 4,
+            None => 5,
+        }
+    };
+    let stages: Vec<u8> = order.iter().map(|s| stage(s)).collect();
+    assert!(stages.windows(2).all(|w| w[0] <= w[1]), "{order:#?}");
+    assert_eq!(stages.first(), Some(&0), "{order:#?}");
+    let offsets: Vec<u32> = order
+        .iter()
+        .filter_map(|s| s.strip_prefix("delete ipv4 rule "))
+        .map(|p| p.parse::<u32>().unwrap_or(0) - 1000)
+        .filter(|o| ![64, 264, 464].contains(o))
+        .collect();
+    assert_eq!(offsets.first(), Some(&699), "{order:#?}");
+    for (i, o) in offsets.iter().enumerate() {
+        if *o == 564 {
+            assert!(
+                offsets.get(i + 1).is_some_and(|n| (501..=563).contains(n)),
+                "a source guard right before its source rule: {order:#?}"
+            );
+        }
+    }
+    let levels: Vec<u32> = offsets
+        .iter()
+        .map(|o| if (501..=564).contains(o) { 501 } else { *o })
+        .collect();
+    assert!(
+        levels.windows(2).all(|w| w[0] >= w[1]),
+        "lookup rules by increasing precedence: {order:#?}"
+    );
+    assert_eq!(
+        order.last().map(String::as_str),
+        Some("remove the state files and the manifest")
+    );
+    Ok(())
+}
+
+/// AS-36 (IPv4): active-set updates under a continuous stream of new
+/// connections, each first rejected by an injected failure before any
+/// mutation. A's probes fail while A still forwards: until the retry new
+/// connections keep using the previous set {A, B}, after it only B; then A
+/// recovers and, after the rejected update is retried, rejoins. No new
+/// connection of the stream fails, pinned connections are uninterrupted and
+/// the status is degraded until the update is complete. (With one IPv4
+/// balancing route per update and no policies in M1, an update has no
+/// partial state; the IPv6 failure after the first insertion is M2.)
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as36_active_set_updates_under_new_connections() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", ""))?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    t.reset_counters()?;
+    let flows: Vec<_> = (80..86)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect::<Result<_>>()?;
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| -> Result<()> {
+        let stream = s.spawn(|| -> Result<Vec<testbed::ConnResult>> {
+            let mut all = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                all.extend(t.connect_many(Node::Client, Family::V4, 20, 20, false)?);
+            }
+            Ok(all)
+        });
+        let result = (|| -> Result<()> {
+            let phase = |expected: &[Uplink], what: &str| -> Result<()> {
+                let r = t.connect_many(Node::Client, Family::V4, 30, 60, false)?;
+                let used: std::collections::BTreeSet<Option<Uplink>> = r.iter().map(|c| c.uplink()).collect();
+                let expected: std::collections::BTreeSet<Option<Uplink>> = expected.iter().copied().map(Some).collect();
+                assert_eq!(used, expected, "{what}: {:?}", tally(&r));
+                Ok(())
+            };
+            for (change, before, after) in [
+                ("A out", vec![Uplink::A, Uplink::B], vec![Uplink::B]),
+                ("A back", vec![Uplink::B], vec![Uplink::A, Uplink::B]),
+            ] {
+                let recovered = f.log().matches("desired state fully applied").count();
+                faults.arm(0)?;
+                if change == "A out" {
+                    t.drop_probe_echoes(Uplink::A, 1)?;
+                } else {
+                    t.clear_provider_rules(Uplink::A)?;
+                }
+                t.wait_for(
+                    &format!("{change}: the update rejected"),
+                    Duration::from_secs(15),
+                    || Ok(faults.injected()),
+                )?;
+                assert!(
+                    faults.steps().iter().all(|s| s.ends_with(" failed")),
+                    "rejected before any mutation: {:?}",
+                    faults.steps()
+                );
+                phase(&before, &format!("{change}, before the boundary"))?;
+                faults.disarm()?;
+                f.wait_log(
+                    &t,
+                    "desired state fully applied",
+                    recovered + 1,
+                    Duration::from_secs(70),
+                )?;
+                phase(&after, &format!("{change}, after the boundary"))?;
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Relaxed);
+        let all = stream.join().expect("stream thread")?;
+        result?;
+        assert!(all.len() >= 40, "a continuous stream: {} connections", all.len());
+        assert!(
+            all.iter().all(|c| c.outcome == Outcome::Ok),
+            "every new connection succeeds: {:?}",
+            tally(&all)
+        );
+        Ok(())
+    })?;
+    let log = f.log();
+    assert_eq!(log.matches("status_degraded").count(), 2, "{log}");
+    assert_eq!(log.matches("status_recovered").count(), 2, "{log}");
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    for r in &reports {
+        assert!(r.continuous(Duration::from_secs(1)), "pinned flow interrupted: {r:?}");
+    }
+    assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
     Ok(())
 }

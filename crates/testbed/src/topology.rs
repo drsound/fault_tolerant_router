@@ -200,6 +200,13 @@ impl Topology {
             .collect()
     }
 
+    /// The per-namespace configuration directory of a node: `ip netns exec`
+    /// bind-mounts each entry over the one with the same name in `/etc`
+    /// (for example `systemd` over `/etc/systemd`). Removed with the run.
+    pub fn netns_etc(&self, node: Node) -> PathBuf {
+        Path::new("/etc/netns").join(self.ns(node).name())
+    }
+
     /// Path of the agent executable.
     pub fn agent_bin(&self) -> &Path {
         &self.opts.agent_bin
@@ -794,6 +801,10 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
     for ns in &spaces {
         if let Err(e) = netns::host("ip", ["netns", "del", ns.name()]) {
             errors.push(format!("{e:#}"));
+        }
+        let etc = Path::new("/etc/netns").join(ns.name());
+        if etc.exists() {
+            let _ = fs::remove_dir_all(etc);
         }
     }
     let _ = fs::remove_file(format!("/run/ppp-tb-{run_id}-c.pid"));

@@ -310,43 +310,4 @@ impl Topology {
         self.router().cmd("nft", "reset counters table inet tb_egress")?;
         Ok(())
     }
-
-    /// Test scaffolding until the daemon exists: routes LAN traffic of both
-    /// families through one uplink with a rule and table outside FTR's
-    /// default ranges (priority 90, table 90) and masquerades it.
-    pub fn route_lan_via(&self, uplink: Uplink) -> Result<()> {
-        let r = self.router();
-        self.clear_lan_route()?;
-        for f in self.families(uplink) {
-            let gw = self
-                .os_default_route(uplink, f)?
-                .with_context(|| format!("no {f} default route on {uplink}"))?;
-            let via = gw.map(|g| format!("via {g} ")).unwrap_or_default();
-            r.ip(&format!(
-                "{} route replace default {via}dev {} table 90",
-                f.flag(),
-                uplink.l3_iface()
-            ))?;
-            r.ip(&format!("{} rule add pref 90 iif lan lookup 90", f.flag()))?;
-        }
-        r.nft(&format!(
-            "table inet tb_scaffold {{\n  chain post {{\n    type nat hook postrouting priority 100;\n    iifname \"lan\" oifname \"{}\" masquerade\n  }}\n}}\n",
-            uplink.l3_iface()
-        ))
-    }
-
-    /// Removes the scaffolding of [`Topology::route_lan_via`].
-    pub fn clear_lan_route(&self) -> Result<()> {
-        let r = self.router();
-        for f in Family::ALL {
-            while r
-                .output("ip", [f.flag(), "rule", "del", "pref", "90"])?
-                .status
-                .success()
-            {}
-            let _ = r.output("ip", [f.flag(), "route", "flush", "table", "90"])?;
-        }
-        let _ = r.output("nft", ["delete", "table", "inet", "tb_scaffold"])?;
-        Ok(())
-    }
 }

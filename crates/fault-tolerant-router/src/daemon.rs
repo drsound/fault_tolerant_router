@@ -87,6 +87,12 @@ struct Daemon {
     held_routes: BTreeSet<(Family, u32)>,
     /// The next pass is part of a full reconciliation: no repair is held.
     full_pass: bool,
+    /// Sysctls to apply before the next routes and rules (FR-REC-3), by
+    /// interface (`None`: every setting); a failure is retried (FR-REC-5).
+    sysctls_pending: BTreeSet<Option<String>>,
+    /// The last prober generation: unique across paths, so that a round of
+    /// a removed and re-added uplink's old prober is never taken as current.
+    probe_generation: u64,
     probe_tx: mpsc::Sender<probe::Report>,
     boot_id: String,
     dirty: bool,
@@ -198,6 +204,8 @@ pub async fn run(opts: Options) -> Result<()> {
         held_rules: Vec::new(),
         held_routes: BTreeSet::new(),
         full_pass: false,
+        sysctls_pending: BTreeSet::new(),
+        probe_generation: 0,
         probe_tx,
         boot_id: state::boot_id().unwrap_or_default(),
         dirty: true,
@@ -284,12 +292,13 @@ fn report(f: &checks::Findings) -> Result<()> {
 }
 
 impl Daemon {
-    fn hysteresis(&self, id: UplinkId) -> Hysteresis {
-        let h = &self.cfg.uplink(id).expect("configured").health;
-        Hysteresis {
+    /// `None` once a reload has removed the uplink.
+    fn hysteresis(&self, id: UplinkId) -> Option<Hysteresis> {
+        let h = &self.cfg.uplink(id)?.health;
+        Some(Hysteresis {
             fall: h.fall,
             rise: h.rise,
-        }
+        })
     }
 
     fn load_drain_and_checkpoint(&mut self) {
@@ -376,6 +385,8 @@ impl Daemon {
         }
         sysctl::record(&mut self.manifest, &diffs);
         self.state_dir.write_manifest(&self.manifest)?;
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::step("set sysctls").map_err(|e| anyhow::anyhow!(e))?;
         for d in diffs {
             sysctl::write(&d.setting.key, d.setting.value).with_context(|| d.setting.display())?;
             info!("set {} = {} (was {})", d.setting.display(), d.setting.value, d.current);
@@ -526,13 +537,10 @@ impl Daemon {
                             self.reread.insert((f, *t));
                         }
                     }
-                    if matches!(change, Change::Link(_)) {
-                        let name = self.cfg.uplink(u).map(|u| u.interface.clone());
-                        if let Some(name) = name
-                            && let Err(e) = self.apply_sysctls(Some(&name))
-                        {
-                            warn!("sysctls of {name}: {e:#}");
-                        }
+                    if matches!(change, Change::Link(_))
+                        && let Some(up) = self.cfg.uplink(u)
+                    {
+                        self.sysctls_pending.insert(Some(up.interface.clone()));
                     }
                 }
                 self.dirty = true;
@@ -569,7 +577,11 @@ impl Daemon {
                 }
             }
             probe::Report::Round(r) => {
-                let h = self.hysteresis(r.path.uplink);
+                // A round already queued when a reload removed its uplink.
+                let Some(h) = self.hysteresis(r.path.uplink) else {
+                    debug!("discarding a round of a removed uplink");
+                    return;
+                };
                 let Some(p) = self.paths.get_mut(&r.path) else { return };
                 if p.generation != r.generation {
                     debug!("discarding a round of an older generation (FR-PROBE-3)");
@@ -718,6 +730,7 @@ impl Daemon {
     /// generation (FR-PROBE-1, FR-PROBE-3).
     fn manage_probers(&mut self) {
         let mask = self.cfg.routing.fwmark_mask;
+        let mut generation = self.probe_generation;
         for (key, p) in self.paths.iter_mut() {
             let u = self.cfg.uplink(key.uplink).expect("configured");
             let ready = p.discovered.as_ref().and_then(|d| d.ready.as_ref().ok()).copied();
@@ -744,13 +757,15 @@ impl Daemon {
             if let Some((_, h)) = p.prober.take() {
                 h.abort();
             }
-            p.generation += 1;
+            generation += 1;
+            p.generation = generation;
             if let Some(mut spec) = wanted {
                 spec.generation = p.generation;
                 let handle = probe::spawn(spec.clone(), self.probe_tx.clone());
                 p.prober = Some((spec, handle));
             }
         }
+        self.probe_generation = generation;
     }
 
     fn desired(&self, input: &Input, exclude: &BTreeSet<UplinkId>) -> Desired {
@@ -769,11 +784,29 @@ impl Daemon {
         plan::plan(&self.cfg, &i)
     }
 
+    /// Applies the pending sysctls, keeping those that failed.
+    fn apply_pending_sysctls(&mut self) -> std::result::Result<(), Failure> {
+        while let Some(only) = self.sysctls_pending.first().cloned() {
+            self.apply_sysctls(only.as_deref()).map_err(|e| Failure {
+                op: "set sysctls".into(),
+                error: format!("{e:#}"),
+                route: None,
+            })?;
+            self.sysctls_pending.remove(&only);
+        }
+        Ok(())
+    }
+
     /// One reconciliation pass.
     async fn step(&mut self) {
         if let Some(r) = &self.retry
             && Instant::now() < r.at
         {
+            return;
+        }
+        // FR-REC-3: sysctls before the routes and rules that rely on them.
+        if let Err(f) = self.apply_pending_sysctls() {
+            self.failed(f);
             return;
         }
         if !self.reread.is_empty() {
@@ -1011,9 +1044,7 @@ impl Daemon {
         self.manifest = manifest;
         self.cfg = new;
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
-        if let Err(e) = self.apply_sysctls(None) {
-            warn!("sysctls: {e:#}");
-        }
+        self.sysctls_pending.insert(None);
         info!("config_reloaded");
         self.dirty = true;
     }

@@ -229,6 +229,8 @@ where
                 _ => None,
             },
         };
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::step(&op.to_string()).map_err(fail)?;
         match &op {
             Op::ApplyNft => nft().await.map_err(fail)?,
             _ => {

@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use testbed::plan::{self, Family, Node, Uplink};
 use testbed::traffic::tally;
 use testbed::{Options, Outcome, PingOutcome, Topology, netns, topology};
@@ -37,6 +37,46 @@ fn router_ping(t: &Topology, uplink: Uplink, dst: IpAddr) -> Result<bool> {
         ["-n", "-c", "1", "-W", "1", "-I", uplink.l3_iface(), &dst.to_string()],
     )?;
     Ok(out.status.success())
+}
+
+/// Steers LAN traffic of both families through one uplink with a rule and
+/// a table outside FTR's default ranges (priority 90, table 90), and
+/// masquerades it: these checks of the harness run without the daemon,
+/// which routes only IPv4 until M2.
+fn steer_lan(t: &Topology, uplink: Uplink) -> Result<()> {
+    let r = t.router();
+    clear_steering(t)?;
+    for f in t.families(uplink) {
+        let gw = t
+            .os_default_route(uplink, f)?
+            .with_context(|| format!("no {f} default route on {uplink}"))?;
+        let via = gw.map(|g| format!("via {g} ")).unwrap_or_default();
+        r.ip(&format!(
+            "{} route replace default {via}dev {} table 90",
+            f.flag(),
+            uplink.l3_iface()
+        ))?;
+        r.ip(&format!("{} rule add pref 90 iif lan lookup 90", f.flag()))?;
+    }
+    r.nft(&format!(
+        "table inet tb_steer {{\n  chain post {{\n    type nat hook postrouting priority 100;\n    iifname \"lan\" oifname \"{}\" masquerade\n  }}\n}}\n",
+        uplink.l3_iface()
+    ))
+}
+
+/// Removes what [`steer_lan`] installed.
+fn clear_steering(t: &Topology) -> Result<()> {
+    let r = t.router();
+    for f in Family::ALL {
+        while r
+            .output("ip", [f.flag(), "rule", "del", "pref", "90"])?
+            .status
+            .success()
+        {}
+        let _ = r.output("ip", [f.flag(), "route", "flush", "table", "90"])?;
+    }
+    let _ = r.output("nft", ["delete", "table", "inet", "tb_steer"])?;
+    Ok(())
 }
 
 fn ppp_ifindex(t: &Topology) -> Option<u64> {
@@ -85,7 +125,7 @@ fn topology_comes_up_with_os_default_routes_and_tears_down() -> Result<()> {
 fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
     let t = build();
     for u in t.uplinks() {
-        t.route_lan_via(u)?;
+        steer_lan(&t, u)?;
         t.reset_counters()?;
         for f in t.families(u) {
             let tcp = t.connect_many(Node::Client, f, 50, 200, false)?;
@@ -108,11 +148,11 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
             );
             assert!(t.egress_packets(u, f)? >= 250, "{u} {f} egress counter");
         }
-        assert_eq!(t.ipv4_leaks()?, 0, "scaffolding routes carry no OS realm");
+        assert_eq!(t.ipv4_leaks()?, 0, "steering routes carry no OS realm");
     }
 
     // One-way UDP flow, attributed from the server log.
-    t.route_lan_via(Uplink::B)?;
+    steer_lan(&t, Uplink::B)?;
     t.udp_send(
         Node::Client,
         plan::server(Family::V4, 7),
@@ -128,10 +168,10 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
     assert_eq!(seen.len(), 5);
     assert!(seen.iter().all(|e| e.uplink() == Some(Uplink::B)));
 
-    // Leak detection: without the scaffolding rule, LAN traffic follows the
+    // Leak detection: without the steering rule, LAN traffic follows the
     // operating-system default route of the main table.
-    t.clear_lan_route()?;
-    t.router().nft("table inet tb_scaffold {\n  chain post {\n    type nat hook postrouting priority 100;\n    iifname \"lan\" masquerade\n  }\n}\n")?;
+    clear_steering(&t)?;
+    t.router().nft("table inet tb_steer {\n  chain post {\n    type nat hook postrouting priority 100;\n    iifname \"lan\" masquerade\n  }\n}\n")?;
     t.reset_counters()?;
     let r = t.connect_many(Node::Client, Family::V4, 5, 5, false)?;
     assert!(r.iter().all(|c| c.outcome == Outcome::Ok));
@@ -173,7 +213,7 @@ fn failure_injection() -> Result<()> {
     })?;
 
     // A long-lived flow on A survives failures of B, and stalls when A loses carrier.
-    t.route_lan_via(Uplink::A)?;
+    steer_lan(&t, Uplink::A)?;
     let flow = t.start_flow(Node::Client, plan::server(Family::V4, 1), Duration::from_millis(20))?;
     std::thread::sleep(Duration::from_millis(300));
     t.carrier_down(Uplink::B)?;
@@ -212,7 +252,7 @@ fn failure_injection() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn unreachable_is_detected() -> Result<()> {
     let t = build();
-    t.route_lan_via(Uplink::A)?;
+    steer_lan(&t, Uplink::A)?;
     // IPv4 ICMP errors for packets rejected by routing are rate-limited per
     // source host by the host-wide net.ipv4.route.error_cost/error_burst
     // sysctls (one per second after a small burst), which no namespace can

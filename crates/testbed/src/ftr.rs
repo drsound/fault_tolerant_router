@@ -218,11 +218,13 @@ impl Ftr {
         self.env.push((key.to_owned(), value.to_owned()));
     }
 
-    /// Runs a CLI command in the router namespace (with this run's lock).
+    /// Runs a CLI command in the router namespace (with this run's lock and
+    /// the environment set by [`Ftr::set_env`]).
     pub fn cli(&self, rest: &[&str]) -> Result<Output> {
         let args = self.args(rest);
         Ok(std::process::Command::new("ip")
-            .args(["netns", "exec", &self.router_ns])
+            .args(["netns", "exec", &self.router_ns, "env"])
+            .args(self.env.iter().map(|(k, v)| format!("{k}={v}")))
             .arg(&self.bin)
             .args(&args)
             .output()?)
