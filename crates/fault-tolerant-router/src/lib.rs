@@ -13,6 +13,7 @@ pub mod netlink;
 pub mod nft;
 pub mod plan;
 pub mod probe;
+pub mod reconcile;
 pub mod select;
 pub mod state;
 pub mod system;
