@@ -496,9 +496,16 @@ impl Topology {
             &opts,
             "noauth\nnoipv6\nmtu 1492\nmru 1492\nlcp-echo-interval 1\nlcp-echo-failure 3\nip-up-script /bin/true\nip-down-script /bin/true\n",
         )?;
+        self.start_pppoe_server("203.0.113.10")
+    }
+
+    /// Provider C's PPPoE server, handing out remote addresses from `first`
+    /// (ten of them, in 203.0.113.0/24, which the internet node routes to C).
+    pub(crate) fn start_pppoe_server(&self, first: &str) -> Result<()> {
+        let opts = self.dir.join("pppoe-server.options");
         // User-mode PPPoE on the server side: the kernel-mode plugin path is
         // hard-coded differently across rp-pppoe versions.
-        ns.run(
+        self.ns(Node::IspC).run(
             "pppoe-server",
             [
                 "-I",
@@ -506,7 +513,7 @@ impl Topology {
                 "-L",
                 "203.0.113.1",
                 "-R",
-                "203.0.113.10",
+                first,
                 "-N",
                 "10",
                 "-O",

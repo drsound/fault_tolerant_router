@@ -54,6 +54,32 @@ fn balancing_members(t: &Topology) -> Result<Vec<String>> {
     Ok(v)
 }
 
+/// Long-lived flows from the client to test servers `first..first+count`.
+fn start_flows(t: &Topology, first: u8, count: u8) -> Result<Vec<testbed::traffic::Flow>> {
+    (first..first + count)
+        .map(|n| {
+            t.start_flow(
+                Node::Client,
+                testbed::plan::server(Family::V4, n),
+                Duration::from_millis(50),
+            )
+        })
+        .collect()
+}
+
+/// Stops `flows` and checks that at least one ran on `u` and that every flow
+/// on `u` was uninterrupted (no stall longer than a second): a check that
+/// cannot pass because no flow happened to use `u`.
+fn flows_on_continuous(flows: Vec<testbed::traffic::Flow>, u: Uplink) -> Result<()> {
+    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+    let on_u: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(u)).collect();
+    assert!(!on_u.is_empty(), "no flow ran on {u}: {reports:?}");
+    for r in on_u {
+        assert!(r.continuous(Duration::from_secs(1)), "flow on {u} interrupted: {r:?}");
+    }
+    Ok(())
+}
+
 fn share(results: &[testbed::ConnResult], u: Uplink) -> f64 {
     let n = tally(results).get(&Some(u)).copied().unwrap_or(0);
     n as f64 / results.len() as f64
@@ -103,13 +129,24 @@ fn as04_carrier_loss_withdraws_the_uplink_within_a_second() -> Result<()> {
 }
 
 /// AS-14: every uplink loses carrier; new connections are rejected and no
-/// packet leaves through a route that FTR did not install (INV-3).
+/// packet leaves through a route that FTR did not install (INV-3), although
+/// an operating-system default route through an unmanaged interface stays
+/// usable; without FTR's final guard, that route carries them (control).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as14_no_uplink_rejects_without_leaking() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::ipv4(&abc()))?;
+    let mut f = t.start_ftr(&ftr::ipv4(&abc()))?;
     f.wait_installed(&t)?;
+    // An escape: a default route of main through an interface FTR does not
+    // manage, with the realm of operating-system routes.
+    let r = t.router();
+    r.ip("link add esc0 type dummy")?;
+    r.ip("link set esc0 up")?;
+    r.ip(&format!(
+        "route add default dev esc0 metric 900 realm {}",
+        testbed::plan::OS_ROUTE_REALM
+    ))?;
     for u in Uplink::ALL {
         t.carrier_down(u)?;
     }
@@ -117,12 +154,17 @@ fn as14_no_uplink_rejects_without_leaking() -> Result<()> {
         Ok(balancing_members(&t)?.is_empty())
     })?;
     t.reset_counters()?;
-    let r = t.connect_many(Node::Client, Family::V4, 10, 30, false)?;
-    assert!(r.iter().all(|c| c.outcome != Outcome::Ok), "{:?}", tally(&r));
+    let c = t.connect_many(Node::Client, Family::V4, 10, 30, false)?;
+    assert!(c.iter().all(|c| c.outcome != Outcome::Ok), "{:?}", tally(&c));
     assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
     for u in [Uplink::A, Uplink::B] {
         assert_eq!(t.egress_packets(u, Family::V4)?, 0, "no packet leaves through {u}");
     }
+    // Control: the escape is real once the final guard is gone.
+    f.kill()?;
+    r.ip("rule del pref 1699")?;
+    t.connect_many(Node::Client, Family::V4, 10, 10, false)?;
+    assert!(t.ipv4_leaks()? > 0, "without the final guard the escape route is used");
     Ok(())
 }
 
@@ -210,8 +252,14 @@ fn as02_weights_three_to_one() -> Result<()> {
     f.wait_installed(&t)?;
     for run in 0..5 {
         let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
+        let counts = tally(&r);
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok)
+                && counts.keys().all(|u| matches!(u, Some(Uplink::A | Uplink::B))),
+            "run {run}: every connection succeeds through A or B: {counts:?}"
+        );
         let a = share(&r, Uplink::A);
-        assert!((0.70..=0.80).contains(&a), "run {run}: A got {a:.3} ({:?})", tally(&r));
+        assert!((0.70..=0.80).contains(&a), "run {run}: A got {a:.3} ({counts:?})");
     }
     Ok(())
 }
@@ -824,30 +872,36 @@ fn as09_inbound_replies_leave_through_the_arrival_uplink() -> Result<()> {
     ];
     let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
-    let _server = serve_in(&t, Node::Client)?;
+    inbound_via_each_uplink(&t, &[Uplink::A, Uplink::B, Uplink::C])?;
+    Ok(())
+}
+
+/// Port forwarding on every uplink of `uplinks` (provider B forwards its
+/// public port to the router, CGNAT): inbound connections from the internet
+/// succeed and their replies leave through the uplink they arrived on, never
+/// another (INV-5).
+fn inbound_via_each_uplink(t: &Topology, uplinks: &[Uplink]) -> Result<()> {
+    let _server = serve_in(t, Node::Client)?;
     t.router().nft(&format!(
         "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname {{ \"wana\", \"wanb\", \"ppp0\" }} tcp dport 8007 dnat to {}:{}\n  }}\n}}\n",
         testbed::plan::LAN_CLIENT_V4,
         testbed::plan::TCP_PORT
     ))?;
     // Provider B (CGNAT) forwards its public port 8007 to the router.
-    let b = address(&t, Uplink::B)?;
+    let b = address(t, Uplink::B)?;
     t.ns(Node::IspB).nft(&format!(
         "table ip tb_in {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"core\" tcp dport 8007 dnat to {b}\n  }}\n}}\n"
     ))?;
-    for (u, iface) in [(Uplink::A, "wana"), (Uplink::B, "wanb"), (Uplink::C, "ppp0")] {
+    for &u in uplinks {
+        let iface = u.l3_iface();
         let public = if u == Uplink::B {
             "198.18.0.6".to_owned()
         } else {
-            address(&t, u)?
+            address(t, u)?
         };
+        counter(t, &format!("in{iface}"), &format!("oifname \"{iface}\" tcp sport 8007"))?;
         counter(
-            &t,
-            &format!("in{iface}"),
-            &format!("oifname \"{iface}\" tcp sport 8007"),
-        )?;
-        counter(
-            &t,
+            t,
             &format!("out{iface}"),
             &format!("oifname != \"{iface}\" oifname != \"lan\" tcp sport 8007"),
         )?;
@@ -864,11 +918,11 @@ fn as09_inbound_replies_leave_through_the_arrival_uplink() -> Result<()> {
             r.iter().map(|c| c.outcome).collect::<Vec<_>>()
         );
         assert!(
-            counter_value(&t, &format!("in{iface}"))? >= 20,
+            counter_value(t, &format!("in{iface}"))? >= 20,
             "{u}: replies leave through {iface}"
         );
         assert_eq!(
-            counter_value(&t, &format!("out{iface}"))?,
+            counter_value(t, &format!("out{iface}"))?,
             0,
             "{u}: no reply through another uplink"
         );
@@ -913,11 +967,15 @@ fn as17_third_party_deletions_are_repaired() -> Result<()> {
         "route repaired after {:?}",
         start.elapsed()
     );
+    let table = || -> Result<String> {
+        let out = r.output("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let installed = table()?;
+    assert!(installed.contains("chain"), "{installed}");
     r.run("nft", ["delete", "table", "inet", "fault_tolerant_router"])?;
-    t.wait_for("the nftables table back", Duration::from_secs(13), || {
-        Ok(r.output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
-            .status
-            .success())
+    t.wait_for("the same nftables table back", Duration::from_secs(13), || {
+        Ok(table()? == installed)
     })?;
     // Repeated deletions: after the fourth rule removal in five minutes (the
     // balancing rule above counts) immediate repairs stop until a full
@@ -940,6 +998,17 @@ fn as17_third_party_deletions_are_repaired() -> Result<()> {
     )?;
     f.wait_log(&t, "ownership conflict cleared", 1, Duration::from_secs(25))?;
     f.wait_log(&t, "status_recovered", 1, Duration::from_secs(2))?;
+    // The invariants hold again: new connections are balanced without
+    // leaks, a pinned connection runs uninterrupted, inbound replies leave
+    // through their arrival uplink.
+    t.reset_counters()?;
+    let c = t.connect_many(Node::Client, Family::V4, 20, 100, false)?;
+    assert!(c.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&c));
+    let flows = start_flows(&t, 30, 12)?;
+    std::thread::sleep(Duration::from_secs(2));
+    flows_on_continuous(flows, Uplink::A)?;
+    assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
+    inbound_via_each_uplink(&t, &[Uplink::A, Uplink::B])?;
     Ok(())
 }
 
@@ -986,15 +1055,8 @@ fn as19_reload_adds_removes_reorders_and_protects_ids() -> Result<()> {
     let t = build();
     let mut f = t.start_ftr(&ftr::ipv4(&ab()))?;
     f.wait_installed(&t)?;
-    let flows: Vec<_> = (20..26)
-        .map(|n| {
-            t.start_flow(
-                Node::Client,
-                testbed::plan::server(Family::V4, n),
-                Duration::from_millis(50),
-            )
-        })
-        .collect::<Result<_>>()?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    let flows = start_flows(&t, 20, 12)?;
     std::thread::sleep(Duration::from_millis(500));
     // C added first in the file, A removed, B unchanged.
     f.write_config(&ftr::ipv4(&[
@@ -1006,13 +1068,7 @@ fn as19_reload_adds_removes_reorders_and_protects_ids() -> Result<()> {
     // A path added by reload starts down and needs `rise` passed rounds.
     wait_members(&t, &["ppp0", "wanb"], Duration::from_secs(20))?;
     std::thread::sleep(Duration::from_secs(1));
-    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
-        assert!(
-            r.continuous(Duration::from_millis(1000)),
-            "flow on B interrupted: {r:?}"
-        );
-    }
+    flows_on_continuous(flows, Uplink::B)?;
     // Id 1 belonged to A: reusing it for another name is refused.
     let reuse = [UplinkSpec::new(Uplink::A, 1), UplinkSpec::new(Uplink::B, 2)];
     let text = ftr::ipv4_config(&reuse, &HealthSpec::fast(), "", "").replace("name = \"a\"", "name = \"fiber\"");
@@ -1143,15 +1199,8 @@ fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
     let t = build();
     let f = t.start_ftr(&ftr::ipv4(&ab()))?;
     f.wait_installed(&t)?;
-    let flows: Vec<_> = (40..46)
-        .map(|n| {
-            t.start_flow(
-                Node::Client,
-                testbed::plan::server(Family::V4, n),
-                Duration::from_millis(50),
-            )
-        })
-        .collect::<Result<_>>()?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    let flows = start_flows(&t, 40, 12)?;
     std::thread::sleep(Duration::from_millis(500));
     let old = address(&t, Uplink::A)?;
     t.ns(Node::IspA).ip("addr add 192.0.2.254/24 dev wan")?;
@@ -1188,41 +1237,49 @@ fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
     );
     assert!(f.log().contains("path discovery changed uplink=1"), "{}", f.log());
     std::thread::sleep(Duration::from_secs(1));
-    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
-        assert!(
-            r.continuous(Duration::from_millis(1000)),
-            "flow on B interrupted: {r:?}"
-        );
-    }
+    flows_on_continuous(flows, Uplink::B)?;
     Ok(())
 }
 
-/// AS-11: the PPP uplink reconnects with a new interface index; artifacts
-/// follow and the per-interface settings are applied again.
+/// AS-11: the PPP uplink reconnects with a new interface index and a new
+/// address; as in AS-10, artifacts follow within 1 s of the new address and
+/// connections on B are unaffected; per-interface settings are applied
+/// again.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as11_ppp_reconnection_with_a_new_ifindex() -> Result<()> {
     let t = build();
     let f = t.start_ftr(&ftr::ipv4(&abc()))?;
     f.wait_installed(&t)?;
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(10))?;
     let before = t.ifindex("ppp0").expect("ppp0");
+    let old = address(&t, Uplink::C)?;
     assert!(path_route(&t, 1003)?.contains("dev ppp0"));
-    t.pppoe_reset()?;
-    t.wait_for("ppp0 to come back with a new index", Duration::from_secs(30), || {
-        Ok(t.ifindex("ppp0").is_some_and(|i| i != before))
+    let flows = start_flows(&t, 50, 12)?;
+    std::thread::sleep(Duration::from_millis(500));
+    t.pppoe_renumber("203.0.113.20")?;
+    t.wait_for(
+        "ppp0 back with a new index and address",
+        Duration::from_secs(30),
+        || Ok(t.ifindex("ppp0").is_some_and(|i| i != before) && !address(&t, Uplink::C)?.is_empty()),
+    )?;
+    let start = Instant::now();
+    let addr = address(&t, Uplink::C)?;
+    assert_ne!(addr, old, "a new address");
+    t.wait_for("C's path route on the new ppp0", Duration::from_secs(3), || {
+        let route = path_route(&t, 1003)?;
+        Ok(route.contains("dev ppp0") && route.contains(&format!("src {addr}")))
     })?;
-    t.wait_for("C's path route on the new ppp0", Duration::from_secs(10), || {
-        Ok(path_route(&t, 1003)?.contains("dev ppp0")
-            && t.router()
-                .run("ip", ["-4", "addr", "show", "dev", "ppp0"])?
-                .contains("inet "))
+    let took = start.elapsed();
+    assert!(took <= Duration::from_secs(1), "updated after {took:?}");
+    t.wait_for("the source rules of the new address", Duration::from_secs(1), || {
+        let rules = ftr_rules(&t)?.join("\n");
+        Ok(rules.contains(&format!("from {addr} ")) && !rules.contains(&format!("from {old} ")))
     })?;
     let svm = t.router().sysctl_get("net.ipv4.conf.ppp0.src_valid_mark")?;
     assert_eq!(svm, "1", "per-interface settings re-applied");
-    let route = path_route(&t, 1003)?;
-    let addr = address(&t, Uplink::C)?;
-    assert!(route.contains(&format!("src {addr}")), "{route}");
+    std::thread::sleep(Duration::from_secs(1));
+    flows_on_continuous(flows, Uplink::B)?;
     Ok(())
 }
 
@@ -1307,30 +1364,47 @@ fn as30_replies_with_an_empty_active_set() -> Result<()> {
         UplinkSpec::new(Uplink::A, 1).priority(None),
         UplinkSpec::new(Uplink::B, 2).priority(None),
     ];
-    let health = HealthSpec {
-        text: "interval = \"1s\"\ntimeout = \"300ms\"\nattempts = 2\n[health.ipv4]\ntargets = [\"icmp:1.1.1.1\", \"icmp:8.8.8.8\", \"tcp:9.9.9.9:443\", \"tcp:208.67.222.222:443\"]\n".into(),
-    };
     // Static gateways: the operating-system default routes go away.
     let (gwa, gwb) = (gateway(&t, Uplink::A)?, gateway(&t, Uplink::B)?);
-    let config = ftr::ipv4_config(&ups, &health, "", "")
-        .replacen("[uplink.ipv4]\n", &format!("[uplink.ipv4]\ngateway = \"{gwa}\"\n"), 1)
-        .replacen(
-            "[uplink.ipv4]\n[health]",
-            &format!("[uplink.ipv4]\ngateway = \"{gwb}\"\n[health]"),
-            1,
-        );
+    let config = |targets: &str| {
+        let health = HealthSpec {
+            text: format!(
+                "interval = \"1s\"\ntimeout = \"300ms\"\nattempts = 2\nrequired_reachable = 2\n[health.ipv4]\ntargets = [{targets}]\n"
+            ),
+        };
+        ftr::ipv4_config(&ups, &health, "", "")
+            .replacen("[uplink.ipv4]\n", &format!("[uplink.ipv4]\ngateway = \"{gwa}\"\n"), 1)
+            .replacen(
+                "[uplink.ipv4]\n[health]",
+                &format!("[uplink.ipv4]\ngateway = \"{gwb}\"\n[health]"),
+                1,
+            )
+    };
     for _ in 0..3 {
         let _ = t.router().output("ip", ["-4", "route", "del", "default"])?;
     }
-    let mut f = t.start_ftr(&config)?;
-    f.wait_installed(&t)?;
-    assert!(balancing_members(&t)?.is_empty());
-    std::thread::sleep(Duration::from_secs(4));
-    assert!(
-        !f.log().contains("to=Down"),
-        "ICMP and TCP probe replies accepted:\n{}",
-        f.log()
-    );
+    // Each kind of probe separately, both of its targets required.
+    let icmp = "\"icmp:1.1.1.1\", \"icmp:8.8.8.8\"";
+    let tcp = "\"tcp:9.9.9.9:443\", \"tcp:208.67.222.222:443\"";
+    // TCP first; the ICMP configuration stays for the rest.
+    let mut running: Option<ftr::Ftr> = None;
+    for (kind, targets) in [("TCP", tcp), ("ICMP", icmp)] {
+        if let Some(mut f) = running.take() {
+            f.stop()?;
+        }
+        let f = t.start_ftr(&config(targets))?;
+        f.wait_installed(&t)?;
+        assert!(balancing_members(&t)?.is_empty());
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(
+            !f.log().contains("to=Down"),
+            "{kind} probe replies accepted:\n{}",
+            f.log()
+        );
+        assert_eq!(gateway(&t, Uplink::A)?, "", "no operating-system default route");
+        running = Some(f);
+    }
+    let mut f = running.expect("started");
     let _client = serve_in(&t, Node::Client)?;
     let _router = serve_in(&t, Node::Router)?;
     t.router().nft(&format!(
@@ -1415,7 +1489,25 @@ fn as37_removed_uplink_connections_are_rejected_not_moved() -> Result<()> {
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     wait_members(&t, &["wana", "wanb"], Duration::from_secs(5))?;
+    t.wait_for("C's path route withdrawn", Duration::from_secs(5), || {
+        Ok(path_route(&t, 1003)?.is_empty())
+    })?;
+    // The connection keeps trying (retransmissions arrive from the LAN), and
+    // none of its packets leaves, not even through C.
+    counter(&t, "via_c", "oifname \"ppp0\" ip daddr 198.18.100.77")?;
+    t.router().nft(
+        "table ip t_tries {\n  counter c {}\n  chain pre {\n    type filter hook prerouting priority -300; policy accept;\n    iifname \"lan\" ip daddr 198.18.100.77 counter name c\n  }\n}\n",
+    )?;
     std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        t.router().counter("ip", "t_tries", "c")? > 0,
+        "the connection keeps sending"
+    );
+    assert_eq!(
+        counter_value(&t, "via_c")?,
+        0,
+        "rejected by the path guard, not sent through C"
+    );
     let report = flow.stop()?;
     assert_eq!(report.uplink(), Some(Uplink::C));
     assert_eq!(t.ipv4_leaks()?, 0, "INV-3 for the connection of the removed uplink");
@@ -1671,26 +1763,45 @@ fn as21_router_originated_traffic() -> Result<()> {
         check("bound to wana, path withdrawn", &by_dev("wana"), udp, None)?;
     }
     assert_eq!(counter_value(&t, "elsewhere")?, 0, "never through another interface");
-    // The point-to-point uplink with its path route withdrawn: the
-    // datagrams go to the peer, through ppp0 only.
-    counter(
-        &t,
-        "c_elsewhere",
-        "oifname != \"ppp0\" oifname != \"lo\" ip daddr 198.18.100.120-198.18.100.129",
-    )?;
+    // The point-to-point uplink outside the active set (its probes fail):
+    // bound traffic still uses it.
+    t.drop_probe_echoes(Uplink::C, 1)?;
+    t.wait_for("C outside the active set", Duration::from_secs(10), || {
+        Ok(!balancing_members(&t)?.contains(&"ppp0".to_owned()))
+    })?;
+    for udp in [false, true] {
+        check(
+            "bound to ppp0 outside the active set",
+            &by_dev("ppp0"),
+            udp,
+            Some(Uplink::C),
+        )?;
+    }
+    t.clear_provider_rules(Uplink::C)?;
+    // Its path route withdrawn: a point-to-point path needs only its
+    // address, so the address goes. Traffic bound to ppp0 still goes to the
+    // peer, through ppp0 only (§4.1.1).
     let c = address(&t, Uplink::C)?;
     t.router()
         .ip(&format!("addr del {c}/32 dev ppp0"))
         .or_else(|_| t.router().ip("addr flush dev ppp0"))?;
-    let udp_dsts: Vec<String> = servers(120, 10).iter().map(|d| d.replace(":7000", ":7001")).collect();
-    let _ = t.connect_bound(
-        Node::Router,
-        &udp_dsts,
-        10,
-        true,
-        Duration::from_secs(1),
-        &by_dev("ppp0"),
+    t.wait_for("C's path route withdrawn", Duration::from_secs(3), || {
+        Ok(path_route(&t, 1003)?.is_empty())
+    })?;
+    let dsts = "ip daddr 198.18.100.120-198.18.100.129";
+    counter(&t, "c_out", &format!("oifname \"ppp0\" {dsts}"))?;
+    counter(
+        &t,
+        "c_elsewhere",
+        &format!("oifname != \"ppp0\" oifname != \"lo\" {dsts}"),
     )?;
+    for udp in [false, true] {
+        let port = if udp { ":7001" } else { ":7000" };
+        let dsts: Vec<String> = servers(120, 10).iter().map(|d| d.replace(":7000", port)).collect();
+        let before = counter_value(&t, "c_out")?;
+        t.connect_bound(Node::Router, &dsts, 10, udp, Duration::from_secs(1), &by_dev("ppp0"))?;
+        assert!(counter_value(&t, "c_out")? > before, "sent through ppp0 (udp: {udp})");
+    }
     assert_eq!(counter_value(&t, "c_elsewhere")?, 0, "never through another interface");
     Ok(())
 }
@@ -1701,8 +1812,15 @@ fn as21_router_originated_traffic() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as23_external_firewall_mode() -> Result<()> {
     let t = build();
+    // C in a second priority group: inbound connections also arrive on an
+    // uplink outside the active set (AS-09).
+    let ups = [
+        UplinkSpec::new(Uplink::A, 1),
+        UplinkSpec::new(Uplink::B, 2),
+        UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
+    ];
     let config = ftr::ipv4_config(
-        &ab(),
+        &ups,
         &HealthSpec::fast(),
         "reconcile_interval = \"10s\"",
         "[firewall]\nmode = \"external\"\n",
@@ -1741,45 +1859,19 @@ fn as23_external_firewall_mode() -> Result<()> {
         "A got {a:.3} ({:?})",
         tally(&r)
     );
-    // AS-03: connections on A survive a failure of B.
-    let flows: Vec<_> = (1..=6)
-        .map(|n| {
-            t.start_flow(
-                Node::Client,
-                testbed::plan::server(Family::V4, n),
-                Duration::from_millis(50),
-            )
-        })
-        .collect::<Result<_>>()?;
+    // AS-03: connections on A survive a failure and the recovery of B.
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    let flows = start_flows(&t, 1, 12)?;
     std::thread::sleep(Duration::from_millis(500));
     t.carrier_down(Uplink::B)?;
     wait_members(&t, &["wana"], Duration::from_secs(3))?;
     std::thread::sleep(Duration::from_secs(1));
     t.carrier_up(Uplink::B)?;
-    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::A)) {
-        assert!(
-            r.continuous(Duration::from_millis(1000)),
-            "flow on A interrupted: {r:?}"
-        );
-    }
-    // AS-09 on A.
-    let _server = serve_in(&t, Node::Client)?;
-    t.router().nft(&format!(
-        "table ip admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" tcp dport 8007 dnat to {}:{}\n  }}\n}}\n",
-        testbed::plan::LAN_CLIENT_V4,
-        testbed::plan::TCP_PORT
-    ))?;
-    counter(&t, "in_a", "oifname \"wana\" tcp sport 8007")?;
-    let r = t.connect_to(
-        Node::Inet,
-        &[format!("{}:8007", address(&t, Uplink::A)?)],
-        10,
-        false,
-        Duration::from_secs(2),
-    )?;
-    assert!(r.iter().all(|c| c.outcome == Outcome::Ok));
-    assert!(counter_value(&t, "in_a")? >= 20);
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(15))?;
+    std::thread::sleep(Duration::from_secs(1));
+    flows_on_continuous(flows, Uplink::A)?;
+    // AS-09 on every uplink, C outside the active set.
+    inbound_via_each_uplink(&t, &[Uplink::A, Uplink::B, Uplink::C])?;
     Ok(())
 }
 
@@ -1796,11 +1888,14 @@ fn as47_startup_with_existing_artifacts() -> Result<()> {
     t.upstream_down(Uplink::A)?;
     wait_members(&t, &["wanb"], Duration::from_secs(10))?;
     let rules = ftr_rules(&t)?;
-    let flow = t.start_flow(
-        Node::Client,
-        testbed::plan::server(Family::V4, 90),
-        Duration::from_millis(50),
-    )?;
+    let flow = |n| {
+        t.start_flow(
+            Node::Client,
+            testbed::plan::server(Family::V4, n),
+            Duration::from_millis(50),
+        )
+    };
+    let intact = flow(90)?;
     std::thread::sleep(Duration::from_millis(500));
 
     // (1) Intact artifacts, checkpoint older than 10 minutes: adopted, cold
@@ -1818,6 +1913,14 @@ fn as47_startup_with_existing_artifacts() -> Result<()> {
     f.wait_installed(&t)?;
     assert_eq!(ftr_rules(&t)?, rules, "adopted without duplicates");
     wait_members(&t, &["wanb"], Duration::from_secs(5))?;
+    let report = intact.stop()?;
+    assert_eq!(report.uplink(), Some(Uplink::B));
+    assert!(
+        report.continuous(Duration::from_secs(1)),
+        "a connection whose artifacts stayed intact is uninterrupted: {report:?}"
+    );
+    let damaged = flow(91)?;
+    std::thread::sleep(Duration::from_millis(500));
 
     // (2) Partial artifacts with live marks and a recent checkpoint.
     f.kill()?;
@@ -1837,7 +1940,7 @@ fn as47_startup_with_existing_artifacts() -> Result<()> {
     })?;
     wait_members(&t, &["wanb"], Duration::from_secs(3))?;
     std::thread::sleep(Duration::from_secs(1));
-    let report = flow.stop()?;
+    let report = damaged.stop()?;
     assert_eq!(report.uplink(), Some(Uplink::B));
     assert!(
         report.error.is_none(),
@@ -2166,21 +2269,21 @@ fn as27_failure_after_each_step() -> Result<()> {
         testbed::plan::TCP_PORT,
         testbed::plan::LAN_CLIENT_V4
     ))?;
-    let mut flows = Vec::new();
-    for n in 60..69 {
+    // Pinned client connections, a router-originated one and an inbound one,
+    // started again for each change: a change may legitimately end those of
+    // the uplink it affects.
+    let a_addr: std::net::IpAddr = a.parse()?;
+    let start_traffic = || -> Result<Vec<testbed::traffic::Flow>> {
+        let mut flows = start_flows(&t, 60, 12)?;
         flows.push(t.start_flow(
-            Node::Client,
-            testbed::plan::server(Family::V4, n),
+            Node::Router,
+            testbed::plan::server(Family::V4, 75),
             Duration::from_millis(50),
         )?);
-    }
-    flows.push(t.start_flow(
-        Node::Router,
-        testbed::plan::server(Family::V4, 70),
-        Duration::from_millis(50),
-    )?);
-    flows.push(t.start_flow(Node::Inet, a.parse()?, Duration::from_millis(50))?);
-    std::thread::sleep(Duration::from_secs(1));
+        flows.push(t.start_flow(Node::Inet, a_addr, Duration::from_millis(50))?);
+        std::thread::sleep(Duration::from_secs(1));
+        Ok(flows)
+    };
     t.reset_counters()?;
 
     let reload = |config: &str| -> Result<()> {
@@ -2209,6 +2312,7 @@ fn as27_failure_after_each_step() -> Result<()> {
         Change::AddressOnC,
         Change::ReconnectC,
     ] {
+        let flows = start_traffic()?;
         for k in 0.. {
             if let Change::AddC = change {
                 reload(&without_c)?;
@@ -2287,10 +2391,7 @@ fn as27_failure_after_each_step() -> Result<()> {
                 break;
             }
         }
-    }
-    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
-        assert!(r.continuous(Duration::from_secs(1)), "flow on B interrupted: {r:?}");
+        flows_on_continuous(flows, Uplink::B)?;
     }
     assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2");
     f.stop()?;

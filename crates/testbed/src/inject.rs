@@ -139,6 +139,27 @@ impl Topology {
         Ok(())
     }
 
+    /// Restarts provider C's PPPoE server with remote addresses from `first`
+    /// and ends the session: the router's `pppd` reconnects with a new
+    /// `ppp0` and an address of the new range.
+    pub fn pppoe_renumber(&self, first: &str) -> Result<()> {
+        let ns = self.ns(Node::IspC);
+        for pid in ns.pids()? {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if matches!(comm.trim(), "pppoe-server" | "pppd") {
+                let _ = netns::host("kill", ["-TERM", &pid.to_string()]);
+            }
+        }
+        self.wait_for("provider C's PPPoE server to stop", Duration::from_secs(5), || {
+            Ok(ns.pids()?.iter().all(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|c| c.trim() != "pppoe-server")
+                    .unwrap_or(true)
+            }))
+        })?;
+        self.start_pppoe_server(first)
+    }
+
     /// Forces DHCPv4 renewal on an uplink (SIGUSR1 to its `udhcpc`).
     pub fn dhcp_renew(&self, uplink: Uplink) -> Result<()> {
         let pidfile = self.dir().join(format!("udhcpc-{}.pid", uplink.carrier_iface()));
