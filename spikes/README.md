@@ -18,5 +18,5 @@ Scripts must run as root on a disposable Linux host. They create network namespa
 | S1 Routing core | `s1-routing-core/` | done |
 | S2 Mark lifecycle | `s2-mark-lifecycle/` | done |
 | S3 Rust netlink | `s3-netlink/` | done |
-| S4 Coexistence and control plane | `s4-control-plane/` | in progress |
+| S4 Coexistence and control plane | `s4-control-plane/` | done |
 | S5 Probes | `s5-probes/` | done |
