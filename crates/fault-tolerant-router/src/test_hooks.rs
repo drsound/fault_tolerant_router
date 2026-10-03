@@ -20,8 +20,10 @@ pub fn boottime_shift_ms() -> u64 {
 /// Every step of the reconciler and of cleanup calls this before acting.
 /// While the file holds a number N greater than 0, the step proceeds and the
 /// file is rewritten with N - 1; while it holds 0, the step fails with an
-/// injected error, until the file is removed or rewritten. Every step is
-/// appended to `<file>.steps`, followed by ` failed` when it failed.
+/// injected error, until the file is removed or rewritten. While it holds
+/// `match:TEXT`, the steps whose name contains TEXT fail and the others
+/// proceed. Every step is appended to `<file>.steps`, followed by ` failed`
+/// when it failed.
 #[cfg(feature = "test-hooks")]
 pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
     use std::io::Write;
@@ -29,16 +31,24 @@ pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
     let Some(path) = std::env::var_os("FTR_TEST_FAULTS").map(std::path::PathBuf::from) else {
         return Ok(());
     };
-    let armed = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let result = match armed {
-        Some(0) => Err(format!("failure injected before {name}")),
-        Some(n) => {
-            let _ = std::fs::write(&path, (n - 1).to_string());
+    let control = std::fs::read_to_string(&path).unwrap_or_default();
+    let control = control.trim();
+    let failure = || Err(format!("failure injected before {name}"));
+    let result = if let Some(text) = control.strip_prefix("match:") {
+        if name.to_string().contains(text) {
+            failure()
+        } else {
             Ok(())
         }
-        None => Ok(()),
+    } else {
+        match control.parse::<u64>().ok() {
+            Some(0) => failure(),
+            Some(n) => {
+                let _ = std::fs::write(&path, (n - 1).to_string());
+                Ok(())
+            }
+            None => Ok(()),
+        }
     };
     let mut steps = path.into_os_string();
     steps.push(".steps");

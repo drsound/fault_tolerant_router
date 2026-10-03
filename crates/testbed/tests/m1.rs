@@ -2165,6 +2165,13 @@ impl Faults {
         Ok(())
     }
 
+    /// Fails every step whose name contains `text`, until disarmed.
+    fn arm_matching(&self, text: &str) -> Result<()> {
+        let _ = std::fs::remove_file(self.steps_path());
+        std::fs::write(&self.path, format!("match:{text}"))?;
+        Ok(())
+    }
+
     fn disarm(&self) -> Result<()> {
         let _ = std::fs::remove_file(&self.path);
         Ok(())
@@ -2270,8 +2277,8 @@ fn as27_failure_after_each_step() -> Result<()> {
         testbed::plan::LAN_CLIENT_V4
     ))?;
     // Pinned client connections, a router-originated one and an inbound one,
-    // started again for each change: a change may legitimately end those of
-    // the uplink it affects.
+    // started again for each failure position: a change may legitimately end
+    // those of the uplink it affects.
     let a_addr: std::net::IpAddr = a.parse()?;
     let start_traffic = || -> Result<Vec<testbed::traffic::Flow>> {
         let mut flows = start_flows(&t, 60, 12)?;
@@ -2312,12 +2319,13 @@ fn as27_failure_after_each_step() -> Result<()> {
         Change::AddressOnC,
         Change::ReconnectC,
     ] {
-        let flows = start_traffic()?;
+        let mut on_b = 0;
         for k in 0.. {
             if let Change::AddC = change {
                 reload(&without_c)?;
                 t.wait_for("C removed", timeout, &c_gone)?;
             }
+            let flows = start_traffic()?;
             let recovered = f.log().matches("desired state fully applied").count();
             let index = t.ifindex("ppp0");
             faults.arm(k)?;
@@ -2386,14 +2394,66 @@ fn as27_failure_after_each_step() -> Result<()> {
                 Change::ReconnectC => {}
             }
             wait_members(&t, &all, timeout)?;
+            // Every kind of traffic was exchanging data at this position.
+            let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
+            for r in &reports {
+                assert!(
+                    r.received > 0,
+                    "{change:?} after {k} steps: traffic not exchanged: {r:?}"
+                );
+            }
+            // Connections on B, which no change touches, are uninterrupted.
+            for r in reports.iter().filter(|r| r.uplink() == Some(Uplink::B)) {
+                on_b += 1;
+                assert!(
+                    r.continuous(Duration::from_secs(1)),
+                    "{change:?} after {k} steps: flow on B interrupted: {r:?}"
+                );
+            }
             if !injected {
                 eprintln!("{change:?}: {k} steps");
                 break;
             }
         }
-        flows_on_continuous(flows, Uplink::B)?;
+        assert!(on_b > 0, "{change:?}: no flow ran on B");
     }
     assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2");
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, a runtime update failing for one uplink does not hold back
+/// another: while the settings of C's new interface keep failing, C is not
+/// ready, and A still leaves the active set within the detection bound when
+/// its provider fails (FR-REC-5, FR-HEALTH-5); C comes back once its
+/// settings apply.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_a_failing_interface_setting_does_not_hold_back_failover() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let all = ["ppp0", "wana", "wanb"];
+    wait_members(&t, &all, Duration::from_secs(15))?;
+    faults.arm_matching("set sysctls")?;
+    let before = t.ifindex("ppp0");
+    t.pppoe_reset()?;
+    t.wait_for(
+        "C's settings failing",
+        Duration::from_secs(30),
+        || Ok(faults.injected()),
+    )?;
+    t.wait_for("C not ready", Duration::from_secs(5), || {
+        Ok(t.ifindex("ppp0") != before && balancing_members(&t)? == ["wana", "wanb"])
+    })?;
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(10))?;
+    faults.disarm()?;
+    t.upstream_up(Uplink::A)?;
+    wait_members(&t, &all, Duration::from_secs(70))?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(5))?;
     f.stop()?;
     Ok(())
 }

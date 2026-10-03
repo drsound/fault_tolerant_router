@@ -117,6 +117,28 @@ pub fn normalize(mut v: Value) -> Value {
     v
 }
 
+/// Whether a table listing assigns a path value: a rule that matches
+/// `meta nfproto` `family` and `oifname` `interface` and sets the conntrack
+/// mark to `value` within the mark field (FR-FW-2). nft rewrites the mask of
+/// the operation, so only the value set is compared.
+pub fn assigns(listing: &Value, family: &str, interface: &str, value: u32) -> bool {
+    let matches = |expr: &Value, key: &str, right: &str| {
+        expr["match"]["left"]["meta"]["key"] == key && expr["match"]["right"] == right
+    };
+    listing["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| o["rule"]["expr"].as_array())
+        .any(|exprs| {
+            exprs.iter().any(|e| matches(e, "nfproto", family))
+                && exprs.iter().any(|e| matches(e, "oifname", interface))
+                && exprs.iter().any(|e| {
+                    e["mangle"]["key"]["ct"]["key"] == "mark" && e["mangle"]["value"]["|"][1] == u64::from(value)
+                })
+        })
+}
+
 /// Interfaces listed by flowtables, by table (FR-CT-2). A single device is
 /// a string in the JSON listing, several are an array (S2 F14).
 pub fn flowtable_devices(ruleset: &Value) -> Vec<(String, String)> {
@@ -185,6 +207,19 @@ pub fn source_nat_chains(ruleset: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignments_are_recognised_by_their_mark_not_by_a_name() {
+        // As nftables 1.1 lists an assignment and a NAT rule (S2).
+        let listing: Value = serde_json::from_str(
+            r#"{"nftables":[{"rule":{"chain":"mark","expr":[{"match":{"op":"==","left":{"meta":{"key":"nfproto"}},"right":"ipv4"}},{"match":{"op":"==","left":{"meta":{"key":"oifname"}},"right":"wana"}},{"match":{"op":"==","left":{"ct":{"key":"direction"}},"right":"original"}},{"mangle":{"key":{"ct":{"key":"mark"}},"value":{"|":[{"&":[{"ct":{"key":"mark"}},4278321151]},65536]}}},{"mangle":{"key":{"meta":{"key":"mark"}},"value":{"|":[{"&":[{"meta":{"key":"mark"}},4278321151]},65536]}}},{"return":null}]}},{"rule":{"chain":"nat","expr":[{"match":{"op":"==","left":{"meta":{"key":"nfproto"}},"right":"ipv4"}},{"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":{"set":["dnat","lan"]}}},{"match":{"op":"==","left":{"meta":{"key":"oifname"}},"right":"lan2"}},{"masquerade":null}]}}]}"#,
+        )
+        .unwrap();
+        assert!(assigns(&listing, "ipv4", "wana", 0x10000));
+        assert!(!assigns(&listing, "ipv4", "wana", 0x20000), "another uplink's value");
+        assert!(!assigns(&listing, "ipv6", "wana", 0x10000), "another family");
+        assert!(!assigns(&listing, "ipv4", "lan2", 0x20000), "named only by a NAT rule");
+    }
 
     #[test]
     fn normalisation_removes_handles_and_metainfo() {

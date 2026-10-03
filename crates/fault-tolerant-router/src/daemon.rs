@@ -56,6 +56,13 @@ struct Retry {
     attempt: String,
 }
 
+/// A set of sysctls applied together.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SysctlScope {
+    Global,
+    Interface(String),
+}
+
 /// The attempt of a failed sysctl application.
 const SYSCTL_ATTEMPT: &str = "sysctls";
 
@@ -105,7 +112,11 @@ struct Daemon {
     resync_due: bool,
     /// Sysctls to apply before the next routes and rules (FR-REC-3), by
     /// interface (`None`: every setting); a failure is retried (FR-REC-5).
-    sysctls_pending: BTreeSet<Option<String>>,
+    sysctls_pending: BTreeSet<SysctlScope>,
+    /// Interfaces whose settings failed: their uplinks' paths are not ready
+    /// until a retry, with its own backoff, succeeds (FR-REC-5, FR-DISC-7).
+    sysctls_failed: BTreeMap<String, String>,
+    sysctl_retry: Option<Retry>,
     /// The last prober generation: unique across paths, so that a round of
     /// a removed and re-added uplink's old prober is never taken as current.
     probe_generation: u64,
@@ -231,6 +242,8 @@ pub async fn run(opts: Options) -> Result<()> {
         held_routes: BTreeSet::new(),
         full_pass: false,
         sysctls_pending: BTreeSet::new(),
+        sysctls_failed: BTreeMap::new(),
+        sysctl_retry: None,
         probe_generation: 0,
         probe_tx,
         boot_id: state::boot_id().unwrap_or_default(),
@@ -246,18 +259,26 @@ pub async fn run(opts: Options) -> Result<()> {
     d.state_dir
         .write_manifest(&d.manifest)
         .context("writing the manifest")?;
-    d.apply_sysctls(None).context("sysctls")?;
+    for scope in d.sysctl_scopes() {
+        d.apply_sysctls(&scope).context("sysctls")?;
+    }
     d.load_drain_and_checkpoint();
     if d.cfg.firewall.mode == FirewallMode::Managed
         && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
     {
-        // An uplink's interface name appears in the rules of its assignments.
-        let text = listing.to_string();
+        // An uplink whose path assignments the table has, for every family
+        // the uplink configures.
+        let mask = d.cfg.routing.fwmark_mask;
         d.nft_adopted = Some(
             d.cfg
                 .uplinks
                 .iter()
-                .filter(|u| serde_json::to_string(&u.interface).is_ok_and(|name| text.contains(&name)))
+                .filter(|u| {
+                    Family::ALL.into_iter().filter(|f| u.path(*f).is_some()).all(|f| {
+                        let nfproto = if f == Family::V4 { "ipv4" } else { "ipv6" };
+                        nftctl::assigns(&listing, nfproto, &u.interface, mask.encode(FieldValue::path(u.id)))
+                    })
+                })
                 .map(|u| u.id)
                 .collect(),
         );
@@ -423,10 +444,13 @@ impl Daemon {
 
     /// FR-SYS: record baselines (write-ahead), then change; with
     /// `manage_sysctls = false`, only warn. `only` restricts to one interface.
-    fn apply_sysctls(&mut self, only: Option<&str>) -> Result<()> {
+    fn apply_sysctls(&mut self, scope: &SysctlScope) -> Result<()> {
         let wanted: Vec<_> = sysctl::desired(&self.cfg)
             .into_iter()
-            .filter(|s| only.is_none() || s.interface.as_deref() == only)
+            .filter(|s| match scope {
+                SysctlScope::Global => s.interface.is_none(),
+                SysctlScope::Interface(i) => s.interface.as_ref() == Some(i),
+            })
             .collect();
         let diffs = sysctl::differences(&wanted, sysctl::read)?;
         if diffs.is_empty() {
@@ -606,7 +630,8 @@ impl Daemon {
                     if matches!(change, Change::Link(_))
                         && let Some(up) = self.cfg.uplink(u)
                     {
-                        self.sysctls_pending.insert(Some(up.interface.clone()));
+                        self.sysctls_pending
+                            .insert(SysctlScope::Interface(up.interface.clone()));
                     }
                 }
                 self.dirty = true;
@@ -722,6 +747,16 @@ impl Daemon {
                 && d.ready.is_ok()
             {
                 debug!("path {key:?} not ready: route installation failed ({e})");
+                d.ready = Err(Reason::RouteInstallFailed);
+            }
+            // The interface's settings are part of the path's installation.
+            if let Some(e) = self
+                .cfg
+                .uplink(key.uplink)
+                .and_then(|u| self.sysctls_failed.get(&u.interface))
+                && d.ready.is_ok()
+            {
+                debug!("path {key:?} not ready: its interface's sysctls failed ({e})");
                 d.ready = Err(Reason::RouteInstallFailed);
             }
             let p = self.paths.entry(key).or_insert_with(|| PathRuntime {
@@ -842,19 +877,68 @@ impl Daemon {
     }
 
     /// Applies the pending sysctls, keeping those that failed.
+    /// Every scope of the desired settings: the global ones, then each
+    /// interface's.
+    fn sysctl_scopes(&self) -> Vec<SysctlScope> {
+        let interfaces: BTreeSet<String> = sysctl::desired(&self.cfg)
+            .into_iter()
+            .filter_map(|s| s.interface)
+            .collect();
+        std::iter::once(SysctlScope::Global)
+            .chain(interfaces.into_iter().map(SysctlScope::Interface))
+            .collect()
+    }
+
+    /// Applies the pending sysctls before the routes and rules that rely on
+    /// them (FR-REC-3). A failure of the global settings fails the pass:
+    /// everything depends on them. A failure of an interface's settings
+    /// keeps them pending and its uplinks' paths not ready, retried with
+    /// their own backoff, and the rest of the pass goes on (FR-REC-5).
     fn apply_pending_sysctls(&mut self) -> std::result::Result<(), Failure> {
-        while let Some(only) = self.sysctls_pending.first().cloned() {
-            self.apply_sysctls(only.as_deref()).map_err(|e| Failure {
+        if self.sysctls_pending.contains(&SysctlScope::Global) {
+            self.apply_sysctls(&SysctlScope::Global).map_err(|e| Failure {
                 op: "set sysctls".into(),
                 error: format!("{e:#}"),
                 route: None,
             })?;
-            if only.is_none() {
-                // Every setting, every interface included.
-                self.sysctls_pending.clear();
-            } else {
-                self.sysctls_pending.remove(&only);
+            self.sysctls_pending.remove(&SysctlScope::Global);
+        }
+        if self.sysctl_retry.as_ref().is_some_and(|r| Instant::now() < r.at) {
+            return Ok(());
+        }
+        let pending: Vec<SysctlScope> = self.sysctls_pending.iter().cloned().collect();
+        let mut failed = false;
+        for scope in pending {
+            let SysctlScope::Interface(i) = &scope else { continue };
+            match self.apply_sysctls(&scope) {
+                Ok(()) => {
+                    self.sysctls_pending.remove(&scope);
+                    if self.sysctls_failed.remove(i).is_some() {
+                        self.dirty = true;
+                    }
+                }
+                Err(e) => {
+                    error!(interface = %i, "apply_failed: set sysctls: {e:#}");
+                    if self.sysctls_failed.insert(i.clone(), format!("{e:#}")).is_none() {
+                        self.dirty = true;
+                    }
+                    failed = true;
+                }
             }
+        }
+        if failed {
+            self.degrade("apply_failed");
+            let backoff = self
+                .sysctl_retry
+                .as_ref()
+                .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
+            self.sysctl_retry = Some(Retry {
+                at: Instant::now() + backoff,
+                backoff,
+                attempt: SYSCTL_ATTEMPT.to_owned(),
+            });
+        } else {
+            self.sysctl_retry = None;
         }
         Ok(())
     }
@@ -869,7 +953,7 @@ impl Daemon {
             .map(|r| r.attempt.clone());
         // FR-REC-3: sysctls before the routes and rules that rely on them.
         if !self.sysctls_pending.is_empty() {
-            if waiting.as_deref() == Some(SYSCTL_ATTEMPT) {
+            if self.sysctls_pending.contains(&SysctlScope::Global) && waiting.as_deref() == Some(SYSCTL_ATTEMPT) {
                 self.evaluate();
                 return;
             }
@@ -1010,7 +1094,8 @@ impl Daemon {
     }
 
     fn applied(&mut self) {
-        if self.retry.take().is_some() || self.degraded.contains("apply_failed") {
+        let retried = self.retry.take().is_some();
+        if self.sysctls_failed.is_empty() && (retried || self.degraded.contains("apply_failed")) {
             info!("desired state fully applied");
             self.recover("apply_failed");
         }
@@ -1146,7 +1231,7 @@ impl Daemon {
         let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
         self.prune_paths(|k| configured.contains(&k.uplink));
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
-        self.sysctls_pending.insert(None);
+        self.sysctls_pending.extend(self.sysctl_scopes());
         info!("config_reloaded");
         self.dirty = true;
     }
@@ -1170,7 +1255,11 @@ impl Daemon {
                 info!("a netlink dump was still interrupted after its retries: full resynchronisation");
                 next_full = next_full.min(Instant::now() + RESYNC_AFTER_INTERRUPTED);
             }
-            let wake = self.retry.as_ref().map(|r| r.at).unwrap_or(next_full).min(next_full);
+            let wake = [&self.retry, &self.sysctl_retry]
+                .into_iter()
+                .flatten()
+                .map(|r| r.at)
+                .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
                 n = subscription.next() => match n {
