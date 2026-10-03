@@ -125,6 +125,14 @@ pub fn ruleset(config: &Config) -> String {
     g.restore_all();
     g.line(
         2,
+        "# Multicast and broadcast that the packet type misses (tunnels deliver",
+    );
+    g.line(2, "# them as host packets) are not assigned either (S2).");
+    g.line(2, "ip daddr { 224.0.0.0/4, 255.255.255.255 } return");
+    g.line(2, "ip6 daddr ff00::/8 return");
+    g.line(2, "meta nfproto ipv4 fib daddr type broadcast return");
+    g.line(
+        2,
         "# New inbound connection on an uplink: assign that uplink's path (INV-5).",
     );
     for (u, f) in &paths {
@@ -180,6 +188,8 @@ pub fn ruleset(config: &Config) -> String {
     g.line(2, "# Only unicast traffic is marked (§4.8).");
     g.line(2, "ip daddr { 224.0.0.0/4, 255.255.255.255 } return");
     g.line(2, "ip6 daddr ff00::/8 return");
+    g.line(2, "# Subnet-directed broadcasts of the egress interface (S2).");
+    g.line(2, "meta nfproto ipv4 fib daddr . oif type broadcast return");
     g.line(2, "# Connections that already have a path keep it (INV-2).");
     g.line(2, &format!("ct mark & {} != 0 return", g.mask()));
     for (u, f) in &paths {

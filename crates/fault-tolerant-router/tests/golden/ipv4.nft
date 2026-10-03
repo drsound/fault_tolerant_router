@@ -70,6 +70,11 @@ table inet fault_tolerant_router {
     ct mark & 0x00ff0000 == 0x003d0000 meta mark set meta mark & 0xff00ffff | 0x003d0000 return
     ct mark & 0x00ff0000 == 0x003e0000 meta mark set meta mark & 0xff00ffff | 0x003e0000 return
     ct mark & 0x00ff0000 == 0x003f0000 meta mark set meta mark & 0xff00ffff | 0x003f0000 return
+    # Multicast and broadcast that the packet type misses (tunnels deliver
+    # them as host packets) are not assigned either (S2).
+    ip daddr { 224.0.0.0/4, 255.255.255.255 } return
+    ip6 daddr ff00::/8 return
+    meta nfproto ipv4 fib daddr type broadcast return
     # New inbound connection on an uplink: assign that uplink's path (INV-5).
     # uplink "a", ipv4
     meta nfproto ipv4 iifname "wana" ct direction original ct mark set ct mark & 0xff00ffff | 0x00010000 meta mark set meta mark & 0xff00ffff | 0x00010000 return
@@ -159,6 +164,8 @@ table inet fault_tolerant_router {
     # Only unicast traffic is marked (§4.8).
     ip daddr { 224.0.0.0/4, 255.255.255.255 } return
     ip6 daddr ff00::/8 return
+    # Subnet-directed broadcasts of the egress interface (S2).
+    meta nfproto ipv4 fib daddr . oif type broadcast return
     # Connections that already have a path keep it (INV-2).
     ct mark & 0x00ff0000 != 0 return
     # uplink "a", ipv4
