@@ -80,6 +80,12 @@ enum AgentCommand {
         parallel: usize,
         #[arg(long)]
         udp: bool,
+        /// Source address to bind.
+        #[arg(long)]
+        bind: Option<std::net::IpAddr>,
+        /// Interface to bind (SO_BINDTODEVICE).
+        #[arg(long)]
+        device: Option<String>,
         #[arg(required = true)]
         dst: Vec<SocketAddr>,
     },
@@ -175,9 +181,12 @@ fn run(cli: Cli) -> Result<()> {
                 timeout_ms,
                 parallel,
                 udp,
+                bind,
+                device,
                 dst,
             } => {
-                let r = agent::connect(&dst, count, udp, Duration::from_millis(timeout_ms), parallel);
+                let binding = agent::Binding { source: bind, device };
+                let r = agent::connect(&dst, count, udp, Duration::from_millis(timeout_ms), parallel, &binding);
                 println!("{}", serde_json::to_string(&r)?);
             }
             AgentCommand::Flow {

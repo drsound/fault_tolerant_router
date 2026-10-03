@@ -159,6 +159,20 @@ impl Topology {
         udp: bool,
         timeout: Duration,
     ) -> Result<Vec<ConnResult>> {
+        self.connect_bound(node, dsts, count, udp, timeout, &crate::agent::Binding::default())
+    }
+
+    /// Like [`Topology::connect_to`], with sockets bound to a source address
+    /// and/or an interface.
+    pub fn connect_bound(
+        &self,
+        node: Node,
+        dsts: &[String],
+        count: usize,
+        udp: bool,
+        timeout: Duration,
+        binding: &crate::agent::Binding,
+    ) -> Result<Vec<ConnResult>> {
         let mut args = vec![
             "agent".to_owned(),
             "connect".into(),
@@ -169,6 +183,12 @@ impl Topology {
         ];
         if udp {
             args.push("--udp".into());
+        }
+        if let Some(a) = binding.source {
+            args.extend(["--bind".to_owned(), a.to_string()]);
+        }
+        if let Some(d) = &binding.device {
+            args.extend(["--device".to_owned(), d.clone()]);
         }
         args.extend(dsts.iter().cloned());
         let out = self.ns(node).run(&self.agent_bin().to_string_lossy(), &args)?;

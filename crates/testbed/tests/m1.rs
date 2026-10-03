@@ -444,14 +444,23 @@ fn as29_probes_leave_through_their_path() -> Result<()> {
     assert_eq!(balancing_members(&t)?, ["wanb"]);
     let (gwb, a) = (gateway(&t, Uplink::B)?, address(&t, Uplink::A)?);
     t.router().ip(&format!("route add 1.1.1.1/32 via {gwb} dev wanb"))?;
-    counter(&t, "wrong", &format!("oifname != \"wana\" ip saddr {a}"))?;
+    // Real interfaces only: traffic of the router to itself goes through `lo`.
+    counter(
+        &t,
+        "wrong",
+        &format!("oifname {{ \"wanb\", \"ppp0\", \"lan\" }} ip saddr {a}"),
+    )?;
     counter(&t, "probes", "oifname \"wana\" ip daddr 1.1.1.1 icmp type echo-request")?;
+    t.router().nft(&format!(
+        "table inet t_diag {{\n  set seen {{ type ifname . ipv4_addr; flags dynamic; }}\n  chain post {{\n    type filter hook postrouting priority 300; policy accept;\n    oifname != \"wana\" ip saddr {a} add @seen {{ oifname . ip daddr }}\n  }}\n}}\n"
+    ))?;
     std::thread::sleep(Duration::from_secs(4));
+    let seen = t.router().run("nft", ["list", "set", "inet", "t_diag", "seen"])?;
     assert!(counter_value(&t, "probes")? >= 3, "probes to 1.1.1.1 leave through A");
     assert_eq!(
         counter_value(&t, "wrong")?,
         0,
-        "nothing with A's address leaves elsewhere"
+        "nothing with A's address leaves elsewhere: {seen}"
     );
     assert!(
         !f.log().contains("uplink=1 family=ipv4 from=Up to=Down"),
@@ -1346,5 +1355,122 @@ fn as50_unmanaged_interface_replies_are_not_pinned() -> Result<()> {
     };
     assert!(other > 0, "replies continued through the other uplink");
     t.carrier_up(used)?;
+    Ok(())
+}
+
+/// AS-21: router-originated traffic. Unbound connections are balanced;
+/// connections bound to A's address use A, also outside the active set;
+/// connections bound to A's interface never leave through another interface
+/// and behave as §4.1.1 describes, for TCP and UDP, on the Ethernet and the
+/// point-to-point uplink, with the path in and outside the active set and
+/// with its path route withdrawn.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as21_router_originated_traffic() -> Result<()> {
+    use testbed::agent::Binding;
+    let t = build();
+    let f = t.start_ftr(&ftr::ipv4_config(&abc(), &HealthSpec::fast(), "", ""))?;
+    f.wait_installed(&t)?;
+    let ok = |r: &[testbed::ConnResult]| r.iter().all(|c| c.outcome == Outcome::Ok);
+    // Unbound: balanced over A and B.
+    let r = t.connect_to(Node::Router, &servers(1, 50), 200, false, Duration::from_secs(2))?;
+    let counts = tally(&r);
+    assert!(
+        ok(&r) && counts.contains_key(&Some(Uplink::A)) && counts.contains_key(&Some(Uplink::B)),
+        "{counts:?}"
+    );
+    let a: std::net::IpAddr = address(&t, Uplink::A)?.parse()?;
+    let by_addr = Binding {
+        source: Some(a),
+        device: None,
+    };
+    let by_dev = |d: &str| Binding {
+        source: None,
+        device: Some(d.to_owned()),
+    };
+    let check = |what: &str, b: &Binding, udp: bool, expect: Option<Uplink>| -> Result<()> {
+        let port = if udp {
+            testbed::plan::UDP_PORT
+        } else {
+            testbed::plan::TCP_PORT
+        };
+        let dsts: Vec<String> = servers(120, 10)
+            .iter()
+            .map(|d| d.replace(":7000", &format!(":{port}")))
+            .collect();
+        let r = t.connect_bound(Node::Router, &dsts, 20, udp, Duration::from_secs(2), b)?;
+        match expect {
+            Some(u) => assert!(
+                ok(&r) && tally(&r).get(&Some(u)) == Some(&20),
+                "{what}: {:?} {:?}",
+                tally(&r),
+                r.iter()
+                    .map(|c| (c.outcome, c.errno, c.local, c.observed))
+                    .take(4)
+                    .collect::<Vec<_>>()
+            ),
+            None => assert!(r.iter().all(|c| c.outcome != Outcome::Ok), "{what}: {:?}", tally(&r)),
+        }
+        Ok(())
+    };
+    check("bound to A's address", &by_addr, false, Some(Uplink::A))?;
+    for udp in [false, true] {
+        check("bound to wana", &by_dev("wana"), udp, Some(Uplink::A))?;
+        check("bound to ppp0", &by_dev("ppp0"), udp, Some(Uplink::C))?;
+    }
+    // A outside the active set (probes fail, path still ready).
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["ppp0", "wanb"], Duration::from_secs(10))?;
+    t.upstream_up(Uplink::A)?;
+    // While A recovers (rise rounds), it is still outside the active set.
+    check(
+        "bound to A's address outside the active set",
+        &by_addr,
+        false,
+        Some(Uplink::A),
+    )?;
+    check(
+        "bound to wana outside the active set",
+        &by_dev("wana"),
+        false,
+        Some(Uplink::A),
+    )?;
+    // A's path route withdrawn: the gateway disappears from main.
+    counter(
+        &t,
+        "elsewhere",
+        "oifname != \"wana\" oifname != \"lo\" ip daddr 198.18.100.120-198.18.100.129",
+    )?;
+    t.router().ip("route del default dev wana")?;
+    t.wait_for("A's path route withdrawn", Duration::from_secs(3), || {
+        Ok(path_route(&t, 1001)?.is_empty())
+    })?;
+    for udp in [false, true] {
+        // IPv4 sends on-link through the bound interface (§4.1.1): nothing
+        // answers on Ethernet.
+        check("bound to wana, path withdrawn", &by_dev("wana"), udp, None)?;
+    }
+    assert_eq!(counter_value(&t, "elsewhere")?, 0, "never through another interface");
+    // The point-to-point uplink with its path route withdrawn: the
+    // datagrams go to the peer, through ppp0 only.
+    counter(
+        &t,
+        "c_elsewhere",
+        "oifname != \"ppp0\" oifname != \"lo\" ip daddr 198.18.100.120-198.18.100.129",
+    )?;
+    let c = address(&t, Uplink::C)?;
+    t.router()
+        .ip(&format!("addr del {c}/32 dev ppp0"))
+        .or_else(|_| t.router().ip("addr flush dev ppp0"))?;
+    let udp_dsts: Vec<String> = servers(120, 10).iter().map(|d| d.replace(":7000", ":7001")).collect();
+    let _ = t.connect_bound(
+        Node::Router,
+        &udp_dsts,
+        10,
+        true,
+        Duration::from_secs(1),
+        &by_dev("ppp0"),
+    )?;
+    assert_eq!(counter_value(&t, "c_elsewhere")?, 0, "never through another interface");
     Ok(())
 }

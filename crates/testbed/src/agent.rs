@@ -223,7 +223,39 @@ fn classify(e: &io::Error) -> Outcome {
 }
 
 /// Opens one connection (TCP) or exchange (UDP) and reports what happened.
-fn one(dst: SocketAddr, udp: bool, timeout: Duration) -> ConnResult {
+/// Optional binding of the agent's sockets: a source address
+/// (`bind(2)`) and an interface (`SO_BINDTODEVICE`).
+#[derive(Clone, Debug, Default)]
+pub struct Binding {
+    pub source: Option<IpAddr>,
+    pub device: Option<String>,
+}
+
+impl Binding {
+    fn is_none(&self) -> bool {
+        self.source.is_none() && self.device.is_none()
+    }
+
+    fn socket(&self, dst: SocketAddr, udp: bool) -> io::Result<socket2::Socket> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let domain = if dst.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let (ty, proto) = if udp {
+            (Type::DGRAM, Protocol::UDP)
+        } else {
+            (Type::STREAM, Protocol::TCP)
+        };
+        let s = Socket::new(domain, ty, Some(proto))?;
+        if let Some(d) = &self.device {
+            s.bind_device(Some(d.as_bytes()))?;
+        }
+        if let Some(a) = self.source {
+            s.bind(&SocketAddr::new(a, 0).into())?;
+        }
+        Ok(s)
+    }
+}
+
+fn one(dst: SocketAddr, udp: bool, timeout: Duration, binding: &Binding) -> ConnResult {
     let start = Instant::now();
     let mut r = ConnResult {
         dst,
@@ -235,8 +267,13 @@ fn one(dst: SocketAddr, udp: bool, timeout: Duration) -> ConnResult {
     };
     let res: io::Result<String> = (|| {
         if udp {
-            let bind = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-            let s = UdpSocket::bind(bind)?;
+            let s = if binding.is_none() {
+                let bind = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                UdpSocket::bind(bind)?
+            } else {
+                let s: UdpSocket = binding.socket(dst, true)?.into();
+                s
+            };
             s.connect(dst)?;
             r.local = s.local_addr().ok();
             s.set_read_timeout(Some(timeout))?;
@@ -245,7 +282,13 @@ fn one(dst: SocketAddr, udp: bool, timeout: Duration) -> ConnResult {
             let n = s.recv(&mut buf)?;
             Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
         } else {
-            let s = TcpStream::connect_timeout(&dst, timeout)?;
+            let s = if binding.is_none() {
+                TcpStream::connect_timeout(&dst, timeout)?
+            } else {
+                let sock = binding.socket(dst, false)?;
+                sock.connect_timeout(&dst.into(), timeout)?;
+                sock.into()
+            };
             r.local = s.local_addr().ok();
             s.set_read_timeout(Some(timeout))?;
             let mut line = String::new();
@@ -265,20 +308,27 @@ fn one(dst: SocketAddr, udp: bool, timeout: Duration) -> ConnResult {
 }
 
 /// Opens `count` connections, cycling over `dsts`, with up to `parallel` in flight.
-pub fn connect(dsts: &[SocketAddr], count: usize, udp: bool, timeout: Duration, parallel: usize) -> Vec<ConnResult> {
+pub fn connect(
+    dsts: &[SocketAddr],
+    count: usize,
+    udp: bool,
+    timeout: Duration,
+    parallel: usize,
+    binding: &Binding,
+) -> Vec<ConnResult> {
     let next = Arc::new(AtomicUsize::new(0));
     let results = Arc::new(Mutex::new(Vec::with_capacity(count)));
     let dsts: Arc<Vec<SocketAddr>> = Arc::new(dsts.to_vec());
     let workers: Vec<_> = (0..parallel.clamp(1, count.max(1)))
         .map(|_| {
-            let (next, results, dsts) = (next.clone(), results.clone(), dsts.clone());
+            let (next, results, dsts, binding) = (next.clone(), results.clone(), dsts.clone(), binding.clone());
             thread::spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     if i >= count {
                         return;
                     }
-                    let r = one(dsts[i % dsts.len()], udp, timeout);
+                    let r = one(dsts[i % dsts.len()], udp, timeout, &binding);
                     if let Ok(mut v) = results.lock() {
                         v.push((i, r));
                     }
