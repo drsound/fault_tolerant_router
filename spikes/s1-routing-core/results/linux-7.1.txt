@@ -89,20 +89,22 @@ t1-rules.sh: 63 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Co
 ######## t2-devbound.sh
 == IPv4
 PASS v4 TCP connect bound to wana, A not in the active set: connects via A (source rule after on-link source selection)
-     wana:       1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [S.], seq 3666593623, ack 328955933, win 65160, options [mss 1460,sackOK,TS val 3333163167 ecr 1256144856,nop,wscale 10], length 0;      1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [P.], seq 1:11, ack 1, win 64, options [nop,nop,TS val 3333163167 ecr 1256144856], length 10;      1 IP 198.18.100.9.7 > 192.0.2.2.55648: Flags [F.], seq 11, ack 2, win 64, options [nop,nop,TS val 3333163167 ecr 1256144856], length 0;
+     wana:       1 IP 198.18.100.9.7 > 192.0.2.2.37086: Flags [S.], seq 4233876132, ack 689470590, win 65160, options [mss 1460,sackOK,TS val 745119344 ecr 1240348074,nop,wscale 10], length 0;      1 IP 198.18.100.9.7 > 192.0.2.2.37086: Flags [P.], seq 1:11, ack 1, win 64, options [nop,nop,TS val 745119345 ecr 1240348074], length 10;      1 IP 198.18.100.9.7 > 192.0.2.2.37086: Flags [F.], seq 11, ack 2, win 64, options [nop,nop,TS val 745119345 ecr 1240348075], length 0;
 PASS v4 unconnected UDP bound to wana, A not in the active set: no reply (sent on-link)
-     wana:       3 ARP, Request who-has 198.18.100.9 tell 192.0.2.2, length 28;      1 ARP, Request who-has 192.0.2.2 tell 192.0.2.1, length 28;      1 ARP, Reply 192.0.2.2 is-at 8e:82:ee:07:e5:ff, length 28;
+     wana:       3 ARP, Request who-has 198.18.100.9 tell 192.0.2.2, length 28;      1 ARP, Request who-has 192.0.2.2 tell 192.0.2.1, length 28;      1 ARP, Reply 192.0.2.2 is-at da:2e:c4:28:e3:c8, length 28;
 PASS v4 UDP bound to point-to-point wanc, all wanc tables and balancing empty: sent on-link, reply dropped by rp_filter (path guard)
-     wanc:       1 IP 203.0.113.2.41733 > 198.18.100.9.7: UDP, length 1;      1 IP 198.18.100.9.7 > 203.0.113.2.41733: UDP, length 12;      1 ;
+     wanc:       1 IP 203.0.113.2.52982 > 198.18.100.9.7: UDP, length 1;      1 IP 198.18.100.9.7 > 203.0.113.2.52982: UDP, length 12;      1 ;
      v4 UDP bound to non-FTR wanx: {"errors": {"timeout": 1}, "peers": {}}; wanx:       3 ARP, Request who-has 198.18.100.9 tell 100.127.0.2, length 28;      1 ;; leak sink counters v4 v6 = 0 0
 PASS v4 UDP bound to non-FTR wanx is only ARPed on-link (no IP packet reaches the sink)
+PASS v4 UDP with IP_UNICAST_IF wanc, all wanc tables and balancing empty: also sent on-link
 == IPv6
 PASS v6 TCP connect bound to wana, A not in the active set: source taken from wana, then source rule -> via A
 PASS v6 TCP connect bound to wana and A's address: via A
 PASS v6 unconnected UDP bound to wana, A not in the active set: via A (source rule)
 PASS v6 UDP bound to wanc, all wanc tables empty: rejected (source guard)
+PASS v6 UDP with IPV6_UNICAST_IF wanc, all wanc tables empty: rejected
 
-t2-devbound.sh: 8 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
+t2-devbound.sh: 10 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
 ######## t3-multipath.sh
 == IPv4 updates
 PASS v4 single A -> A,B
@@ -183,22 +185,22 @@ PASS v6 table holds only the new set
 PASS v6 active set {3} installed
      connections: {"errors": {}, "peers": {"C": 12}}
 PASS v6 active set {1 3} installed
-     connections: {"errors": {}, "peers": {"A": 6, "C": 6}}
+     connections: {"errors": {}, "peers": {"A": 7, "C": 5}}
 PASS v6 active set {1 2 3} installed
-     connections: {"errors": {}, "peers": {"A": 5, "B": 5, "C": 2}}
+     connections: {"errors": {}, "peers": {"A": 5, "B": 4, "C": 3}}
 PASS v6 active set {3} installed
      connections: {"errors": {}, "peers": {"C": 12}}
 PASS v6 active set {2 3} installed
-     connections: {"errors": {}, "peers": {"B": 4, "C": 8}}
+     connections: {"errors": {}, "peers": {"B": 7, "C": 5}}
 PASS v6 active set {3} installed
      connections: {"errors": {}, "peers": {"C": 12}}
 
 t3-multipath.sh: 36 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
 ######## t4-hash.sh
-PASS v4 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 487, "B": 513}})
-PASS v4 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 725, "B": 275}})
-PASS v6 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 497, "B": 503}})
-PASS v6 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 724, "B": 276}})
+PASS v4 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 488, "B": 512}})
+PASS v4 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 757, "B": 243}})
+PASS v6 weights 1:1 -> A gets 45-55% ({"errors": {}, "peers": {"A": 509, "B": 491}})
+PASS v6 weights 3:1 -> A gets 70-80% ({"errors": {}, "peers": {"A": 758, "B": 242}})
 == carrier loss on A before FTR reacts (route still lists A)
      v4 table: default proto 249 metric 100 nexthop via 192.0.2.1 dev wana weight 1 linkdown nexthop via 198.51.100.1 dev wanb weight 1 
 PASS v4 ignore_routes_with_linkdown=0: connections hashed to A fail
@@ -212,7 +214,7 @@ PASS v6 ignore_routes_with_linkdown=1: all new connections on B
 t4-hash.sh: 8 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
 ######## t5-pinning.sh
 == IPv4 outbound flow
-     flow pinned to path id 2 (ct mark 131072)
+     flow pinned to path id 1 (ct mark 65536)
 PASS v4 flow keeps working after its uplink leaves the active set
 PASS v4 flow keeps working with an empty active set
 PASS v4 flow summary: no error, gaps < 0.5 s
@@ -223,7 +225,7 @@ PASS v4 ... and nothing leaked
 PASS v4 inbound flow through B answered (replies leave via B)
 PASS v4 inbound flow through B with an empty active set
 == IPv6 outbound flow
-     flow pinned to path id 1 (ct mark 65536)
+     flow pinned to path id 3 (ct mark 196608)
 PASS v6 flow keeps working after its uplink leaves the active set
 PASS v6 flow keeps working with an empty active set
 PASS v6 flow summary: no error, gaps < 0.5 s
@@ -259,7 +261,7 @@ PASS R3 flows A B alive, flow C rejected by the path guard (AS-37)
 PASS R4 C's routes deleted: f4 10/10/0/0/0 f6 8/12/0/0/0 r4 10/10/0/0/0 r6 6/14/0/0/0
 PASS flow C never left through another interface (counters a b c x)
      flow C egress counters a/b/c/x: 0 0 0 0
-     flow C: {"error": "timeout", "max_gap": 0.102, "peer": "C", "received": 18, "sent": 37}
+     flow C: {"error": "timeout", "max_gap": 0.101, "peer": "C", "received": 16, "sent": 35}
 == FR-REC-3 adding uplink C back while flows on A and B run
 PASS A1 C's path routes: f4 8/12/0/0/0 f6 10/10/0/0/0 r4 8/12/0/0/0 r6 12/8/0/0/0
 PASS A2 C's lookup rules, source rule and guard: f4 8/12/0/0/0 f6 8/12/0/0/0 r4 8/12/0/0/0 r6 10/10/0/0/0
@@ -294,7 +296,7 @@ PASS v4 flow survived
 PASS v4 flow falls to balancing and leaves via another uplink (a b c x)
 PASS v4 moving the connection broke it
 -- damage 3: nftables table missing, routing intact (repair phase)
-     flow egress while the table is missing (a b c x): 0 1 3 0; flow alive
+     flow egress while the table is missing (a b c x): 0 3 1 0; flow alive
      new flows while the table is missing: f4 0/13/7/0/0 f6 0/14/6/0/0 r4 0/12/8/0/0 r6 0/8/12/0/0
 PASS v4 conntrack marks survived the table deletion
      flow after repair: alive
@@ -309,7 +311,7 @@ PASS v6 flow survived
 PASS v6 flow falls to balancing and leaves via another uplink (a b c x)
 PASS v6 moving the connection broke it
 -- damage 3: nftables table missing, routing intact (repair phase)
-     flow egress while the table is missing (a b c x): 0 3 2 0; flow alive
+     flow egress while the table is missing (a b c x): 0 3 1 0; flow alive
      new flows while the table is missing: f4 0/6/14/0/0 f6 0/11/9/0/0 r4 0/9/11/0/0 r6 0/8/12/0/0
 PASS v6 conntrack marks survived the table deletion
      flow after repair: alive
@@ -318,11 +320,11 @@ PASS v6 new flows correct after repair
 t7-startup.sh: 14 passed, 0 failed (kernel 7.1.13+deb13-amd64, nftables v1.1.3 (Commodore Bullmoose #4))
 ######## t8-source.sh
 == unbound router-originated connections over the balancing route
-PASS v4 TCP: sources spread over A, B, C primaries; secondary never chosen ({"errors": {}, "peers": {"A": 103, "B": 93, "C": 104, "local=A": 103, "local=B": 93, "local=C": 104}})
+PASS v4 TCP: sources spread over A, B, C primaries; secondary never chosen ({"errors": {}, "peers": {"A": 95, "B": 96, "C": 109, "local=A": 95, "local=B": 96, "local=C": 109}})
 PASS v4 TCP: secondary 192.0.2.3 not used for unbound traffic
-PASS v6 TCP: sources spread over A, B, C ({"errors": {}, "peers": {"A": 95, "B": 110, "C": 95, "local=A": 95, "local=B": 110, "local=C": 95}})
-PASS v4 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 32, "B": 36, "C": 32}})
-PASS v6 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 38, "B": 37, "C": 25}})
+PASS v6 TCP: sources spread over A, B, C ({"errors": {}, "peers": {"A": 99, "B": 92, "C": 109, "local=A": 99, "local=B": 92, "local=C": 109}})
+PASS v4 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 41, "B": 29, "C": 30}})
+PASS v6 unconnected UDP: sources spread ({"errors": {}, "peers": {"A": 36, "B": 35, "C": 29}})
 PASS source address always matches the egress uplink (mismatch v4 v6)
 == bound to an address (AS-42)
 PASS v4 bound to A's secondary address: via A, seen as 192.0.2.3
@@ -330,8 +332,8 @@ PASS v4 bound to A's secondary address with an empty active set: still via A
 PASS v4 unbound with an empty active set: rejected
 == FR-DISC-6: IPv6 uplink B without a global address, static source on the LAN, snat
 PASS v6 path route of B with a source on another interface accepted
-PASS v6 forwarded: B used with the snat source ({"errors": {}, "peers": {"A": 33, "2001:db8:b:1::1": 29, "C": 28}})
-     v6 unbound router traffic, sources: {"errors": {}, "peers": {"A": 92, "2001:db8:b:1::1": 103, "C": 105, "local=A": 92, "local=2001:db8:b:1::1": 103, "local=C": 105}}
+PASS v6 forwarded: B used with the snat source ({"errors": {}, "peers": {"A": 25, "2001:db8:b:1::1": 31, "C": 34}})
+     v6 unbound router traffic, sources: {"errors": {}, "peers": {"A": 86, "2001:db8:b:1::1": 103, "C": 111, "local=A": 86, "local=2001:db8:b:1::1": 103, "local=C": 111}}
 PASS v6 unbound router traffic: source always matches egress (mismatch v4 v6)
 PASS v6 bound to the static source: via B
 PASS v6 LAN host reaches the static source address; the reply follows the main bypass, not the source rule
