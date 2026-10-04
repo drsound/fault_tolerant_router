@@ -666,6 +666,7 @@ impl Daemon {
             RouteNetlinkMessage::NewRoute(r) | RouteNetlinkMessage::DelRoute(r) => {
                 let deleted = matches!(message, RouteNetlinkMessage::DelRoute(_));
                 match crate::netlink::msg::ObservedRoute::parse(r) {
+                    Some(r) if deleted && crate::test_hooks::hidden_deletion(r.family, r.table) => Change::None,
                     Some(r) => {
                         // Against the view before the notification is
                         // applied: which entries a replacement may have
@@ -1339,7 +1340,6 @@ impl Daemon {
             // before the next pass. FR-ROUTE-2's case: a failed IPv6
             // replacement can leave the table empty (the kernel removes the
             // members it inserted, and the old route is gone).
-            debug!(%family, table, "re-reading the table of the failed update");
             self.reread.insert((family, table));
             if let Some(key) = self
                 .paths

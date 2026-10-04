@@ -3047,10 +3047,19 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     let t = build();
     let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
     let faults = Faults::new(&mut f);
-    f.set_env("FTR_LOG", "debug");
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
+    // No more advertisements (their routes last 30 minutes): the address
+    // updates they cause re-read the uplinks' tables, the balancing table
+    // included, which would hide whether the failed update's own re-read
+    // happens.
+    for p in [Node::IspA, Node::IspB] {
+        t.ns(p).nft(
+            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert drop\n  }\n}\n",
+        )?;
+    }
+    std::thread::sleep(Duration::from_secs(1));
     t.reset_counters()?;
     let flows = start_flows(&t, Family::V6, 80, 6)?;
     let phase = |expected: &[Uplink], what: &str| -> Result<()> {
@@ -3069,14 +3078,9 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     faults.disarm()?;
     f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(70))?;
     phase(&[Uplink::B], "after the boundary")?;
-    // A comes back; the replacement fails after its first insertion.
-    let rereads = || {
-        f.log()
-            .lines()
-            .filter(|l| l.contains("re-reading the table of the failed update family=ipv6 table=1000"))
-            .count()
-    };
-    let before = rereads();
+    // A comes back; the replacement fails after its first insertion. The
+    // test hook hides the deletion's notification from the daemon, as a
+    // kernel failure need not send one.
     faults.arm_empty("replace ipv6 route of table 1000")?;
     t.clear_provider_rules(Uplink::A)?;
     t.wait_for(
@@ -3085,12 +3089,6 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
         || Ok(faults.injected()),
     )?;
     assert!(balancing_members(&t, Family::V6)?.is_empty(), "the old route is gone");
-    // The view is corrected by a re-read of the table: the simulation
-    // deletes the route with a notification, which a kernel failure need
-    // not send.
-    t.wait_for("the re-read of the balancing table", Duration::from_secs(5), || {
-        Ok(rereads() > before)
-    })?;
     let dsts = format!(
         "ip6 daddr {}-{}",
         testbed::plan::server(Family::V6, 150),
@@ -3116,10 +3114,18 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     );
     assert_eq!(t.ipv6_leaks()?, 0, "INV-3, INV-4");
     assert!(f.log().contains("multipath route replace failed") || f.log().contains("failure injected"));
+    // A fails again before the retry: the target is the previous set, {B},
+    // which the daemon's view would still hold without the re-read of the
+    // table after the failure, leaving the table empty.
+    t.drop_probe_echoes(Uplink::A, 1)?;
+    f.wait_log(&t, "uplink=1 family=ipv6 from=Up to=Down", 2, Duration::from_secs(15))?;
     faults.disarm()?;
     f.wait_log(&t, "desired state fully applied", 2, Duration::from_secs(70))?;
-    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(5))?;
-    phase(&[Uplink::A, Uplink::B], "after the retry")?;
+    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(5))?;
+    phase(&[Uplink::B], "after the retry")?;
+    t.clear_provider_rules(Uplink::A)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(15))?;
+    phase(&[Uplink::A, Uplink::B], "A back")?;
     let log = f.log();
     assert_eq!(log.matches("status_degraded").count(), 2, "{log}");
     assert_eq!(log.matches("status_recovered").count(), 2, "{log}");

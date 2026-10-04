@@ -251,10 +251,16 @@ where
                 // The outcome of FR-ROUTE-2's IPv6 failure after the first
                 // insertion, which needs an allocation failure in the
                 // kernel: the old route is gone, the new one not installed.
+                // Its deletion notification is hidden from the daemon, which
+                // handles notifications only after this pass.
                 let key = msg::route_delete_key(r.family, r.table, protocol);
-                let _ = client
+                if client
                     .mutate(RouteNetlinkMessage::DelRoute(key), Mutation::Delete)
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    crate::test_hooks::hide_deletion(r.family, r.table);
+                }
             }
             return Err(fail(e.message));
         }

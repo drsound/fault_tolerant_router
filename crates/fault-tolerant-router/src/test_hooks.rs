@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use crate::model::Family;
+
 /// `FTR_TEST_BOOTTIME_SHIFT_MS`: milliseconds added to `CLOCK_BOOTTIME`, so
 /// that a scenario can age the health checkpoint past its maximum age on a
 /// host that booted less than that age ago (AS-47).
@@ -105,6 +107,29 @@ pub fn step(name: impl std::fmt::Display) -> Result<(), Injected> {
     result
 }
 
+/// The table whose route an `empty:` failure removed: the daemon ignores
+/// the deletion's notification, as a kernel failure need not send one, so
+/// that only the re-read of the table corrects its view (AS-36).
+#[cfg(feature = "test-hooks")]
+static HIDDEN: std::sync::Mutex<Option<(Family, u32)>> = std::sync::Mutex::new(None);
+
+/// Records the deletion that the simulated failure performs next.
+#[cfg(feature = "test-hooks")]
+pub fn hide_deletion(family: Family, table: u32) {
+    *HIDDEN.lock().unwrap_or_else(|e| e.into_inner()) = Some((family, table));
+}
+
+/// Whether a deletion notification is the hidden one; it is consumed.
+#[cfg(feature = "test-hooks")]
+pub fn hidden_deletion(family: Family, table: u32) -> bool {
+    let mut hidden = HIDDEN.lock().unwrap_or_else(|e| e.into_inner());
+    if *hidden == Some((family, table)) {
+        *hidden = None;
+        return true;
+    }
+    false
+}
+
 #[cfg(not(feature = "test-hooks"))]
 pub fn boottime_shift_ms() -> u64 {
     0
@@ -118,4 +143,12 @@ pub fn gateway_warning(default: Duration) -> Duration {
 #[cfg(not(feature = "test-hooks"))]
 pub fn step(_name: impl std::fmt::Display) -> Result<(), Injected> {
     Ok(())
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn hide_deletion(_family: Family, _table: u32) {}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn hidden_deletion(_family: Family, _table: u32) -> bool {
+    false
 }
