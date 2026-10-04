@@ -2992,7 +2992,10 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
                 ("A back", vec![Uplink::B], vec![Uplink::A, Uplink::B]),
             ] {
                 let recovered = f.log().matches("desired state fully applied").count();
-                faults.arm(0)?;
+                // Only this family's routes: in the IPv6 variant (dual-stack)
+                // A's IPv4 path fails too, and a rejected IPv4 update and its
+                // retry would otherwise stand for the IPv6 boundary.
+                faults.arm_matching(&format!("{fam} route"))?;
                 if change == "A out" {
                     t.drop_probe_echoes(Uplink::A, 1)?;
                 } else {
@@ -3004,7 +3007,11 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
                     || Ok(faults.injected()),
                 )?;
                 assert!(
-                    faults.steps().iter().all(|s| s.ends_with(" failed")),
+                    faults
+                        .steps()
+                        .iter()
+                        .filter(|s| s.contains(&format!("{fam} route")))
+                        .all(|s| s.ends_with(" failed")),
                     "rejected before any mutation: {:?}",
                     faults.steps()
                 );
