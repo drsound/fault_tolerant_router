@@ -430,10 +430,15 @@ per_family!(as06_deterministic_loss_violates_the_loss_gate);
 /// clearing of the window (FR-PROBE-5).
 fn as06_deterministic_loss_violates_the_loss_gate(fam: Family) -> Result<()> {
     let t = build();
-    let health = with_gates("max_loss = 0.2\n");
-    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &health, "", ""))?;
+    // The gate is enabled once the topology forwards steadily (as AS-39).
+    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let health = with_gates("max_loss = 0.2\n");
+    f.write_config(&polywan::config(&ab(), &[fam], &health, "", ""))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     t.drop_probe_echoes(Uplink::A, 3)?;
     f.wait_log(
         &t,
@@ -483,14 +488,22 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
         ));
         polywan::config(&ab(), &[fam], &health, "", "")
     };
-    let mut f = t.start_polywan(&config("100ms"))?;
+    // Gates are enabled once the topology forwards steadily: the first
+    // echoes after startup can be lost while neighbours are resolved. The
+    // reload changes the sampling mode, so the window starts empty.
+    let mut f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    std::thread::sleep(Duration::from_secs(2));
+    f.write_config(&config("100ms"))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     // More than quality_min_samples samples and five RTTs and differences.
     std::thread::sleep(Duration::from_secs(10));
     let log = f.log();
+    let gated = log.split("config_reloaded").nth(1).unwrap_or_default();
     assert!(
-        !log.contains("quality gate violated") && !log.contains("reason=degraded"),
+        !gated.contains("quality gate violated") && !gated.contains("reason=degraded"),
         "{log}"
     );
     f.write_config(&config("5ms"))?;
@@ -515,6 +528,91 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
         Duration::from_secs(8),
     )?;
     t.clear_target_delays(Uplink::A)?;
+    f.stop()?;
+    Ok(())
+}
+
+/// IMPL-4 and FR-HEALTH-5: while the nftables lane applies a slow
+/// transaction (a reload adding a policy, 5 s), and while the persistence
+/// lane writes slowly (a reload adding C, 5 s per job), a carrier loss on B
+/// still withdraws B within a second; both reloads complete afterwards.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let nft = t.router().sh("command -v nft")?.trim().to_owned();
+    let slow = f.dir.join("nft-slow");
+    let wrapper = t.exec_dir()?.join("nft");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -e {slow} ] && [ \"$1\" = -f ]; then sleep 5; fi\nexec {nft} \"$@\"\n",
+            slow = slow.display()
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    let writes = f.dir.join("slow-writes");
+    f.set_env("POLYWAN_TEST_SLOW_WRITES", &writes.display().to_string());
+    let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
+    let policy = policies(&[("p", Family::V4, "a", "balance", "protocol = \"udp\"\n")]);
+    let config = |uplinks: &[polywan::UplinkSpec], extra: &str| {
+        polywan::config(
+            uplinks,
+            &[Family::V4],
+            &HealthSpec::fast(),
+            "",
+            &format!("{firewall}{extra}"),
+        )
+    };
+    f.write_config(&config(&ab(), ""))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    // FR-HEALTH-5 counts from the kernel's notification, which the kernel
+    // can delay under the load of parallel scenarios (Linux 6.1).
+    let withdrawn = |f: &polywan::Polywan, what: &str| -> Result<()> {
+        let monitor = t.router().monitor_links()?;
+        t.carrier_down(Uplink::B)?;
+        wait_members(&t, Family::V4, &["wana"], Duration::from_secs(5))?;
+        let withdrawn = Instant::now();
+        let notified = monitor
+            .first(&["wanb", "NO-CARRIER"])
+            .ok_or_else(|| anyhow::anyhow!("{what}: no carrier notification for wanb"))?;
+        let took = withdrawn.duration_since(notified);
+        assert!(
+            took <= Duration::from_secs(1),
+            "{what}: B withdrawn {took:?} after the notification\n{}",
+            f.log()
+        );
+        t.carrier_up(Uplink::B)?;
+        Ok(())
+    };
+
+    // A slow nftables application.
+    std::fs::write(&slow, "")?;
+    f.write_config(&config(&ab(), &policy))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(500));
+    withdrawn(&f, "slow nft")?;
+    std::fs::remove_file(&slow)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(20))?;
+    t.wait_for("the policy rule installed", Duration::from_secs(15), || {
+        Ok(t.router()
+            .sh("nft list table inet polywan")?
+            .contains("meta l4proto udp"))
+    })?;
+
+    // Slow persistence: the reload's binding waits behind slow writes.
+    std::fs::write(&writes, "5000")?;
+    f.write_config(&config(&abc(), &policy))?;
+    f.reload()?;
+    std::thread::sleep(Duration::from_millis(500));
+    withdrawn(&f, "slow persistence")?;
+    f.wait_log(&t, "config_reloaded", 2, Duration::from_secs(30))?;
+    std::fs::remove_file(&writes)?;
+    wait_members(&t, Family::V4, &["ppp0", "wana", "wanb"], Duration::from_secs(30))?;
     f.stop()?;
     Ok(())
 }

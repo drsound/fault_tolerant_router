@@ -228,8 +228,48 @@ pub async fn execute<F, Fut>(
     scope: &crate::system::Scope,
     protocol: u8,
     ops: Vec<Op>,
-    mut nft: F,
+    nft: F,
 ) -> Result<usize, Failure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run(client, system, scope, protocol, ops, Some(nft))
+        .await
+        .map(|(done, _)| done)
+}
+
+/// Like [`execute`], but stops at the nftables step, whose test hook has
+/// passed: the caller applies the table outside the State task (IMPL-4) and
+/// runs the operations that follow it once the application succeeded.
+/// Returns whether the nftables step was reached.
+pub async fn execute_until_nft(
+    client: &Client,
+    system: &mut System,
+    scope: &crate::system::Scope,
+    protocol: u8,
+    ops: Vec<Op>,
+) -> Result<bool, Failure> {
+    run(
+        client,
+        system,
+        scope,
+        protocol,
+        ops,
+        None::<fn() -> std::future::Ready<Result<(), String>>>,
+    )
+    .await
+    .map(|(_, nft_due)| nft_due)
+}
+
+async fn run<F, Fut>(
+    client: &Client,
+    system: &mut System,
+    scope: &crate::system::Scope,
+    protocol: u8,
+    ops: Vec<Op>,
+    mut nft: Option<F>,
+) -> Result<(usize, bool), Failure>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
@@ -265,7 +305,10 @@ where
             return Err(fail(e.message));
         }
         match &op {
-            Op::ApplyNft => nft().await.map_err(fail)?,
+            Op::ApplyNft => match nft.as_mut() {
+                Some(nft) => nft().await.map_err(fail)?,
+                None => return Ok((done, true)),
+            },
             _ => {
                 let (message, kind, tolerated) = netlink_op(&op, protocol);
                 match client.mutate(message.clone(), kind).await {
@@ -278,7 +321,7 @@ where
         }
         done += 1;
     }
-    Ok(done)
+    Ok((done, false))
 }
 
 /// The message of an operation, its flags and the errnos that mean the

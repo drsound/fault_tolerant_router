@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,7 @@ use crate::select::{self, Candidate};
 use crate::state::{self, Checkpoint, InstanceLock, Manifest, PathCheckpoint, StateDir};
 use crate::sysctl;
 use crate::system::{Change, Scope, System};
+use crate::worker::{self, Done, Io, Lanes, Lost, NftJob, PersistJob, SysctlScope};
 
 pub struct Options {
     pub config: PathBuf,
@@ -122,22 +124,6 @@ struct Retry {
     attempt: String,
 }
 
-/// A set of sysctls applied together.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum SysctlScope {
-    Global,
-    Interface(String),
-}
-
-impl std::fmt::Display for SysctlScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SysctlScope::Global => f.write_str("global"),
-            SysctlScope::Interface(i) => f.write_str(i),
-        }
-    }
-}
-
 /// The attempt of a failed sysctl application.
 const SYSCTL_ATTEMPT: &str = "sysctls";
 
@@ -149,8 +135,61 @@ struct Ownership {
     clean_reconciliations: u8,
 }
 
+/// The settings of one scope and whether they are managed or only checked.
+type SysctlJob = (Vec<sysctl::Setting>, bool);
+
+/// The nftables transaction being applied by the nftables lane (IMPL-4).
+struct NftFlight {
+    seq: u64,
+    transaction: String,
+    configured: BTreeSet<Assignment>,
+    /// The operations of the pass that started it, for the retry of a
+    /// failure (FR-REC-5).
+    attempt: String,
+}
+
+/// A reload in progress: validated on the I/O runtime, then bound in the
+/// manifest by the persistence lane, then committed (FR-CFG-3).
+enum ReloadPhase {
+    Validating(u64),
+    Binding {
+        seq: u64,
+        config: Arc<Config>,
+        drained: BTreeSet<UplinkId>,
+    },
+}
+
 struct Daemon {
     cfg: Config,
+    config_path: PathBuf,
+    /// The I/O thread; taken at shutdown, which stops its lanes.
+    io: Option<Io>,
+    lanes: Lanes,
+    /// Sequence numbers of the jobs given to the lanes.
+    seq: u64,
+    nft_flight: Option<NftFlight>,
+    inspection: Option<u64>,
+    /// Scopes whose settings the persistence lane is applying, with the
+    /// job's sequence number; a reload forgets them, so that a completion of
+    /// superseded settings only updates the manifest.
+    sysctls_flight: BTreeMap<SysctlScope, (u64, SysctlJob)>,
+    /// The settings last applied (or checked) per scope. A reload checks
+    /// every scope again, but settings applied earlier keep their paths
+    /// ready meanwhile; only new settings and failures take them out
+    /// (FR-CFG-3, FR-DISC-7).
+    sysctls_applied: BTreeMap<SysctlScope, SysctlJob>,
+    /// Startup (installation, FR-REC-1 step 2): passes wait until the first
+    /// settings of every scope completed, so that warm adoption never sees
+    /// the paths of pending interfaces as not ready (FR-REC-8).
+    installing: bool,
+    hand_back: Option<(u64, String)>,
+    reload: Option<ReloadPhase>,
+    reload_again: bool,
+    /// Operations applied since the last pass that left nothing to do,
+    /// across the passes an nftables application splits.
+    applied_ops: usize,
+    /// An internal task ended (FR-REC-7): the daemon exits with this error.
+    fatal: Option<String>,
     layout: Layout,
     scope: Scope,
     protocol: u8,
@@ -316,7 +355,29 @@ pub async fn run(opts: Options) -> Result<()> {
     report(&findings)?;
 
     let (probe_tx, probe_rx) = mpsc::channel(256);
+    let mut manifest = manifest;
+    if !opts.dry_run {
+        // Write-ahead (IMPL-5, FR-REC-1 step 1): before any mutation.
+        manifest.bind(&cfg);
+        state_dir.write_manifest(&manifest).context("writing the manifest")?;
+    }
+    let io = Io::start().context("starting the I/O thread")?;
+    let (lanes, done_rx) = Lanes::start(&io, state_dir.clone(), manifest.clone());
     let mut d = Daemon {
+        config_path: opts.config.clone(),
+        io: Some(io),
+        lanes,
+        seq: 0,
+        nft_flight: None,
+        inspection: None,
+        sysctls_flight: BTreeMap::new(),
+        sysctls_applied: BTreeMap::new(),
+        installing: true,
+        hand_back: None,
+        reload: None,
+        reload_again: false,
+        applied_ops: 0,
+        fatal: None,
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -355,10 +416,6 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.dry_run {
         return d.dry_run();
     }
-    d.manifest.bind(&d.cfg);
-    d.state_dir
-        .write_manifest(&d.manifest)
-        .context("writing the manifest")?;
     // Applied by the first pass, with the failure handling of any other
     // (FR-REC-3, FR-REC-5).
     d.sysctls_pending.extend(d.sysctl_scopes());
@@ -382,7 +439,8 @@ pub async fn run(opts: Options) -> Result<()> {
                 .collect(),
         );
     }
-    d.check_nft().await;
+    let listing = nftctl::table(&d.cfg.firewall.nft_path).await;
+    d.check_nft(listing);
     info!(
         uplinks = d.cfg.uplinks.len(),
         mode = ?d.cfg.firewall.mode,
@@ -392,7 +450,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if d.cfg.firewall.mode == FirewallMode::External {
         info!("external firewall mode: marking and NAT are the administrator's responsibility (export-nft)");
     }
-    d.event_loop(subscription, probe_rx, &opts).await
+    d.event_loop(subscription, probe_rx, done_rx).await
 }
 
 /// The system checks of `check-config` without `--offline` (§9).
@@ -527,52 +585,11 @@ impl Daemon {
         }
     }
 
-    /// FR-SYS: record baselines (write-ahead), then change; with
-    /// `manage_sysctls = false`, only warn. `only` restricts to one interface.
-    fn apply_sysctls(&mut self, scope: &SysctlScope) -> Result<()> {
-        let wanted: Vec<_> = sysctl::desired(&self.cfg)
-            .into_iter()
-            .filter(|s| match scope {
-                SysctlScope::Global => s.interface.is_none(),
-                SysctlScope::Interface(i) => s.interface.as_ref() == Some(i),
-            })
-            .collect();
-        let diffs = match sysctl::differences(&wanted, sysctl::read) {
-            Ok(diffs) => diffs,
-            // Only checked, never a prerequisite of readiness.
-            Err(e) if !self.cfg.routing.manage_sysctls => {
-                warn!("checking sysctls: {e} (manage_sysctls = false)");
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if diffs.is_empty() {
-            return Ok(());
-        }
-        if !self.cfg.routing.manage_sysctls {
-            for d in diffs {
-                warn!(
-                    "{} is {}, PolyWAN needs {} (manage_sysctls = false)",
-                    d.setting.display(),
-                    d.current,
-                    d.setting.value
-                );
-            }
-            return Ok(());
-        }
-        sysctl::record(&mut self.manifest, &diffs);
-        self.state_dir.write_manifest(&self.manifest)?;
-        crate::test_hooks::step(format_args!("set sysctls ({scope})")).map_err(|e| anyhow::anyhow!(e))?;
-        for d in diffs {
-            sysctl::write(&d.setting.key, d.setting.value).with_context(|| d.setting.display())?;
-            info!("set {} = {} (was {})", d.setting.display(), d.setting.value, d.current);
-        }
-        Ok(())
-    }
-
-    async fn check_nft(&mut self) {
+    /// The comparisons of PolyWAN's table listed by an inspection
+    /// (FR-REC-6, FR-FW-2).
+    fn check_nft(&mut self, listing: std::result::Result<Option<serde_json::Value>, String>) {
         if self.cfg.firewall.mode == FirewallMode::External {
-            match nftctl::table(&self.cfg.firewall.nft_path).await {
+            match listing {
                 Ok(Some(_)) => {
                     self.recover("external_ruleset_missing");
                 }
@@ -589,7 +606,7 @@ impl Daemon {
             }
             return;
         }
-        match nftctl::table(&self.cfg.firewall.nft_path).await {
+        match listing {
             Ok(listing) => {
                 let differs = listing.is_none() || (self.nft_listing.is_some() && listing != self.nft_listing);
                 if differs && self.nft_applied.is_some() {
@@ -617,12 +634,6 @@ impl Daemon {
         if self.degraded.remove(reason) && self.degraded.is_empty() {
             info!(reason, "status_recovered");
         }
-    }
-
-    /// FR-CT-2 runtime inspection against the running configuration.
-    async fn inspect_flowtables(&mut self) {
-        let listing = nftctl::flowtables(&self.cfg.firewall.nft_path).await;
-        self.record_flowtables(&listing);
     }
 
     /// The `flow_offload` reason from a flowtable listing, against the
@@ -719,6 +730,9 @@ impl Daemon {
             }
             _ => self.system.apply(&self.scope, &message),
         };
+        if let Change::Link(i) = &change {
+            debug!(ifindex = i, "link changed");
+        }
         let third_party = port != 0 && port != self.client.port();
         if third_party && let Some(r) = removed_rule {
             warn!(
@@ -759,8 +773,9 @@ impl Daemon {
                     {
                         // A new incarnation of the interface gets its
                         // settings at once, not after the old one's backoff.
-                        self.sysctls_pending
-                            .insert(SysctlScope::Interface(up.interface.clone()));
+                        let scope = SysctlScope::Interface(up.interface.clone());
+                        self.sysctls_applied.remove(&scope);
+                        self.sysctls_pending.insert(scope);
                         self.sysctl_retries.remove(&up.interface);
                     }
                 }
@@ -948,7 +963,23 @@ impl Daemon {
     }
 
     fn write_checkpoint(&mut self) {
-        let c = Checkpoint {
+        let c = self.checkpoint();
+        // Best effort: a full queue drops it, the next one supersedes it.
+        if self.lanes.persist(PersistJob::Checkpoint(Box::new(c))) == Err(Lost::Closed) {
+            self.lost();
+        }
+        self.last_checkpoint = Instant::now();
+    }
+
+    /// At shutdown, once the lanes have stopped.
+    fn write_checkpoint_now(&mut self) {
+        if let Err(e) = self.state_dir.write_checkpoint(&self.checkpoint()) {
+            warn!("health checkpoint: {e}");
+        }
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
             version: 1,
             boot_id: self.boot_id.clone(),
             boottime_ms: now_ms(),
@@ -983,11 +1014,17 @@ impl Daemon {
                 .get(&Family::V6)
                 .map(|s| s.iter().map(|i| i.get()).collect())
                 .unwrap_or_default(),
-        };
-        if let Err(e) = self.state_dir.write_checkpoint(&c) {
-            warn!("health checkpoint: {e}");
         }
-        self.last_checkpoint = Instant::now();
+    }
+
+    /// A lane is gone (FR-REC-7).
+    fn lost(&mut self) {
+        self.fatal = Some("an internal I/O lane stopped".into());
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
     }
 
     /// Discovery, readiness, probers and active sets; returns the planner
@@ -1013,11 +1050,10 @@ impl Daemon {
                 d.ready = Err(Reason::RouteInstallFailed);
             }
             // The interface's settings are part of the path's installation:
-            // a path is not ready while they are pending, failed or not.
+            // a path is not ready until those of its family are applied, nor
+            // while they fail.
             if let Some(u) = self.cfg.uplink(key.uplink)
-                && self
-                    .sysctls_pending
-                    .contains(&SysctlScope::Interface(u.interface.clone()))
+                && self.sysctls_unapplied(&SysctlScope::Interface(u.interface.clone()), Some(key.family))
                 && d.ready.is_ok()
             {
                 debug!(
@@ -1044,12 +1080,16 @@ impl Daemon {
                     } else {
                         format!("{} ms", delay.as_millis())
                     };
-                    warn!(
-                        uplink = %u.name,
-                        "no IPv6 default route discovered on {} {delay} after startup or after its link came up: {}; a static gateway avoids depending on Router Advertisements (FR-SYS-3)",
-                        u.interface,
-                        checks::gateway_causes(&u.interface, sysctl::read)
-                    );
+                    // The causes come from the interface's settings, read
+                    // outside the State task (IMPL-4).
+                    let job = PersistJob::GatewayWarning {
+                        uplink: u.name.clone(),
+                        interface: u.interface.clone(),
+                        delay,
+                    };
+                    if self.lanes.persist(job) == Err(Lost::Closed) {
+                        self.fatal = Some("an internal I/O lane stopped".into());
+                    }
                 }
             } else {
                 p.gateway_wait = None;
@@ -1171,6 +1211,42 @@ impl Daemon {
             .collect()
     }
 
+    /// Whether the settings of `scope` that matter to `family` (`None`: all
+    /// of them) are pending without an earlier application: the
+    /// prerequisite of readiness is not met (FR-DISC-7). Settings that are
+    /// only checked (`manage_sysctls = false`) are never a prerequisite.
+    fn sysctls_unapplied(&self, scope: &SysctlScope, family: Option<Family>) -> bool {
+        if !self.cfg.routing.manage_sysctls || !self.sysctls_pending.contains(scope) {
+            return false;
+        }
+        let Some((applied, true)) = self.sysctls_applied.get(scope) else {
+            return true;
+        };
+        let wanted = self.wanted_sysctls().remove(scope).map(|j| j.0).unwrap_or_default();
+        !wanted
+            .iter()
+            .filter(|s| family.is_none() || s.family.is_none() || s.family == family)
+            .all(|s| applied.contains(s))
+    }
+
+    /// The wanted settings of every scope, and whether they are managed.
+    fn wanted_sysctls(&self) -> BTreeMap<SysctlScope, SysctlJob> {
+        let manage = self.cfg.routing.manage_sysctls;
+        let mut m: BTreeMap<SysctlScope, SysctlJob> = self
+            .sysctl_scopes()
+            .into_iter()
+            .map(|s| (s, (Vec::new(), manage)))
+            .collect();
+        for s in sysctl::desired(&self.cfg) {
+            let scope = match &s.interface {
+                Some(i) => SysctlScope::Interface(i.clone()),
+                None => SysctlScope::Global,
+            };
+            m.entry(scope).or_insert_with(|| (Vec::new(), manage)).0.push(s);
+        }
+        m
+    }
+
     /// Every scope of the desired settings: the global ones, then each
     /// interface's.
     fn sysctl_scopes(&self) -> Vec<SysctlScope> {
@@ -1183,55 +1259,97 @@ impl Daemon {
             .collect()
     }
 
-    /// Applies the pending sysctls before the routes and rules that rely on
-    /// them (FR-REC-3). A failure of the global settings fails the pass:
-    /// everything depends on them. A failure of an interface's settings
-    /// keeps them pending, retried with that interface's own backoff, and
-    /// the rest of the pass goes on (FR-REC-5); `evaluate` keeps the
-    /// uplinks of interfaces with pending settings not ready.
-    fn apply_pending_sysctls(&mut self, global: bool) -> std::result::Result<(), Failure> {
-        let pending: Vec<SysctlScope> = self.sysctls_pending.iter().cloned().collect();
-        for scope in pending {
-            let SysctlScope::Interface(i) = &scope else { continue };
-            if self.sysctl_retries.get(i).is_some_and(|r| Instant::now() < r.at) {
+    /// Gives the pending sysctls to the persistence lane, before the routes
+    /// and rules that rely on them (FR-REC-3): the interfaces' first, then
+    /// the global ones unless `global` is false (their retry waits for its
+    /// backoff). An interface whose settings are pending or failed keeps its
+    /// paths not ready; it is retried with its own backoff, and no other
+    /// interface waits for it (FR-DISC-7).
+    fn dispatch_sysctls(&mut self, global: bool) {
+        let mut scopes: Vec<SysctlScope> = self.sysctls_pending.iter().cloned().collect();
+        // Interfaces first: a failure of the global settings does not keep
+        // them from their own.
+        scopes.sort_by_key(|s| *s == SysctlScope::Global);
+        for scope in scopes {
+            if self.sysctls_flight.contains_key(&scope) {
                 continue;
             }
-            match self.apply_sysctls(&scope) {
+            match &scope {
+                SysctlScope::Interface(i) if self.sysctl_retries.get(i).is_some_and(|r| Instant::now() < r.at) => {
+                    continue;
+                }
+                SysctlScope::Global if !global => continue,
+                _ => {}
+            }
+            let wanted = self.wanted_sysctls().remove(&scope).unwrap_or_default();
+            let seq = self.next_seq();
+            let job = PersistJob::Sysctls {
+                seq,
+                scope: scope.clone(),
+                settings: wanted.0.clone(),
+                manage: wanted.1,
+            };
+            match self.lanes.persist(job) {
                 Ok(()) => {
-                    self.sysctls_pending.remove(&scope);
+                    self.sysctls_flight.insert(scope, (seq, wanted));
+                }
+                // Retried by the next pass.
+                Err(Lost::Full) => self.dirty = true,
+                Err(Lost::Closed) => self.lost(),
+            }
+        }
+    }
+
+    /// A completed sysctl application (FR-REC-5, FR-DISC-7).
+    fn sysctls_done(&mut self, seq: u64, scope: SysctlScope, result: std::result::Result<(), String>) {
+        if !matches!(self.sysctls_flight.get(&scope), Some((s, _)) if *s == seq) {
+            // Superseded by a reload: applied again if still wanted.
+            return;
+        }
+        let Some((_, job)) = self.sysctls_flight.remove(&scope) else {
+            return;
+        };
+        self.dirty = true;
+        match (result, &scope) {
+            (Ok(()), _) => {
+                self.sysctls_pending.remove(&scope);
+                self.sysctls_applied.insert(scope.clone(), job);
+                if let SysctlScope::Interface(i) = &scope {
                     self.sysctl_retries.remove(i);
                     self.sysctls_failed.remove(i);
                 }
-                Err(e) => {
-                    error!(interface = %i, "apply_failed: set sysctls: {e:#}");
-                    self.sysctls_failed.insert(i.clone(), format!("{e:#}"));
-                    self.degrade("apply_failed");
-                    let backoff = self
-                        .sysctl_retries
-                        .get(i)
-                        .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
-                    self.sysctl_retries.insert(
-                        i.clone(),
-                        Retry {
-                            at: Instant::now() + backoff,
-                            backoff,
-                            attempt: SYSCTL_ATTEMPT.to_owned(),
-                        },
-                    );
-                }
+            }
+            (Err(e), SysctlScope::Interface(i)) => {
+                let i = i.clone();
+                self.sysctls_applied.remove(&scope);
+                error!(interface = %i, "apply_failed: set sysctls: {e}");
+                self.sysctls_failed.insert(i.clone(), e);
+                self.degrade("apply_failed");
+                let backoff = self
+                    .sysctl_retries
+                    .get(&i)
+                    .map_or(Duration::from_secs(1), |r| (r.backoff * 2).min(Duration::from_secs(60)));
+                self.sysctl_retries.insert(
+                    i,
+                    Retry {
+                        at: Instant::now() + backoff,
+                        backoff,
+                        attempt: SYSCTL_ATTEMPT.to_owned(),
+                    },
+                );
+            }
+            (Err(e), SysctlScope::Global) => {
+                self.sysctls_applied.remove(&scope);
+                self.failed(
+                    Failure {
+                        op: "set sysctls".into(),
+                        error: e,
+                        route: None,
+                    },
+                    SYSCTL_ATTEMPT.to_owned(),
+                )
             }
         }
-        // Interfaces first: a failure of the global settings does not keep
-        // them from their own.
-        if global && self.sysctls_pending.contains(&SysctlScope::Global) {
-            self.apply_sysctls(&SysctlScope::Global).map_err(|e| Failure {
-                op: "set sysctls".into(),
-                error: format!("{e:#}"),
-                route: None,
-            })?;
-            self.sysctls_pending.remove(&SysctlScope::Global);
-        }
-        Ok(())
     }
 
     /// One reconciliation pass.
@@ -1245,11 +1363,17 @@ impl Daemon {
         // FR-REC-3: sysctls before the routes and rules that rely on them.
         if !self.sysctls_pending.is_empty() {
             let global = waiting.as_deref() != Some(SYSCTL_ATTEMPT);
-            if let Err(f) = self.apply_pending_sysctls(global) {
-                self.failed(f, SYSCTL_ATTEMPT.to_owned());
+            self.dispatch_sysctls(global);
+        }
+        if self.installing {
+            if !self.sysctls_flight.is_empty() {
+                return;
             }
+            self.installing = false;
+        }
+        if !self.sysctls_pending.is_empty() {
             // Everything depends on the global settings.
-            if self.sysctls_pending.contains(&SysctlScope::Global) {
+            if self.sysctls_unapplied(&SysctlScope::Global, None) {
                 self.evaluate();
                 return;
             }
@@ -1318,12 +1442,35 @@ impl Daemon {
             self.full_pass |= full;
             return;
         }
+        // IMPL-4: while the nftables lane applies a transaction, the
+        // operations before the nftables step still run (withdrawals among
+        // them); those after it wait for the application's completion.
+        let ops: Vec<Op> = if self.nft_flight.is_some() {
+            ops.into_iter().take_while(|o| !matches!(o, Op::ApplyNft)).collect()
+        } else {
+            ops
+        };
         if ops.is_empty() {
+            if self.nft_flight.is_some() || self.hand_back.is_some() {
+                return;
+            }
             // Routing and nftables no longer hold a departed family's
             // artifacts: its settings go back last (FR-REC-9 step 4).
-            if let Err(f) = self.hand_back_families() {
-                self.failed(f, attempt);
+            let departed = sysctl::departed(&self.manifest, &self.cfg);
+            if !departed.is_empty() && self.cfg.routing.manage_sysctls {
+                let seq = self.next_seq();
+                match self.lanes.persist(PersistJob::HandBack {
+                    seq,
+                    families: departed,
+                }) {
+                    Ok(()) => self.hand_back = Some((seq, attempt)),
+                    Err(Lost::Full) => self.dirty = true,
+                    Err(Lost::Closed) => self.lost(),
+                }
                 return;
+            }
+            if self.applied_ops > 0 {
+                info!(operations = std::mem::take(&mut self.applied_ops), "applied");
             }
             self.applied();
             return;
@@ -1332,63 +1479,85 @@ impl Daemon {
             debug!("{op}");
         }
         let count = ops.len();
-        let had_nft = ops.iter().any(|o| matches!(o, Op::ApplyNft));
-        let nft_path = self.cfg.firewall.nft_path.clone();
-        let result = reconcile::execute(&self.client, &mut self.system, &self.scope, self.protocol, ops, || {
-            let path = nft_path.clone();
-            let text = transaction.clone();
-            async move { nftctl::apply(&path, &text).await }
-        })
-        .await;
+        let result =
+            reconcile::execute_until_nft(&self.client, &mut self.system, &self.scope, self.protocol, ops).await;
         match result {
-            Ok(_) => {
-                if had_nft {
-                    self.nft_applied = Some((transaction, configured));
-                    self.nft_missing = false;
-                    self.nft_listing = nftctl::table(&self.cfg.firewall.nft_path).await.ok().flatten();
+            Ok(nft_due) => {
+                if nft_due {
+                    // The operations before it are applied: the table goes
+                    // to the nftables lane, the rest waits for it.
+                    self.applied_ops += count - 1;
+                    let seq = self.next_seq();
+                    let job = NftJob::Apply {
+                        seq,
+                        nft: self.cfg.firewall.nft_path.clone(),
+                        transaction: transaction.clone(),
+                    };
+                    match self.lanes.nft(job) {
+                        Ok(()) => {
+                            self.nft_flight = Some(NftFlight {
+                                seq,
+                                transaction,
+                                configured,
+                                attempt,
+                            })
+                        }
+                        Err(Lost::Full) => self.dirty = true,
+                        Err(Lost::Closed) => self.lost(),
+                    }
+                    return;
                 }
-                info!(operations = count, "applied");
-                self.applied();
+                self.applied_ops += count;
                 // Routes of uplinks whose assignments were just installed
-                // and paths whose routes failed are reconsidered.
+                // and paths whose routes failed are reconsidered; the pass
+                // that finds nothing to do reports the application.
                 self.dirty = true;
             }
             Err(f) => self.failed(f, attempt),
         }
     }
 
-    fn hand_back_families(&mut self) -> std::result::Result<(), Failure> {
-        let departed = sysctl::departed(&self.manifest, &self.cfg);
-        if departed.is_empty() || !self.cfg.routing.manage_sysctls {
-            return Ok(());
-        }
-        let mut failures = Vec::new();
-        for family in departed {
-            let h = sysctl::hand_back(&mut self.manifest, family, sysctl::read, sysctl::write);
-            for k in &h.restored {
-                info!("restored {} (family {family} handed back)", sysctl::dotted(k));
+    /// The nftables lane applied a transaction, or failed to (FR-REC-5).
+    fn nft_applied(&mut self, seq: u64, result: std::result::Result<Option<serde_json::Value>, String>) {
+        let Some(flight) = self.nft_flight.take_if(|f| f.seq == seq) else {
+            return;
+        };
+        self.dirty = true;
+        match result {
+            Ok(listing) => {
+                // The kernel holds this table, whatever the configuration
+                // became meanwhile: the next pass compares against it.
+                self.nft_applied = Some((flight.transaction, flight.configured));
+                self.nft_missing = false;
+                self.nft_listing = listing;
+                self.applied_ops += 1;
             }
-            for k in &h.released {
-                info!(
-                    "{} left as it is: changed since PolyWAN set it, or gone",
-                    sysctl::dotted(k)
-                );
-            }
-            for (k, e) in h.failed {
-                failures.push(format!("{}: {e}", sysctl::dotted(k)));
-            }
+            Err(error) => self.failed(
+                Failure {
+                    op: Op::ApplyNft.to_string(),
+                    error,
+                    route: None,
+                },
+                flight.attempt,
+            ),
         }
-        if let Err(e) = self.state_dir.write_manifest(&self.manifest) {
-            failures.push(format!("manifest: {e}"));
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(Failure {
-                op: "restore sysctls of a handed-back family".into(),
-                error: failures.join("; "),
-                route: None,
-            })
+    }
+
+    /// The persistence lane handed families back (FR-REC-9 step 4).
+    fn handed_back(&mut self, seq: u64, result: std::result::Result<(), String>) {
+        let Some((_, attempt)) = self.hand_back.take_if(|(s, _)| *s == seq) else {
+            return;
+        };
+        self.dirty = true;
+        if let Err(error) = result {
+            self.failed(
+                Failure {
+                    op: "restore sysctls of a handed-back family".into(),
+                    error,
+                    route: None,
+                },
+                attempt,
+            );
         }
     }
 
@@ -1441,8 +1610,20 @@ impl Daemon {
             }
             Err(e) => warn!("full reconciliation dump failed: {e}"),
         }
-        self.check_nft().await;
-        self.inspect_flowtables().await;
+        // The table and the flowtables are listed by the nftables lane,
+        // after any application already queued there (IMPL-4).
+        if self.inspection.is_none() {
+            let seq = self.next_seq();
+            let job = NftJob::Inspect {
+                seq,
+                nft: self.cfg.firewall.nft_path.clone(),
+            };
+            match self.lanes.nft(job) {
+                Ok(()) => self.inspection = Some(seq),
+                Err(Lost::Full) => {}
+                Err(Lost::Closed) => self.lost(),
+            }
+        }
         for o in self.ownership.values_mut() {
             if o.conflict {
                 o.clean_reconciliations += 1;
@@ -1460,94 +1641,93 @@ impl Daemon {
         self.dirty = true;
     }
 
-    async fn reload(&mut self, path: &Path) {
-        let new = match config::load(path) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("reload_failed: {e}");
-                return;
-            }
+    /// SIGHUP: a reload starts, or follows the one in progress (FR-CFG-3).
+    fn start_reload(&mut self) {
+        if self.reload.is_some() {
+            self.reload_again = true;
+            return;
+        }
+        let seq = self.next_seq();
+        let context = worker::ReloadContext {
+            structural: self.cfg.structural(),
+            state_dir: self.cfg.state_dir.clone(),
+            nft_path: self.cfg.firewall.nft_path.clone(),
         };
-        if new.structural() != self.cfg.structural() {
-            error!("reload_failed: structural settings cannot change on reload (FR-CFG-4)");
-            return;
-        }
-        // The state directory holds the bindings and the sysctl baselines.
-        if new.state_dir != self.cfg.state_dir {
-            error!("reload_failed: state_dir cannot change on reload; stop, move the state directory, then start");
-            return;
-        }
-        // FR-CFG-5: nothing configured runs before its ownership is verified.
-        let mut trust = checks::trusted(path, &new);
-        trust.extend(checks::identities(&new));
-        if !trust.errors.is_empty() {
-            for e in trust.errors {
-                error!("reload_failed: {e}");
-            }
-            return;
-        }
-        let unsupported = new.unsupported_features();
-        if !unsupported.is_empty() {
-            error!(
-                "reload_failed: not supported by this development build: {}",
-                unsupported.join(", ")
-            );
-            return;
-        }
-        // FR-CT-2: inspect against the running configuration, and refuse a
-        // proposed configuration that would match.
-        let listing = nftctl::flowtables(&self.cfg.firewall.nft_path).await;
-        self.record_flowtables(&listing);
-        let proposed = if new.firewall.nft_path == self.cfg.firewall.nft_path {
-            listing
-        } else {
-            nftctl::flowtables(&new.firewall.nft_path).await
-        };
-        match proposed {
-            Ok(r) => {
-                let found = checks::flowtables(&r, &new);
-                if !found.is_empty() {
-                    for e in found {
-                        error!("reload_failed: {e}");
-                    }
-                    return;
-                }
-            }
-            Err(e) => {
-                error!("reload_failed: cannot inspect the flowtables: {e}");
-                return;
-            }
-        }
-        let conflicts = self.manifest.check(&new);
-        if !conflicts.is_empty() {
-            for c in conflicts {
-                error!("reload_failed: {c}");
-            }
-            return;
-        }
-        let mut manifest = self.manifest.clone();
-        manifest.bind(&new);
-        if let Err(e) = self.state_dir.write_manifest(&manifest) {
+        self.lanes.validate_reload(seq, self.config_path.clone(), context);
+        self.reload = Some(ReloadPhase::Validating(seq));
+    }
+
+    fn reload_failed(&mut self, errors: &[String]) {
+        for e in errors {
             error!("reload_failed: {e}");
+        }
+        self.end_reload();
+    }
+
+    fn end_reload(&mut self) {
+        self.reload = None;
+        if std::mem::take(&mut self.reload_again) {
+            self.start_reload();
+        }
+    }
+
+    /// The validation of a reload: rejected, or bound in the manifest next,
+    /// with the drain intent of removed uplinks pruned (FR-SEL-3), by the
+    /// persistence lane.
+    fn reload_validated(&mut self, outcome: worker::ReloadOutcome) {
+        if !matches!(self.reload, Some(ReloadPhase::Validating(seq)) if seq == outcome.seq) {
             return;
         }
-        // FR-SEL-3: removing an uplink removes its drain intent, durably,
-        // before the configuration is committed.
+        if let Some(listing) = &outcome.running_flowtables {
+            self.record_flowtables(listing);
+        }
+        let new = match outcome.result {
+            Ok(new) => Arc::new(*new),
+            Err(errors) => return self.reload_failed(&errors),
+        };
         let drained: BTreeSet<UplinkId> = self
             .drained
             .iter()
             .copied()
             .filter(|id| new.uplink(*id).is_some())
             .collect();
-        if drained != self.drained {
-            let names = drained.iter().filter_map(|id| new.uplink(*id)).map(|u| u.name.clone());
-            if let Err(e) = self.state_dir.write_drain(&state::DrainState::of(names)) {
-                error!("reload_failed: {e}");
-                return;
+        let drain = (drained != self.drained)
+            .then(|| state::DrainState::of(drained.iter().filter_map(|id| new.uplink(*id)).map(|u| u.name.clone())));
+        let seq = self.next_seq();
+        let job = PersistJob::Bind {
+            seq,
+            config: Arc::clone(&new),
+            drain,
+        };
+        match self.lanes.persist(job) {
+            Ok(()) => {
+                self.reload = Some(ReloadPhase::Binding {
+                    seq,
+                    config: new,
+                    drained,
+                })
             }
+            Err(Lost::Full) => self.reload_failed(&["the persistence queue is full".to_owned()]),
+            Err(Lost::Closed) => self.lost(),
         }
+    }
+
+    /// The manifest and the drain intent are written: the reload commits.
+    fn reload_bound(&mut self, seq: u64, result: std::result::Result<(), Vec<String>>) {
+        let Some(ReloadPhase::Binding { seq: s, .. }) = &self.reload else {
+            return;
+        };
+        if *s != seq {
+            return;
+        }
+        let Some(ReloadPhase::Binding { config, drained, .. }) = self.reload.take() else {
+            return;
+        };
+        if let Err(errors) = result {
+            return self.reload_failed(&errors);
+        }
+        let new = Arc::unwrap_or_clone(config);
         self.drained = drained;
-        self.manifest = manifest;
         self.cfg = new;
         // Paths exist only for configured uplinks: those of removed uplinks
         // go at once, with their probers.
@@ -1556,7 +1736,11 @@ impl Daemon {
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
         // The settings of removed uplinks' interfaces are no longer PolyWAN's
         // to apply, nor their retries to keep: re-added, they start afresh.
-        self.sysctls_pending = self.sysctl_scopes().into_iter().collect();
+        // Every scope is checked again; settings applied earlier keep their
+        // paths ready meanwhile (only new ones are a prerequisite).
+        let wanted = self.wanted_sysctls();
+        self.sysctls_applied.retain(|s, _| wanted.contains_key(s));
+        self.sysctls_pending = wanted.into_keys().collect();
         let kept = |i: &String| self.sysctls_pending.contains(&SysctlScope::Interface(i.clone()));
         self.sysctl_retries.retain(|i, _| kept(i));
         self.sysctls_failed.retain(|i, _| kept(i));
@@ -1569,15 +1753,51 @@ impl Daemon {
                 self.retry = None;
             }
         }
+        // Settings of the previous configuration still being applied are
+        // forgotten: their completions only update the manifest.
+        self.sysctls_flight.clear();
         info!("config_reloaded");
         self.dirty = true;
+        self.end_reload();
+    }
+
+    /// A completion of a lane.
+    fn completion(&mut self, done: Done) {
+        match done {
+            Done::NftApplied { seq, result } => self.nft_applied(seq, result),
+            Done::NftInspected { seq, table, flowtables } => {
+                if self.inspection.take_if(|s| *s == seq).is_some() {
+                    self.check_nft(table);
+                    self.record_flowtables(&flowtables);
+                    self.dirty = true;
+                }
+            }
+            Done::Sysctls {
+                seq,
+                scope,
+                result,
+                manifest,
+            } => {
+                self.manifest = manifest;
+                self.sysctls_done(seq, scope, result);
+            }
+            Done::Bound { seq, result, manifest } => {
+                self.manifest = manifest;
+                self.reload_bound(seq, result);
+            }
+            Done::HandedBack { seq, result, manifest } => {
+                self.manifest = manifest;
+                self.handed_back(seq, result);
+            }
+            Done::Reload(outcome) => self.reload_validated(outcome),
+        }
     }
 
     async fn event_loop(
         &mut self,
         mut subscription: Subscription,
         mut probe_rx: mpsc::Receiver<probe::Report>,
-        opts: &Options,
+        mut done_rx: mpsc::Receiver<Done>,
     ) -> Result<()> {
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
@@ -1590,6 +1810,9 @@ impl Daemon {
             if self.dirty {
                 self.dirty = false;
                 self.step().await;
+            }
+            if let Some(e) = self.fatal.take() {
+                bail!("{e}");
             }
             if std::mem::take(&mut self.resync_due) {
                 info!("a netlink dump was still interrupted after its retries: full resynchronisation");
@@ -1628,6 +1851,10 @@ impl Daemon {
                     }
                 }
                 r = probe_rx.recv() => if let Some(r) = r { self.probe_report(r) },
+                d = done_rx.recv() => match d {
+                    Some(d) => self.completion(d),
+                    None => bail!("the I/O lanes stopped"),
+                },
                 Some(i) = ra_rx.recv() => self.router_advertisement(i),
                 _ = sleep_until(wake) => {
                     if Instant::now() >= next_full {
@@ -1640,7 +1867,7 @@ impl Daemon {
                     }
                 }
                 _ = sleep_until(checkpoint_due) => self.write_checkpoint(),
-                _ = hup.recv() => self.reload(&opts.config).await,
+                _ = hup.recv() => self.start_reload(),
                 _ = term.recv() => break,
                 _ = int.recv() => break,
             }
@@ -1652,7 +1879,10 @@ impl Daemon {
                 h.abort();
             }
         }
-        self.write_checkpoint();
+        // The lanes stop first (a running write completes), so that the
+        // last checkpoint is not overwritten by an older one.
+        drop(self.io.take());
+        self.write_checkpoint_now();
         if self.cfg.routing.on_shutdown == OnShutdown::Cleanup {
             crate::cleanup::run(&self.cfg, &self.state_dir).await?;
         }

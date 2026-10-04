@@ -216,3 +216,64 @@ pub fn with_stdin(mut c: Command, input: &[u8]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+/// Link notifications of a namespace as a netlink listener receives them
+/// (`ip -o monitor link`), each with the instant it arrived: deadlines that
+/// start at the kernel's notification, which the kernel itself can delay
+/// (its link-state work waits for the locks that tearing down other
+/// namespaces holds).
+pub struct LinkMonitor {
+    child: Child,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, String)>>>,
+}
+
+impl LinkMonitor {
+    /// The arrival of the first notification whose line contains every one
+    /// of `words`.
+    pub fn first(&self, words: &[&str]) -> Option<std::time::Instant> {
+        self.lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(_, l)| words.iter().all(|w| l.contains(w)))
+            .map(|(at, _)| *at)
+    }
+}
+
+impl Drop for LinkMonitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Ns {
+    /// Starts a [`LinkMonitor`]; it listens once this returns.
+    pub fn monitor_links(&self) -> Result<LinkMonitor> {
+        use std::io::BufRead;
+
+        let mut child = self
+            .command("ip")
+            .args(["-o", "monitor", "link"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("ip monitor link")?;
+        let stdout = child.stdout.take().context("ip monitor output")?;
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&lines);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((std::time::Instant::now(), line));
+            }
+        });
+        // `ip monitor` subscribes right after it starts.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Ok(LinkMonitor { child, lines })
+    }
+}

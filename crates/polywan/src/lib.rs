@@ -27,3 +27,4 @@ pub mod state;
 pub mod sysctl;
 pub mod system;
 pub mod test_hooks;
+pub mod worker;

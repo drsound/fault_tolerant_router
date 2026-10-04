@@ -35,6 +35,19 @@ pub fn gateway_warning(default: Duration) -> Duration {
     delay.unwrap_or(default)
 }
 
+/// `POLYWAN_TEST_SLOW_WRITES`: a control file holding milliseconds; while it
+/// exists, every job of the persistence lane first waits that long, as a
+/// slow storage device would (IMPL-4 scenarios).
+#[cfg(feature = "test-hooks")]
+pub fn slow_persistence() {
+    let Some(path) = std::env::var_os("POLYWAN_TEST_SLOW_WRITES") else {
+        return;
+    };
+    if let Some(ms) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 /// A failure injected before a step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Injected {
@@ -129,6 +142,9 @@ pub fn hidden_deletion(family: Family, table: u32) -> bool {
     }
     false
 }
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn slow_persistence() {}
 
 #[cfg(not(feature = "test-hooks"))]
 pub fn boottime_shift_ms() -> u64 {
