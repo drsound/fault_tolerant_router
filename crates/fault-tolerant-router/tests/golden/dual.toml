@@ -1,0 +1,27 @@
+version = 2
+[[downlink]]
+interface = "lan"
+[[uplink]]
+id = 1
+name = "a"
+interface = "wana"
+priority = 1
+[uplink.ipv4]
+[uplink.ipv6]
+nat = "masquerade"
+[[uplink]]
+id = 2
+name = "b"
+interface = "wanb"
+priority = 1
+[uplink.ipv4]
+nat = "none"
+[uplink.ipv6]
+source = "2001:db8:1::1"
+nat = "snat"
+[[uplink]]
+id = 3
+name = "c"
+interface = "ppp0"
+[uplink.ipv6]
+nat = "none"

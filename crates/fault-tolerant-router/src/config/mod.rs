@@ -257,9 +257,6 @@ impl Config {
         if self.uplinks.iter().any(|u| u.health.quality.enabled()) {
             v.push("quality gates (health.quality)");
         }
-        if self.manages(Family::V6) {
-            v.push("IPv6 paths ([uplink.ipv6])");
-        }
         v
     }
 }

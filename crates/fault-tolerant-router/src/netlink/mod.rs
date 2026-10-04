@@ -214,15 +214,18 @@ pub mod groups {
     pub const IPV4_RULE: u32 = 8;
     pub const IPV6_IFADDR: u32 = 9;
     pub const IPV6_ROUTE: u32 = 11;
+    /// Prefix information of every received Router Advertisement.
+    pub const IPV6_PREFIX: u32 = 18;
     pub const IPV6_RULE: u32 = 19;
     pub const NEXTHOP: u32 = 32;
-    pub const ALL: [u32; 8] = [
+    pub const ALL: [u32; 9] = [
         LINK,
         IPV4_IFADDR,
         IPV4_ROUTE,
         IPV4_RULE,
         IPV6_IFADDR,
         IPV6_ROUTE,
+        IPV6_PREFIX,
         IPV6_RULE,
         NEXTHOP,
     ];

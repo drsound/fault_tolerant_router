@@ -272,6 +272,19 @@ mod tests {
     }
 
     #[test]
+    fn golden_dual_stack_ruleset() {
+        let cfg = config::parse(include_str!("../tests/golden/dual.toml")).unwrap();
+        let text = ruleset(&cfg);
+        let expected = include_str!("../tests/golden/dual.nft");
+        if text != expected {
+            eprintln!("{text}");
+        }
+        assert_eq!(text, expected);
+        // Both families are managed: no family is skipped (§4.3).
+        assert!(!text.contains("meta nfproto != "));
+    }
+
+    #[test]
     fn mark_operations_use_the_configured_mask() {
         let text = CONFIG.replace("[firewall]", "[routing]\nfwmark_mask = 0xff\n[firewall]");
         let cfg = config::parse(&text).unwrap();

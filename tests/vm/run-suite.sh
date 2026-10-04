@@ -57,10 +57,10 @@ else
   # Copied before the test builds: the daemon's integration tests rebuild
   # its executable without the hooks.
   cp "$target_dir/$target/debug/ftr-testbed" "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
-  # netns: the harness's own checks; m1: the acceptance scenarios.
-  { test_exes testbed netns m1; test_exes fault-tolerant-router $kernel_tests; } \
+  # netns: the harness's own checks; m1, m2: the acceptance scenarios.
+  { test_exes testbed netns m1 m2; test_exes fault-tolerant-router $kernel_tests; } \
     | while read -r name exe; do cp "$exe" "$bindir/$name"; done
-  for t in netns m1 $kernel_tests; do
+  for t in netns m1 m2 $kernel_tests; do
     [ -x "$bindir/$t" ] || { echo "test executable $t was not built" >&2; exit 1; }
   done
 fi
@@ -68,13 +68,17 @@ if [ "$mode" = build ]; then
   echo "$bindir"
   exit 0
 fi
-# The M1 scenarios run once per fwmark_mask (AS-43: offsets 16, 0 and 24);
-# FTR_TEST_MASKS narrows the list; on the host, FTR_PARALLEL_MASKS=1 runs
-# them at the same time.
+# The M1 and M2 scenarios run once per fwmark_mask (AS-43: offsets 16, 0
+# and 24); FTR_TEST_MASKS narrows the list; on the host,
+# FTR_PARALLEL_MASKS=1 runs them at the same time.
 masks=${FTR_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
+scenarios="m1 m2"
 m1_in_vm=
 for mask in $masks; do
-  m1_in_vm="$m1_in_vm && echo '== M1 scenarios with fwmark_mask $mask' && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router FTR_TEST_FWMARK_MASK=$mask /mnt/m1 --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+  m1_in_vm="$m1_in_vm && echo '== M1 and M2 scenarios with fwmark_mask $mask'"
+  for s in $scenarios; do
+    m1_in_vm="$m1_in_vm && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router FTR_TEST_FWMARK_MASK=$mask /mnt/$s --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+  done
 done
 # They change rules and routes, so each runs in a private network namespace.
 kernel_in_vm=
@@ -92,11 +96,15 @@ case $mode in
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
     $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
-    m1() { # m1 MASK TEST-ARGS...
+    m1() { # m1 MASK TEST-ARGS...: every scenario binary, whatever fails
       m1_mask=$1
       shift
-      $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
-        FTR_TEST_FWMARK_MASK="$m1_mask" "$bindir/m1" --ignored "$@"
+      m1_status=0
+      for s in $scenarios; do
+        $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
+          FTR_TEST_FWMARK_MASK="$m1_mask" "$bindir/$s" --ignored "$@" || m1_status=1
+      done
+      return $m1_status
     }
     if [ "${FTR_PARALLEL_MASKS:-0}" = 1 ]; then
       # The scenarios wait more than they compute: with enough cores, the
@@ -109,14 +117,14 @@ case $mode in
       failed=0
       for mask in $masks; do
         wait "$(cat "$out/$mask.pid")" || failed=1
-        echo "== M1 scenarios with fwmark_mask $mask"
+        echo "== M1 and M2 scenarios with fwmark_mask $mask"
         cat "$out/$mask"
       done
       rm -rf "$out"
       [ $failed = 0 ]
     else
       for mask in $masks; do
-        echo "== M1 scenarios with fwmark_mask $mask"
+        echo "== M1 and M2 scenarios with fwmark_mask $mask"
         m1 "$mask" "$@"
       done
     fi

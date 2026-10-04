@@ -48,7 +48,7 @@ impl Topology {
         let (v4, v6) = match uplink {
             Uplink::A => ("198.18.0.1", Some("2001:db8:fff0:a::1")),
             Uplink::B => ("198.18.0.5", Some("2001:db8:fff0:b::1")),
-            Uplink::C => ("198.18.0.9", None),
+            Uplink::C => ("198.18.0.9", Some("2001:db8:fff0:c::1")),
         };
         ns.ip(&format!("route replace default via {v4}"))?;
         if let Some(v6) = v6 {

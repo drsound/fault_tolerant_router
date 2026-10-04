@@ -4,7 +4,7 @@
 //!                         inet (probe targets, test servers)
 //!                  isp-a /        | isp-b         \ isp-c
 //!                ispa            ispb              ispc
-//!     DHCPv4/v6 + RA |   CGNAT + RA |       PPPoE    |
+//!     DHCPv4/v6 + RA |   CGNAT + RA |    PPPoE + RA |
 //!                wana            wanb              wanc (ppp0)
 //!                    \            |               /
 //!                             router  (under test)
@@ -14,10 +14,13 @@
 //!
 //! The router gets its uplink configuration the way an operating system
 //! would: DHCPv4 leases through `udhcpc`, IPv6 addresses and default routes
-//! from Router Advertisements (kernel SLAAC, `accept_ra = 2`), and a PPPoE
-//! session through `pppd`. Its main table therefore holds operating-system
-//! default routes for every uplink (metrics 100, 200 and 300, realm
-//! [`OS_ROUTE_REALM`]), as the acceptance scenarios require.
+//! from Router Advertisements (kernel SLAAC, `accept_ra = 2`, also over the
+//! PPP link), and a PPPoE session through `pppd`. Its main table therefore
+//! holds operating-system default routes for every uplink (IPv4: metrics
+//! 100, 200 and 300, realm [`OS_ROUTE_REALM`]; IPv6: the kernel's Router
+//! Advertisement routes), as the acceptance scenarios require, and an IPv6
+//! default route through the harness's `leak6` device that catches IPv6
+//! leaks (see [`Topology::observability`]).
 
 use std::fs;
 use std::net::IpAddr;
@@ -41,7 +44,7 @@ pub struct Options {
     pub work_root: PathBuf,
     /// The `ftr-testbed` executable, used to run test agents inside namespaces.
     pub agent_bin: PathBuf,
-    /// Configure IPv6 (RA, SLAAC, DHCPv6) on providers A and B.
+    /// Configure IPv6 (RA, SLAAC, DHCPv6) on the providers.
     pub ipv6: bool,
     /// Bring up provider C (PPPoE).
     pub pppoe: bool,
@@ -389,6 +392,8 @@ impl Topology {
         if self.opts.pppoe {
             ns.ip("addr add 198.18.0.9/30 dev isp-c")?;
             ns.ip("route add 203.0.113.0/24 via 198.18.0.10")?;
+            ns.ip("addr add 2001:db8:fff0:c::1/64 dev isp-c nodad")?;
+            ns.ip("-6 route add 2001:db8:c::/48 via 2001:db8:fff0:c::2")?;
         }
         ns.ip("addr add 2001:db8:fff0:a::1/64 dev isp-a nodad")?;
         ns.ip("addr add 2001:db8:fff0:b::1/64 dev isp-b nodad")?;
@@ -446,19 +451,10 @@ impl Topology {
         ns.ip("addr add 2001:db8:fff0:a::2/64 dev core nodad")?;
         ns.ip("-6 route add default via 2001:db8:fff0:a::1")?;
         ns.ip("addr add 192.0.2.1/24 dev wan")?;
-        let mut extra = vec![
-            "--dhcp-range=192.0.2.100,192.0.2.199,255.255.255.0,2m",
-            "--dhcp-option=option:router,192.0.2.1",
-        ];
         if self.opts.ipv6 {
             ns.ip("addr add 2001:db8:a:ffff::1/64 dev wan nodad")?;
-            extra.extend([
-                "--enable-ra",
-                "--dhcp-range=2001:db8:a:ffff::1000,2001:db8:a:ffff::1fff,slaac,64,2m",
-                "--ra-param=wan,4,1800",
-            ]);
         }
-        self.dnsmasq(Node::IspA, "a", &extra)
+        self.provider_dnsmasq(Uplink::A, 1800)
     }
 
     fn provider_b(&self) -> Result<()> {
@@ -471,32 +467,120 @@ impl Topology {
         ns.nft(
             "table ip tb_cgnat {\n  chain post {\n    type nat hook postrouting priority 100;\n    oifname \"core\" ip saddr 100.64.0.0/10 masquerade\n  }\n}\n",
         )?;
-        let mut extra = vec![
-            "--dhcp-range=100.64.0.100,100.64.0.199,255.255.255.0,2m",
-            "--dhcp-option=option:router,100.64.0.1",
-        ];
         if self.opts.ipv6 {
             ns.ip("addr add 2001:db8:b:ffff::1/64 dev wan nodad")?;
-            extra.extend([
-                "--enable-ra",
-                "--dhcp-range=2001:db8:b:ffff::,ra-only,64",
-                "--ra-param=wan,4,1800",
-            ]);
         }
-        self.dnsmasq(Node::IspB, "b", &extra)
+        self.provider_dnsmasq(Uplink::B, 1800)
+    }
+
+    /// The DHCP and Router Advertisement server of provider A or B, with
+    /// the given router lifetime in seconds.
+    fn provider_dnsmasq(&self, uplink: Uplink, router_lifetime: u32) -> Result<()> {
+        let ra = format!("--ra-param=wan,4,{router_lifetime}");
+        let (name, mut extra) = match uplink {
+            Uplink::A => (
+                "a",
+                vec![
+                    "--dhcp-range=192.0.2.100,192.0.2.199,255.255.255.0,2m",
+                    "--dhcp-option=option:router,192.0.2.1",
+                ],
+            ),
+            Uplink::B => (
+                "b",
+                vec![
+                    "--dhcp-range=100.64.0.100,100.64.0.199,255.255.255.0,2m",
+                    "--dhcp-option=option:router,100.64.0.1",
+                ],
+            ),
+            Uplink::C => bail!("provider C runs a dnsmasq per PPP session"),
+        };
+        if self.opts.ipv6 {
+            extra.push("--enable-ra");
+            extra.push(if uplink == Uplink::A {
+                "--dhcp-range=2001:db8:a:ffff::1000,2001:db8:a:ffff::1fff,slaac,64,2m"
+            } else {
+                "--dhcp-range=2001:db8:b:ffff::,ra-only,64"
+            });
+            extra.push(&ra);
+        }
+        self.dnsmasq(uplink.provider(), name, &extra)
+    }
+
+    /// Restarts the DHCP and Router Advertisement server of provider A or B
+    /// with another router lifetime (AS-28: expiry of the default router).
+    /// Leases survive in the lease file.
+    pub fn set_router_lifetime(&self, uplink: Uplink, seconds: u32) -> Result<()> {
+        let name = match uplink {
+            Uplink::A => "a",
+            Uplink::B => "b",
+            Uplink::C => bail!("provider C runs a dnsmasq per PPP session"),
+        };
+        let pid_file = self.dir.join(format!("dnsmasq-{name}.pid"));
+        let pid = fs::read_to_string(&pid_file)?.trim().to_owned();
+        netns::host("kill", ["-TERM", &pid])?;
+        let gone = Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
+            sleep(Duration::from_millis(50));
+        }
+        self.provider_dnsmasq(uplink, seconds)
     }
 
     fn provider_c(&self) -> Result<()> {
         let ns = self.ns(Node::IspC);
         ns.ip("addr add 198.18.0.10/30 dev core")?;
         ns.ip("route add default via 198.18.0.9")?;
+        ns.ip("addr add 2001:db8:fff0:c::2/64 dev core nodad")?;
+        ns.ip("-6 route add default via 2001:db8:fff0:c::1")?;
         ns.sysctl(&["net.ipv6.conf.wan.disable_ipv6=1"])?;
         let opts = self.dir.join("pppoe-server.options");
+        // IPv6CP with fixed interface identifiers: the server is fe80::1,
+        // the router fe80::2.
+        let ipv6 = if self.opts.ipv6 {
+            "+ipv6\nipv6 ::1,::2\n"
+        } else {
+            "noipv6\n"
+        };
         fs::write(
             &opts,
-            "noauth\nnoipv6\nmtu 1492\nmru 1492\nlcp-echo-interval 1\nlcp-echo-failure 3\nip-up-script /bin/true\nip-down-script /bin/true\n",
+            format!(
+                "noauth\n{ipv6}mtu 1492\nmru 1492\nlcp-echo-interval 1\nlcp-echo-failure 3\nip-up-script /bin/true\nip-down-script /bin/true\n"
+            ),
         )?;
+        if self.opts.ipv6 {
+            self.ppp_ipv6_scripts()?;
+        }
         self.start_pppoe_server("203.0.113.10")
+    }
+
+    /// Provider C's IPv6 on each PPP session: pppd 2.4.9 (Debian 12) runs
+    /// only `/etc/ppp/ipv6-up` and `ipv6-down`, so they live in the
+    /// namespace's own `/etc/ppp`. The server's end of the link gets an
+    /// address of 2001:db8:c:ffff::/64 and a dnsmasq instance that announces
+    /// that prefix for SLAAC, with the server's link-local address as the
+    /// router.
+    fn ppp_ipv6_scripts(&self) -> Result<()> {
+        let dir = self.netns_etc(Node::IspC).join("ppp");
+        fs::create_dir_all(&dir)?;
+        let d = self.dir.display();
+        let up = format!(
+            r#"#!/bin/sh
+# ftr-testbed provider C, pppd ipv6-up: $1 is the interface.
+ip -6 addr add 2001:db8:c:ffff::1/64 dev "$1" nodad
+exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
+  --interface="$1" --bind-interfaces --enable-ra --dhcp-range=::,constructor:"$1",ra-only,64 \
+  --ra-param="$1",4,1800 --pid-file={d}/dnsmasq-c-"$1".pid \
+  --dhcp-leasefile={d}/dnsmasq-c.leases --log-facility={d}/dnsmasq-c.log
+"#
+        );
+        let down = format!(
+            "#!/bin/sh\n# ftr-testbed provider C, pppd ipv6-down.\n[ -f {d}/dnsmasq-c-\"$1\".pid ] && kill \"$(cat {d}/dnsmasq-c-\"$1\".pid)\"\nexit 0\n"
+        );
+        for (name, text) in [("ipv6-up", up), ("ipv6-down", down)] {
+            let p = dir.join(name);
+            fs::write(&p, text)?;
+            chmod_x(&p)?;
+        }
+        Ok(())
     }
 
     /// Provider C's PPPoE server, handing out remote addresses from `first`
@@ -567,6 +651,9 @@ impl Topology {
         }
         if self.opts.pppoe {
             r.sysctl(&["net.ipv6.conf.wanc.disable_ipv6=1"])?;
+            // ppp0 does not exist yet: it inherits the defaults.
+            let ra = if self.opts.ipv6 { "2" } else { "0" };
+            r.sysctl(&[&format!("net.ipv6.conf.default.accept_ra={ra}")])?;
         }
         Ok(())
     }
@@ -606,7 +693,9 @@ impl Topology {
                     "pppoe.so",
                     "nic-wanc",
                     "noauth",
-                    "noipv6",
+                    if self.opts.ipv6 { "+ipv6" } else { "noipv6" },
+                    // The interface identifier the server suggests (::2).
+                    "ipv6cp-accept-local",
                     "persist",
                     "maxfail",
                     "0",
@@ -649,22 +738,41 @@ impl Topology {
     ///
     /// - `leak4`: IPv4 packets routed by an operating-system default route
     ///   (matched by realm, see [`OS_ROUTE_REALM`]);
+    /// - `leak6` (table `inet tb_egress`): unicast IPv6 packets routed by
+    ///   the main table's default route. IPv6 routes have no realm, so the harness
+    ///   adds a dummy device `leak6` with a device default route of metric
+    ///   1, the best default of the main table, while the Router
+    ///   Advertisement routes stay there for discovery: any IPv6 packet that
+    ///   reaches the main table's default route leaves through `leak6` and
+    ///   is dropped;
     /// - `<uplink><family>` (for example `a4`, `c4`, `b6`): packets leaving
     ///   through each uplink, by family.
     fn observability(&self) -> Result<()> {
+        if self.opts.ipv6 {
+            let r = self.router();
+            r.ip("link add leak6 type dummy")?;
+            // No Router Solicitations from it (it inherits accept_ra = 2,
+            // which sends them while forwarding).
+            r.sysctl(&["net.ipv6.conf.leak6.accept_ra=0"])?;
+            r.ip("link set leak6 up")?;
+            r.ip("-6 route add default dev leak6 metric 1")?;
+        }
         let mut rules = String::from(
             "table ip tb_observe {\n  counter leak4 {}\n  chain post {\n    type filter hook postrouting priority 400; policy accept;\n",
         );
         rules.push_str(&format!(
             "    meta rtclassid {OS_ROUTE_REALM} counter name \"leak4\"\n  }}\n}}\n"
         ));
-        rules.push_str("table inet tb_egress {\n");
+        rules.push_str("table inet tb_egress {\n  counter leak6 {}\n");
         for u in Uplink::ALL {
             for f in u.families() {
                 rules.push_str(&format!("  counter {} {{}}\n", counter_name(u, *f)));
             }
         }
         rules.push_str("  chain post {\n    type filter hook postrouting priority 400; policy accept;\n");
+        // Multicast never takes the main table's default route; the
+        // device's own control traffic (DAD, MLD) is not a leak.
+        rules.push_str("    oifname \"leak6\" meta nfproto ipv6 ip6 daddr != ff00::/8 counter name \"leak6\"\n");
         for u in Uplink::ALL {
             for f in u.families() {
                 let proto = if *f == Family::V4 { "ipv4" } else { "ipv6" };

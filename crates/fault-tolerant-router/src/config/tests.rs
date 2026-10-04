@@ -124,7 +124,7 @@ fn spec_example_is_valid() {
     assert_eq!(c.notify.email.as_ref().unwrap().max_per_hour, 20);
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
     assert!(c.manages(Family::V6));
-    assert_eq!(c.unsupported_features().len(), 5);
+    assert_eq!(c.unsupported_features().len(), 4, "policies, email, hooks, metrics");
 }
 
 #[test]
@@ -140,6 +140,7 @@ fn digest_is_the_sha256_of_the_text() {
 fn generated_example_is_valid_and_supported() {
     let c = parse(EXAMPLE).unwrap();
     assert_eq!(c.uplinks.len(), 3);
+    assert!(c.manages(Family::V6));
     assert!(c.unsupported_features().is_empty());
 }
 

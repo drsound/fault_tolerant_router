@@ -7,11 +7,11 @@
 //! |---|---|---|
 //! | internet – provider A | 198.18.0.0/30 | 2001:db8:fff0:a::/64 |
 //! | internet – provider B | 198.18.0.4/30 | 2001:db8:fff0:b::/64 |
-//! | internet – provider C | 198.18.0.8/30 | — |
+//! | internet – provider C | 198.18.0.8/30 | 2001:db8:fff0:c::/64 |
 //! | test servers (any address) | 198.18.100.0/24 | 2001:db8:ff00::/64 |
 //! | provider A customer link (DHCPv4, DHCPv6 + SLAAC) | 192.0.2.0/24 | 2001:db8:a:ffff::/64 (routed /48) |
 //! | provider B customer link (DHCPv4, CGNAT, SLAAC) | 100.64.0.0/24, public 198.18.0.6 | 2001:db8:b:ffff::/64 (routed /48) |
-//! | provider C (PPPoE) | 203.0.113.1 → 203.0.113.10–19 | — |
+//! | provider C (PPPoE) | 203.0.113.1 → 203.0.113.10–19 | link-local `fe80::1` → `fe80::2`, SLAAC in 2001:db8:c:ffff::/64 (routed /48) |
 //! | LAN | 198.51.100.0/24 | 2001:db8:1::/64 |
 
 use std::fmt;
@@ -107,7 +107,8 @@ pub enum Uplink {
     A,
     /// CGNAT for IPv4, SLAAC for IPv6.
     B,
-    /// PPPoE, IPv4 only, MTU 1492.
+    /// PPPoE for both families, MTU 1492; IPv6 by Router Advertisements
+    /// over the PPP link from the server's link-local address.
     C,
 }
 
@@ -141,10 +142,7 @@ impl Uplink {
     }
 
     pub fn families(self) -> &'static [Family] {
-        match self {
-            Uplink::A | Uplink::B => &Family::ALL,
-            Uplink::C => &[Family::V4],
-        }
+        &Family::ALL
     }
 
     /// Metric of the operating-system default route on this uplink.
@@ -162,7 +160,7 @@ impl Uplink {
         match self {
             Uplink::A => vec![p("192.0.2.0/24"), p("2001:db8:a::/48")],
             Uplink::B => vec![p("198.18.0.6/32"), p("2001:db8:b::/48")],
-            Uplink::C => vec![p("203.0.113.0/24")],
+            Uplink::C => vec![p("203.0.113.0/24"), p("2001:db8:c::/48")],
         }
     }
 }
@@ -320,6 +318,7 @@ mod tests {
         assert_eq!(attribute("203.0.113.12".parse().unwrap()), Some(Uplink::C));
         assert_eq!(attribute("2001:db8:a:ffff::1234".parse().unwrap()), Some(Uplink::A));
         assert_eq!(attribute("2001:db8:b:ffff:1::1".parse().unwrap()), Some(Uplink::B));
+        assert_eq!(attribute("2001:db8:c:ffff::2".parse().unwrap()), Some(Uplink::C));
         assert_eq!(attribute("198.51.100.10".parse().unwrap()), None);
         assert_eq!(attribute("198.18.0.7".parse().unwrap()), None);
     }

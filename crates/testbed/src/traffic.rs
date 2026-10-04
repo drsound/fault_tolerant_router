@@ -283,6 +283,21 @@ impl Topology {
         self.router().counter("ip", "tb_observe", "leak4")
     }
 
+    /// IPv6 packets routed by the main table's default route (through the
+    /// harness's `leak6` device) since the last [`Topology::reset_counters`].
+    /// Any non-zero value while FTR manages IPv6 is a leak (INV-3).
+    pub fn ipv6_leaks(&self) -> Result<u64> {
+        self.router().counter("inet", "tb_egress", "leak6")
+    }
+
+    /// The leaks of a family ([`Topology::ipv4_leaks`], [`Topology::ipv6_leaks`]).
+    pub fn leaks(&self, family: Family) -> Result<u64> {
+        match family {
+            Family::V4 => self.ipv4_leaks(),
+            Family::V6 => self.ipv6_leaks(),
+        }
+    }
+
     /// Packets of `family` that left the router through `uplink` since the last reset.
     pub fn egress_packets(&self, uplink: Uplink, family: Family) -> Result<u64> {
         if !uplink.families().contains(&family) {

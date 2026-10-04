@@ -155,6 +155,9 @@ struct Daemon {
     boot_id: String,
     dirty: bool,
     reread: BTreeSet<(Family, u32)>,
+    /// Route expiries up to this instant have been handled by a re-read;
+    /// a later one, even one already past, is still due (FR-DISC-5).
+    expiry_checked: std::time::Instant,
     last_checkpoint: Instant,
 }
 
@@ -281,6 +284,7 @@ pub async fn run(opts: Options) -> Result<()> {
         boot_id: state::boot_id().unwrap_or_default(),
         dirty: true,
         reread: BTreeSet::new(),
+        expiry_checked: std::time::Instant::now(),
         last_checkpoint: Instant::now(),
         cfg,
     };
@@ -715,6 +719,17 @@ impl Daemon {
                 }
                 self.dirty = true;
             }
+            Change::RouterAdvertisement(i) => {
+                // FR-DISC-5: the advertised router lifetime, refreshed or
+                // shortened without a route notification.
+                if self.uplink_on(i).is_some() {
+                    debug!(ifindex = i, "router advertisement: re-reading the discovery tables");
+                    for t in &self.cfg.routing.discovery_tables {
+                        self.reread.insert((Family::V6, *t));
+                    }
+                    self.dirty = true;
+                }
+            }
             Change::Route { .. } | Change::Rule { .. } | Change::Nexthop { .. } => self.dirty = true,
             Change::None => {}
         }
@@ -728,19 +743,22 @@ impl Daemon {
     }
 
     /// The next expiry of a discovery-table default route (Router
-    /// Advertisements): the kernel collects it without a notification.
+    /// Advertisements) not handled yet, possibly already past: the kernel
+    /// collects an expired route without a notification.
     fn next_expiry(&self) -> Option<Instant> {
-        let now = std::time::Instant::now();
+        // Just after the expiry: the re-read then shows it past.
         self.discovery_defaults()
             .filter_map(|r| r.expires_at)
-            .filter(|t| *t > now)
+            .filter(|t| *t > self.expiry_checked)
             .min()
-            .map(Instant::from_std)
+            .map(|t| Instant::from_std(t) + Duration::from_millis(50))
     }
 
     /// Re-reads the tables of expired routes before the next evaluation:
     /// later Router Advertisements may have refreshed them without a
-    /// notification (FR-DISC-5).
+    /// notification (FR-DISC-5). The re-read lists a route that has
+    /// expired but is not collected yet with an expiry in the past, which
+    /// counts as handled.
     fn reread_expired(&mut self) {
         let now = std::time::Instant::now();
         let tables: Vec<(Family, u32)> = self
@@ -748,7 +766,9 @@ impl Daemon {
             .filter(|r| r.expired(now))
             .map(|r| (r.family, r.table))
             .collect();
+        debug!(?tables, "re-reading the tables of expired routes");
         self.reread.extend(tables);
+        self.expiry_checked = now;
     }
 
     /// The uplink on an interface, also after the interface is gone.

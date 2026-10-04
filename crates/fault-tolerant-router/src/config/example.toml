@@ -33,9 +33,11 @@ weight = 10
 [uplink.ipv4]
 nat = "masquerade"
 
-# IPv6 paths are not supported yet by this development build.
-# [uplink.ipv6]
-# nat = "masquerade"
+# IPv6 has no NAT default: "masquerade" (for example with a ULA LAN prefix,
+# for transparent failover), "snat" to a static source, or "none" when every
+# provider routes the LAN prefix.
+[uplink.ipv6]
+nat = "masquerade"
 
 [[uplink]]
 id = 2
@@ -46,6 +48,9 @@ priority = 1
 weight = 3
 
 [uplink.ipv4]
+nat = "masquerade"
+
+[uplink.ipv6]
 nat = "masquerade"
 
 [[uplink]]
@@ -67,8 +72,8 @@ required_reachable = 2
 [health.ipv4]
 targets = ["icmp:1.1.1.1", "icmp:8.8.8.8", "icmp:9.9.9.9", "icmp:208.67.222.222"]
 
-# [health.ipv6]
-# targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:fe::fe"]
+[health.ipv6]
+targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:fe::fe"]
 
 # Policies, notifications and metrics are not supported yet by this
 # development build.

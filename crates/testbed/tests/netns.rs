@@ -204,7 +204,11 @@ fn failure_injection() -> Result<()> {
     t.netem(Uplink::B, "loss 100%")?;
     assert!(!router_ping(&t, Uplink::B, target)?);
     t.clear_netem(Uplink::B)?;
-    assert!(router_ping(&t, Uplink::B, target)?);
+    // The gateway's neighbour entry may have failed meanwhile: the first
+    // ping can be spent resolving it again.
+    t.wait_for("B answers again", Duration::from_secs(5), || {
+        router_ping(&t, Uplink::B, target)
+    })?;
 
     // Provider disconnected upstream, link up.
     t.upstream_down(Uplink::A)?;

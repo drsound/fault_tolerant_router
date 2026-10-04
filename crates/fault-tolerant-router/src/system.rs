@@ -65,9 +65,22 @@ pub struct System {
 pub enum Change {
     Link(u32),
     Address(u32),
-    Route { family: Family, table: u32, removed: bool },
-    Rule { family: Family, removed: bool },
-    Nexthop { removed: bool },
+    Route {
+        family: Family,
+        table: u32,
+        removed: bool,
+    },
+    Rule {
+        family: Family,
+        removed: bool,
+    },
+    Nexthop {
+        removed: bool,
+    },
+    /// A Router Advertisement with prefix information arrived on the
+    /// interface: it may have refreshed or shortened the lifetime of the
+    /// default route it installed, which the kernel does not notify.
+    RouterAdvertisement(u32),
     None,
 }
 
@@ -138,9 +151,11 @@ impl System {
                 None => Change::None,
             },
             RouteNetlinkMessage::NewRoute(r) => match ObservedRoute::parse(r) {
-                Some(r) if scope.keeps(&r) => {
+                Some(mut r) if scope.keeps(&r) => {
                     let (family, table) = (r.family, r.table);
-                    self.routes.insert(route_key(scope, &r), r);
+                    let key = route_key(scope, &r);
+                    keep_expiry(self.routes.get(&key), &mut r);
+                    self.routes.insert(key, r);
                     Change::Route {
                         family,
                         table,
@@ -182,6 +197,7 @@ impl System {
                 }
                 None => Change::None,
             },
+            RouteNetlinkMessage::NewPrefix(p) => Change::RouterAdvertisement(p.header.ifindex as u32),
             _ => Change::None,
         }
     }
@@ -189,15 +205,24 @@ impl System {
     /// Replaces every route of a family and table with a fresh dump (the
     /// re-reads of §12.2).
     pub fn replace_table(&mut self, scope: &Scope, family: Family, table: u32, dump: &[RouteNetlinkMessage]) {
-        self.routes.retain(|(f, t, ..), _| !(*f == family && *t == table));
+        let mut old = BTreeMap::new();
+        self.routes.retain(|k, r| {
+            let keep = !(k.0 == family && k.1 == table);
+            if !keep {
+                old.insert(*k, r.clone());
+            }
+            keep
+        });
         for m in dump {
             if let RouteNetlinkMessage::NewRoute(r) = m
-                && let Some(r) = ObservedRoute::parse(r)
+                && let Some(mut r) = ObservedRoute::parse(r)
                 && r.family == family
                 && r.table == table
                 && scope.keeps(&r)
             {
-                self.routes.insert(route_key(scope, &r), r);
+                let key = route_key(scope, &r);
+                keep_expiry(old.get(&key), &mut r);
+                self.routes.insert(key, r);
             }
         }
     }
@@ -233,6 +258,18 @@ impl System {
         self.routes
             .values()
             .filter(move |r| r.family == family && r.table == table)
+    }
+}
+
+/// `rta_expires` is 0 both for a route without expiry and within a clock
+/// tick of its expiry: a route read again at that moment keeps the expiry
+/// already known when it is due within a second (FR-DISC-5).
+fn keep_expiry(old: Option<&ObservedRoute>, new: &mut ObservedRoute) {
+    if new.expires_at.is_none()
+        && let Some(t) = old.and_then(|o| o.expires_at)
+        && t <= std::time::Instant::now() + std::time::Duration::from_secs(1)
+    {
+        new.expires_at = Some(t);
     }
 }
 
@@ -325,6 +362,24 @@ mod tests {
         s.apply(&scope, &RouteNetlinkMessage::NewRoute(route(1001, 6, "fe80::2", 100)));
         let ftr: Vec<u32> = s.routes_in(Family::V6, 1001).map(|r| r.nexthops[0].ifindex).collect();
         assert_eq!(ftr, [6]);
+    }
+
+    #[test]
+    fn an_expiry_about_to_pass_survives_a_read_that_shows_none() {
+        let scope = scope();
+        let m = route(254, 5, "fe80::1", 1024);
+        let mut s = System::default();
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(m.clone()));
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        s.routes.values_mut().for_each(|r| r.expires_at = Some(soon));
+        // Read again within a tick of the expiry: rta_expires 0.
+        s.replace_table(&scope, Family::V6, 254, &[RouteNetlinkMessage::NewRoute(m.clone())]);
+        assert_eq!(s.routes.values().next().unwrap().expires_at, Some(soon));
+        // A distant expiry is not kept: the route lost its expiry.
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        s.routes.values_mut().for_each(|r| r.expires_at = Some(later));
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(m));
+        assert_eq!(s.routes.values().next().unwrap().expires_at, None);
     }
 
     #[test]

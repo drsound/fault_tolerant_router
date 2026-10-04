@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::inject::Daemon;
 use crate::netns::Ns;
-use crate::plan::Uplink;
+use crate::plan::{Family, Uplink};
 use crate::topology::Topology;
 
 /// `FTR_DAEMON_BIN`: the `fault-tolerant-router` executable under test.
@@ -108,6 +108,29 @@ pub fn ipv4(uplinks: &[UplinkSpec]) -> String {
 /// An IPv4 configuration over the given uplinks, with `lan` as downlink.
 /// `extra` is appended verbatim (other tables, routing settings).
 pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
+    config(uplinks, &[Family::V4], health, routing, extra)
+}
+
+/// [`config`] for one family.
+pub fn config_for(family: Family, uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
+    config(uplinks, &[family], health, routing, extra)
+}
+
+/// [`config`] for one family with fast health settings and nothing else.
+pub fn family(uplinks: &[UplinkSpec], family: Family) -> String {
+    config(uplinks, &[family], &HealthSpec::fast(), "", "")
+}
+
+/// [`config`] for both families with fast health settings and nothing else.
+pub fn dual(uplinks: &[UplinkSpec]) -> String {
+    config(uplinks, &Family::ALL, &HealthSpec::fast(), "", "")
+}
+
+/// A configuration of `families` over the given uplinks, with `lan` as
+/// downlink. IPv6 paths masquerade, since IPv6 has no NAT default (FR-NAT-1)
+/// and the LAN prefix is routed by no provider. `extra` is appended verbatim
+/// (other tables, routing settings).
+pub fn config(uplinks: &[UplinkSpec], families: &[Family], health: &HealthSpec, routing: &str, extra: &str) -> String {
     let mut s = String::from("version = 2\n");
     let mut routing = routing.to_owned();
     if mask() != 0x00ff_0000 {
@@ -128,7 +151,13 @@ pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, e
         if let Some(p) = u.priority {
             let _ = writeln!(s, "priority = {p}");
         }
-        let _ = writeln!(s, "weight = {}\n[uplink.ipv4]", u.weight);
+        let _ = writeln!(s, "weight = {}", u.weight);
+        for f in families {
+            s += match f {
+                Family::V4 => "[uplink.ipv4]\n",
+                Family::V6 => "[uplink.ipv6]\nnat = \"masquerade\"\n",
+            };
+        }
     }
     let _ = writeln!(s, "[health]\n{}", health.text);
     s + extra
