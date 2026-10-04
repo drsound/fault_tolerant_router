@@ -140,6 +140,8 @@ pub struct Ftr {
     /// Length of the log when the daemon was last started.
     log_start: usize,
     pub dir: PathBuf,
+    /// The `state_dir` that [`Ftr::write_config`] writes.
+    pub state: PathBuf,
     pub config: PathBuf,
     pub lock: PathBuf,
     pub log: PathBuf,
@@ -175,6 +177,7 @@ impl Topology {
             config: dir.join("config.toml"),
             lock: dir.join("lock"),
             log: self.dir().join("daemon.log"),
+            state: dir.join("state"),
             dir,
             bin: daemon_bin()?,
             router_ns: self.router().name().to_owned(),
@@ -188,10 +191,9 @@ impl Topology {
 impl Ftr {
     /// Replaces the configuration file (a reload needs [`Ftr::reload`]).
     pub fn write_config(&self, config: &str) -> Result<()> {
-        let state = self.dir.join("state");
         let text = config.replacen(
             "version = 2\n",
-            &format!("version = 2\nstate_dir = \"{}\"\n", state.display()),
+            &format!("version = 2\nstate_dir = \"{}\"\n", self.state.display()),
             1,
         );
         fs::write(&self.config, text)?;

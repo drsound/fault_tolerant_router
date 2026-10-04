@@ -269,9 +269,9 @@ pub async fn run(opts: Options) -> Result<()> {
     d.state_dir
         .write_manifest(&d.manifest)
         .context("writing the manifest")?;
-    for scope in d.sysctl_scopes() {
-        d.apply_sysctls(&scope).context("sysctls")?;
-    }
+    // Applied by the first pass, with the failure handling of any other
+    // (FR-REC-3, FR-REC-5).
+    d.sysctls_pending.extend(d.sysctl_scopes());
     d.load_drain_and_checkpoint();
     if d.cfg.firewall.mode == FirewallMode::Managed
         && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
@@ -462,7 +462,15 @@ impl Daemon {
                 SysctlScope::Interface(i) => s.interface.as_ref() == Some(i),
             })
             .collect();
-        let diffs = sysctl::differences(&wanted, sysctl::read)?;
+        let diffs = match sysctl::differences(&wanted, sysctl::read) {
+            Ok(diffs) => diffs,
+            // Only checked, never a prerequisite of readiness.
+            Err(e) if !self.cfg.routing.manage_sysctls => {
+                warn!("checking sysctls: {e} (manage_sysctls = false)");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if diffs.is_empty() {
             return Ok(());
         }
@@ -839,13 +847,18 @@ impl Daemon {
     }
 
     /// Starts, restarts or stops probers: a prober runs while its path is
-    /// ready; any change of interface, source or settings is a new
-    /// generation (FR-PROBE-1, FR-PROBE-3).
+    /// ready, installation included (FR-DISC-7); any change of interface,
+    /// source or settings is a new generation (FR-PROBE-1, FR-PROBE-3).
     fn manage_probers(&mut self) {
         let mask = self.cfg.routing.fwmark_mask;
         for (key, p) in self.paths.iter_mut() {
             let u = self.cfg.uplink(key.uplink).expect("configured");
-            let ready = p.discovered.as_ref().and_then(|d| d.ready.as_ref().ok()).copied();
+            let ready = p
+                .discovered
+                .as_ref()
+                .and_then(|d| d.ready.as_ref().ok())
+                .filter(|_| p.machine.is_ready())
+                .copied();
             let wanted = ready.map(|r| probe::Spec {
                 path: *key,
                 generation: 0,
@@ -1253,6 +1266,15 @@ impl Daemon {
         let kept = |i: &String| self.sysctls_pending.contains(&SysctlScope::Interface(i.clone()));
         self.sysctl_retries.retain(|i, _| kept(i));
         self.sysctls_failed.retain(|i, _| kept(i));
+        // Only checked from now on: nothing waits for the backoff of a
+        // failed application.
+        if !self.cfg.routing.manage_sysctls {
+            self.sysctl_retries.clear();
+            self.sysctls_failed.clear();
+            if self.retry.as_ref().is_some_and(|r| r.attempt == SYSCTL_ATTEMPT) {
+                self.retry = None;
+            }
+        }
         info!("config_reloaded");
         self.dirty = true;
     }

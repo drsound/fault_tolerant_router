@@ -77,12 +77,29 @@ pub fn trusted(config_path: &Path, config: &Config) -> Findings {
 }
 
 /// FR-CFG-5 and `firewall.nft_path`: owned by root, not writable by group or
-/// others, for the file and every parent directory.
+/// others, for the file and every directory its resolution traverses,
+/// through symbolic links too.
 pub fn ownership(path: &Path, what: &str) -> Findings {
     let mut f = Findings::default();
-    let mut p = Some(path);
-    while let Some(cur) = p {
-        match fs::metadata(cur) {
+    // A relative path is the working directory's, as the configuration
+    // loader reads it.
+    let traversed = match std::path::absolute(path).and_then(|path| {
+        traversed(&path, |p| {
+            fs::symlink_metadata(p)?
+                .file_type()
+                .is_symlink()
+                .then(|| fs::read_link(p))
+                .transpose()
+        })
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            f.errors.push(format!("{what}: {}: {e}", path.display()));
+            return f;
+        }
+    };
+    for cur in traversed {
+        match fs::metadata(&cur) {
             Ok(m) if m.uid() != 0 => f
                 .errors
                 .push(format!("{what}: {} is not owned by root (FR-CFG-5)", cur.display())),
@@ -94,9 +111,56 @@ pub fn ownership(path: &Path, what: &str) -> Findings {
             Ok(_) => {}
             Err(e) => f.errors.push(format!("{what}: {}: {e}", cur.display())),
         }
-        p = cur.parent().filter(|x| !x.as_os_str().is_empty());
     }
     f
+}
+
+/// The directories and the file that resolving the absolute `path` goes
+/// through, root first: each one's owner can replace what follows. `link` returns the
+/// target of a symbolic link, `None` for anything else. Symbolic links
+/// themselves are left out: their directory decides who can replace them.
+fn traversed(path: &Path, link: impl Fn(&Path) -> std::io::Result<Option<PathBuf>>) -> std::io::Result<Vec<PathBuf>> {
+    use std::path::Component;
+
+    // The components still to resolve, next last; `/` restarts from the
+    // root.
+    fn push(rest: &mut Vec<PathBuf>, p: &Path) {
+        rest.extend(p.components().rev().filter_map(|c| match c {
+            Component::RootDir => Some(PathBuf::from("/")),
+            Component::ParentDir => Some(PathBuf::from("..")),
+            Component::Normal(n) => Some(PathBuf::from(n)),
+            Component::CurDir | Component::Prefix(_) => None,
+        }));
+    }
+    let root = PathBuf::from("/");
+    let mut out = vec![root.clone()];
+    let mut cur = root.clone();
+    let mut rest = Vec::new();
+    push(&mut rest, path);
+    let mut links = 0;
+    while let Some(c) = rest.pop() {
+        if c == root {
+            cur = root.clone();
+        } else if c.as_os_str() == ".." {
+            cur.pop();
+        } else {
+            let next = cur.join(&c);
+            if let Some(target) = link(&next)? {
+                links += 1;
+                if links > 40 {
+                    return Err(std::io::Error::other("too many levels of symbolic links"));
+                }
+                // A relative target resolves from the link's directory.
+                push(&mut rest, &target);
+                continue;
+            }
+            cur = next;
+            if !out.contains(&cur) {
+                out.push(cur.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// IMPL-6 without a manifest: FTR-tagged rules in the configured range are
@@ -370,6 +434,43 @@ pub fn networkd_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_follows_symbolic_links_and_their_directories() {
+        // /usr/sbin/nft -> ../lib/nft/bin -> /opt/nft/nft; /opt/nft -> v1.
+        let links: BTreeMap<&str, &str> = [
+            ("/usr/sbin/nft", "../lib/nft/bin"),
+            ("/usr/lib/nft/bin", "/opt/nft/nft"),
+            ("/opt/nft", "v1"),
+        ]
+        .into_iter()
+        .collect();
+        let link = |p: &Path| Ok(links.get(p.to_str().unwrap()).map(PathBuf::from));
+        let t = traversed(Path::new("/usr/sbin/nft"), link).unwrap();
+        let t: Vec<&str> = t.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(
+            t,
+            [
+                "/",
+                "/usr",
+                "/usr/sbin",
+                "/usr/lib",
+                "/usr/lib/nft",
+                "/opt",
+                "/opt/v1",
+                "/opt/v1/nft"
+            ]
+        );
+        let lp = |_: &Path| Ok(Some(PathBuf::from("/loop")));
+        assert!(traversed(Path::new("/loop"), lp).is_err(), "a link loop ends");
+    }
+
+    #[test]
+    fn a_relative_path_is_checked_where_it_is_read() {
+        // `etc/passwd` from the crate directory, not the trusted /etc/passwd.
+        assert!(!Path::new("etc/passwd").exists());
+        assert!(!ownership(Path::new("etc/passwd"), "configuration").errors.is_empty());
+    }
 
     #[test]
     fn adoption_without_a_manifest_needs_the_same_layout() {

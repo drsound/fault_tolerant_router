@@ -129,6 +129,10 @@ impl Machine {
         self.reason
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
     pub fn is_up(&self) -> bool {
         self.state == State::Up
     }

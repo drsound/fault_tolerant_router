@@ -80,13 +80,38 @@ fn flows_on_continuous(flows: Vec<testbed::traffic::Flow>, u: Uplink) -> Result<
     Ok(())
 }
 
-fn share(results: &[testbed::ConnResult], u: Uplink) -> f64 {
-    let n = tally(results).get(&Some(u)).copied().unwrap_or(0);
-    n as f64 / results.len() as f64
+/// A statistical split (§14.3): five samples of 1,000 connections to 50
+/// destinations, each through A or B; A's share of the 5,000 is within
+/// `centre ± half` per mille, and of each sample within twice that.
+fn split(t: &Topology, centre: usize, half: usize) -> Result<()> {
+    let mut on_a = Vec::new();
+    for sample in 0..5 {
+        let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
+        let counts = tally(&r);
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok)
+                && counts.keys().all(|u| matches!(u, Some(Uplink::A | Uplink::B))),
+            "sample {sample}: every connection succeeds through A or B: {counts:?}"
+        );
+        on_a.push(counts.get(&Some(Uplink::A)).copied().unwrap_or(0));
+    }
+    eprintln!("connections through A per sample of 1,000: {on_a:?}");
+    let total: usize = on_a.iter().sum();
+    assert!(
+        (5 * (centre - half)..=5 * (centre + half)).contains(&total),
+        "A got {total} of 5,000 (per sample: {on_a:?})"
+    );
+    for (sample, n) in on_a.iter().enumerate() {
+        assert!(
+            (centre - 2 * half..=centre + 2 * half).contains(n),
+            "sample {sample}: A got {n} of 1,000 (per sample: {on_a:?})"
+        );
+    }
+    Ok(())
 }
 
 /// AS-01: two healthy uplinks with equal weights; each gets 45–55% of new
-/// connections (1,000 connections to 50 destinations, 5 runs).
+/// connections (§14.3).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as01_equal_weights_split_connections_evenly() -> Result<()> {
@@ -95,13 +120,7 @@ fn as01_equal_weights_split_connections_evenly() -> Result<()> {
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
     t.reset_counters()?;
-    for run in 0..5 {
-        let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
-        let failed = r.iter().filter(|c| c.outcome != Outcome::Ok).count();
-        assert_eq!(failed, 0, "run {run}: {:?}", tally(&r));
-        let a = share(&r, Uplink::A);
-        assert!((0.45..=0.55).contains(&a), "run {run}: A got {a:.3} ({:?})", tally(&r));
-    }
+    split(&t, 500, 50)?;
     assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
     Ok(())
 }
@@ -250,18 +269,7 @@ fn as02_weights_three_to_one() -> Result<()> {
     let ups = [UplinkSpec::new(Uplink::A, 1).weight(3), UplinkSpec::new(Uplink::B, 2)];
     let f = t.start_ftr(&ftr::ipv4_config(&ups, &HealthSpec::fast(), "", ""))?;
     f.wait_installed(&t)?;
-    for run in 0..5 {
-        let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
-        let counts = tally(&r);
-        assert!(
-            r.iter().all(|c| c.outcome == Outcome::Ok)
-                && counts.keys().all(|u| matches!(u, Some(Uplink::A | Uplink::B))),
-            "run {run}: every connection succeeds through A or B: {counts:?}"
-        );
-        let a = share(&r, Uplink::A);
-        assert!((0.70..=0.80).contains(&a), "run {run}: A got {a:.3} ({counts:?})");
-    }
-    Ok(())
+    split(&t, 750, 50)
 }
 
 /// AS-03: long-lived connections on A are never interrupted while B fails
@@ -402,6 +410,56 @@ fn as20_invalid_reload_keeps_the_running_configuration() -> Result<()> {
     assert_eq!(balancing_members(&t)?, ["wana", "wanb"]);
     let r = t.connect_many(Node::Client, Family::V4, 10, 20, false)?;
     assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    Ok(())
+}
+
+/// AS-20 and AS-23, `firewall.nft_path` (FR-CFG-5): an `nft` reached
+/// through a symbolic link whose target directory is writable by others is
+/// refused by online `check-config`, at startup and on reload, in both
+/// firewall modes, and never runs; the rejected reload keeps the running
+/// configuration.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as20_an_untrusted_nft_path_never_runs() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let open = f.dir.join("open");
+    std::fs::create_dir(&open)?;
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777))?;
+    let ran = f.dir.join("ran");
+    let nft = open.join("nft");
+    std::fs::write(&nft, format!("#!/bin/sh\ntouch {}\nexec nft \"$@\"\n", ran.display()))?;
+    std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755))?;
+    let link = f.dir.join("nft");
+    std::os::unix::fs::symlink(&nft, &link)?;
+    let untrusted = |mode: &str| {
+        let firewall = format!("[firewall]\nmode = \"{mode}\"\nnft_path = \"{}\"\n", link.display());
+        ftr::ipv4_config(&ab(), &HealthSpec::fast(), "", &firewall)
+    };
+    let refusal = format!("{} is writable by group or others", open.display());
+    for mode in ["managed", "external"] {
+        f.write_config(&untrusted(mode))?;
+        let out = f.cli_config(&["check-config"])?;
+        let text = ftr::output_text(&out);
+        assert!(!out.status.success() && text.contains(&refusal), "{mode}: {text}");
+        f.start(&t)?;
+        f.wait_exit(&t, Duration::from_secs(5))?;
+        assert!(f.log().contains(&refusal), "{mode}: {}", f.log());
+    }
+    f.write_config(&ftr::ipv4(&ab()))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
+    f.write_config(&untrusted("managed"))?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert!(f.log().contains(&refusal), "{}", f.log());
+    let r = t.connect_many(Node::Client, Family::V4, 10, 20, false)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    assert!(!ran.exists(), "the untrusted nft never ran");
+    f.stop()?;
     Ok(())
 }
 
@@ -1042,6 +1100,60 @@ fn as18_crash_and_restart_keep_state_and_connections() -> Result<()> {
     let report = flow.stop()?;
     assert_eq!(report.uplink(), Some(Uplink::B));
     assert!(report.continuous(Duration::from_millis(1000)), "{report:?}");
+    t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+/// AS-20 and AS-18, the state directory: a reload that moves it is
+/// rejected and changes nothing; moved while the daemon is stopped with its
+/// artifacts kept, it carries the bindings, a valid checkpoint and the
+/// sysctl baselines to the restart: warm start, A still out, the
+/// connection on B uninterrupted, the same rules, and `cleanup` restores
+/// the settings (FR-CFG-4, IMPL-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as20_state_dir_moves_only_while_stopped() -> Result<()> {
+    let t = build();
+    let svm = || t.router().sysctl_get("net.ipv4.conf.wana.src_valid_mark");
+    let before = svm()?;
+    let mut f = t.start_ftr(&ftr::ipv4(&ab()))?;
+    f.wait_installed(&t)?;
+    assert_eq!(svm()?, "1");
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, &["wanb"], Duration::from_secs(10))?;
+    let flow = t.start_flow(
+        Node::Client,
+        testbed::plan::server(Family::V4, 9),
+        Duration::from_millis(50),
+    )?;
+    std::thread::sleep(Duration::from_millis(500));
+    let rules = ftr_rules(&t)?;
+    let old = f.state.clone();
+    let new = f.dir.join("moved-state");
+    f.state = new.clone();
+    f.write_config(&ftr::ipv4(&ab()))?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
+    assert!(f.log().contains("state_dir cannot change on reload"), "{}", f.log());
+    assert!(!new.exists(), "the rejected directory is not created");
+    f.stop()?;
+    std::fs::rename(&old, &new)?;
+    f.start(&t)?;
+    f.wait_log(&t, "warm=true", 2, Duration::from_secs(10))?;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        assert_eq!(balancing_members(&t)?, ["wanb"], "A never re-enters the active set");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(ftr_rules(&t)?, rules, "no duplicate or missing rule");
+    assert!(!old.exists(), "nothing is written to the old directory");
+    let report = flow.stop()?;
+    assert_eq!(report.uplink(), Some(Uplink::B));
+    assert!(report.continuous(Duration::from_millis(1000)), "{report:?}");
+    f.stop()?;
+    let out = f.cli_config(&["cleanup"])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(svm()?, before, "the baselines moved with the directory");
     t.upstream_up(Uplink::A)?;
     Ok(())
 }
@@ -1851,14 +1963,8 @@ fn as23_external_firewall_mode() -> Result<()> {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     t.router().nft(&String::from_utf8_lossy(&out.stdout))?;
     f.wait_log(&t, "status_recovered", 1, Duration::from_secs(13))?;
-    // AS-01 (one run).
-    let r = t.connect_many(Node::Client, Family::V4, 50, 1000, false)?;
-    let a = share(&r, Uplink::A);
-    assert!(
-        r.iter().all(|c| c.outcome == Outcome::Ok) && (0.45..=0.55).contains(&a),
-        "A got {a:.3} ({:?})",
-        tally(&r)
-    );
+    // AS-01.
+    split(&t, 500, 50)?;
     // AS-03: connections on A survive a failure and the recovery of B.
     wait_members(&t, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, 1, 12)?;
@@ -2460,7 +2566,8 @@ fn as27_a_failing_interface_setting_does_not_hold_back_failover() -> Result<()> 
 
 /// AS-27, an uplink added while another interface's settings keep
 /// failing gets its own settings before it carries traffic: the backoff of
-/// C's settings does not hold back B's (FR-REC-3, FR-REC-5).
+/// C's settings does not hold back B's (FR-REC-3, FR-REC-5); C removed
+/// while its settings fail leaves nothing to retry (FR-DISC-7).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()> {
@@ -2493,8 +2600,113 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
         assert!(!joined || svm()? == "1", "B carries traffic without its settings");
         Ok(joined)
     })?;
+    // Before C's next retry: a kept retry would wait for it.
+    f.write_config(&ftr::ipv4(&[a, b]))?;
+    f.reload()?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(4))?;
+    faults.disarm()?;
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, management switched off by a reload while C's settings and the
+/// global ones wait for long backoffs: both backoffs go, the settings are
+/// only checked, and the pass completes at once (FR-DISC-7, §4.6).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_disabling_sysctl_management_drops_the_backoffs() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(15))?;
+    faults.arm_matching("set sysctls")?;
+    t.pppoe_reset()?;
+    let failures = |scope: &str| {
+        let step = format!("set sysctls ({scope}) failed");
+        faults.steps().iter().filter(|s| **s == step).count()
+    };
+    // Five failures: C's next retry is about 16 s away.
+    t.wait_for("C's settings failing repeatedly", Duration::from_secs(40), || {
+        Ok(failures("ppp0") >= 5)
+    })?;
+    // A global setting changed behind FTR's back, then a reload: four
+    // failures put its next retry about 8 s away, and hold back the pass.
+    t.router()
+        .run("sh", ["-c", "echo 0 > /proc/sys/net/ipv4/fib_multipath_hash_policy"])?;
+    f.reload()?;
+    t.wait_for(
+        "the global settings failing repeatedly",
+        Duration::from_secs(20),
+        || Ok(failures("global") >= 4),
+    )?;
+    let text = ftr::ipv4_config(&abc(), &HealthSpec::fast(), "manage_sysctls = false", "");
+    f.write_config(&text)?;
+    f.reload()?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(4))?;
+    assert!(
+        f.log().contains("fib_multipath_hash_policy is 0, FTR needs"),
+        "only checked: {}",
+        f.log()
+    );
+    wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(15))?;
+    faults.disarm()?;
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, startup: B's settings fail from the start. The daemon starts,
+/// installs A and C, and keeps B out, not probed, until its settings apply
+/// (FR-DISC-7, FR-PROBE-1, FR-REC-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_startup_with_an_interface_setting_failing() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let faults = Faults::new(&mut f);
+    faults.arm_matching("sysctls (wanb)")?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["ppp0", "wana"], Duration::from_secs(15))?;
+    f.wait_log(&t, "apply_failed", 1, Duration::from_secs(5))?;
+    // Probes of a path that is ready send several packets a second; a DHCP
+    // renewal (2-minute leases) may fall in the window.
+    let probed = |what: &str| -> Result<u64> {
+        t.reset_counters()?;
+        std::thread::sleep(Duration::from_secs(3));
+        let n = t.egress_packets(Uplink::B, Family::V4)?;
+        eprintln!("{what}: {n} packets through B in 3 s");
+        Ok(n)
+    };
+    assert!(probed("B not ready")? <= 2, "B is not probed while not ready");
+    assert_eq!(balancing_members(&t)?, ["ppp0", "wana"]);
     faults.disarm()?;
     wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(70))?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(5))?;
+    assert!(probed("B ready")? > 2, "control: probes of a ready B are counted");
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, startup: the global settings fail from the start. The daemon
+/// starts, changes no route or rule until they apply, then installs
+/// everything (FR-REC-3, FR-REC-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_startup_with_a_global_setting_failing() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let faults = Faults::new(&mut f);
+    faults.arm_matching("sysctls (global)")?;
+    f.start(&t)?;
+    f.wait_log(&t, "apply_failed", 2, Duration::from_secs(10))?;
+    assert!(ftr_rules(&t)?.is_empty(), "no rule before the global settings");
+    assert!(balancing_members(&t)?.is_empty(), "no route before the global settings");
+    faults.disarm()?;
+    f.wait_installed(&t)?;
+    wait_members(&t, &["wana", "wanb"], Duration::from_secs(70))?;
+    f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(5))?;
     f.stop()?;
     Ok(())
 }
