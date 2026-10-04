@@ -575,26 +575,6 @@ fn foreign_objects(t: &Topology) -> Result<String> {
     Ok(format!("{}\n{tables}", rules.join("\n")))
 }
 
-/// An `nft` wrapper for `firewall.nft_path` whose invocations containing one
-/// of `failing` (for example `list flowtables`) fail while the returned flag
-/// file exists.
-fn nft_wrapper(t: &Topology, f: &ftr::Ftr, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
-    let nft = t.router().sh("command -v nft")?.trim().to_owned();
-    let flag = f.dir.join("nft-fails");
-    let wrapper = t.exec_dir()?.join("nft");
-    let patterns: Vec<String> = failing.iter().map(|p| format!("*\" {p} \"*")).collect();
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in {}) echo 'injected nft failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
-            patterns.join("|"),
-            flag = flag.display()
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    Ok((wrapper, flag))
-}
-
 /// AS-33, systemd-networkd (FR-COEX-1): a networkd in the router's namespace
 /// with foreign-rule or foreign-route management enabled (both default to
 /// yes) makes online `check-config` fail and startup be refused, naming each
@@ -1338,7 +1318,9 @@ fn as11_ppp_reconnection_with_a_new_ifindex() -> Result<()> {
     let before = t.ifindex("ppp0").expect("ppp0");
     let old = address(&t, Family::V4, Uplink::C)?;
     assert!(path_route(&t, Family::V4, 1003)?.contains("dev ppp0"));
-    let flows = start_flows(&t, Family::V4, 50, 12)?;
+    // Over three uplinks: 24 flows leave B without one once in 17,000 runs
+    // (12 did once in 130).
+    let flows = start_flows(&t, Family::V4, 50, 24)?;
     std::thread::sleep(Duration::from_millis(500));
     t.pppoe_renumber("203.0.113.20")?;
     t.wait_for(
@@ -2955,48 +2937,42 @@ fn as27_cleanup_step_by_step() -> Result<()> {
     Ok(())
 }
 
-/// AS-36 (IPv4): active-set updates under a continuous stream of new
-/// connections, each first rejected by an injected failure before any
-/// mutation. A's probes fail while A still forwards: until the retry new
-/// connections keep using the previous set {A, B}, after it only B; then A
-/// recovers and, after the rejected update is retried, rejoins. No new
-/// connection of the stream fails, pinned connections are uninterrupted and
-/// the status is degraded until the update is complete. (With one IPv4
-/// balancing route per update and no policies in M1, an update has no
-/// partial state; the IPv6 failure after the first insertion is M2.)
-#[test]
-#[ignore = "needs root and network namespaces"]
-fn as36_active_set_updates_under_new_connections() -> Result<()> {
+per_family!(as36_active_set_updates_under_new_connections);
+
+/// AS-36: active-set updates under a continuous stream of new connections,
+/// each first rejected by an injected failure before any mutation. A's
+/// probes fail while A still forwards: until the retry new connections keep
+/// using the previous set {A, B}, after it only B; then A recovers and,
+/// after the rejected update is retried, rejoins. No new connection of the
+/// stream fails, pinned connections are uninterrupted and the status is
+/// degraded until the update is complete. (With no policies yet, an update
+/// rejected before any mutation has no partial state; the IPv6 failure after
+/// the first insertion is `as36_ipv6_update_failing_after_the_first_insertion`.)
+fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.prepare_ftr(&stack(fam, &ab()))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
-    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     t.reset_counters()?;
     let flows: Vec<_> = (80..86)
-        .map(|n| {
-            t.start_flow(
-                Node::Client,
-                testbed::plan::server(Family::V4, n),
-                Duration::from_millis(50),
-            )
-        })
+        .map(|n| t.start_flow(Node::Client, testbed::plan::server(fam, n), Duration::from_millis(50)))
         .collect::<Result<_>>()?;
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| -> Result<()> {
         let stream = s.spawn(|| -> Result<Vec<testbed::ConnResult>> {
             let mut all = Vec::new();
             while !stop.load(Ordering::Relaxed) {
-                all.extend(t.connect_many(Node::Client, Family::V4, 20, 20, false)?);
+                all.extend(t.connect_many(Node::Client, fam, 20, 20, false)?);
             }
             Ok(all)
         });
         let result = (|| -> Result<()> {
             let phase = |expected: &[Uplink], what: &str| -> Result<()> {
-                let r = t.connect_many(Node::Client, Family::V4, 30, 60, false)?;
+                let r = t.connect_many(Node::Client, fam, 30, 60, false)?;
                 let used: std::collections::BTreeSet<Option<Uplink>> = r.iter().map(|c| c.uplink()).collect();
                 let expected: std::collections::BTreeSet<Option<Uplink>> = expected.iter().copied().map(Some).collect();
                 assert_eq!(used, expected, "{what}: {:?}", tally(&r));
@@ -3053,7 +3029,7 @@ fn as36_active_set_updates_under_new_connections() -> Result<()> {
     for r in &reports {
         assert!(r.continuous(Duration::from_secs(1)), "pinned flow interrupted: {r:?}");
     }
-    assert_eq!(t.ipv4_leaks()?, 0, "INV-3");
+    assert_eq!(t.leaks(fam)?, 0, "INV-3");
     Ok(())
 }
 
@@ -3071,6 +3047,7 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     let t = build();
     let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
     let faults = Faults::new(&mut f);
+    f.set_env("FTR_LOG", "debug");
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -3093,6 +3070,13 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(70))?;
     phase(&[Uplink::B], "after the boundary")?;
     // A comes back; the replacement fails after its first insertion.
+    let rereads = || {
+        f.log()
+            .lines()
+            .filter(|l| l.contains("re-reading the table of the failed update family=ipv6 table=1000"))
+            .count()
+    };
+    let before = rereads();
     faults.arm_empty("replace ipv6 route of table 1000")?;
     t.clear_provider_rules(Uplink::A)?;
     t.wait_for(
@@ -3101,6 +3085,12 @@ fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
         || Ok(faults.injected()),
     )?;
     assert!(balancing_members(&t, Family::V6)?.is_empty(), "the old route is gone");
+    // The view is corrected by a re-read of the table: the simulation
+    // deletes the route with a notification, which a kernel failure need
+    // not send.
+    t.wait_for("the re-read of the balancing table", Duration::from_secs(5), || {
+        Ok(rereads() > before)
+    })?;
     let dsts = format!(
         "ip6 daddr {}-{}",
         testbed::plan::server(Family::V6, 150),

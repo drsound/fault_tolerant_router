@@ -105,21 +105,41 @@ fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
 /// its new connections are balanced over both uplinks without leaks, its
 /// long-lived connections keep their uplink, and the pinned IPv4
 /// connections are not interrupted. Each new path joins the balancing route
-/// only after its assignment exists (FR-REC-3 for a path).
+/// only after its assignment exists, also while the replacement that
+/// installs it fails (FR-REC-3 for a path).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    // The replacement that installs the IPv6 assignments fails at first.
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
+    let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
+    let config = |families: &[Family]| ftr::config(&ab(), families, &ftr::HealthSpec::fast(), "", &firewall);
+    f.write_config(&config(&[Family::V4]))?;
+    f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows4 = start_flows(&t, Family::V4, 1, 16)?;
     std::thread::sleep(Duration::from_secs(1));
-    f.write_config(&ftr::dual(&ab()))?;
+    std::fs::write(&flag, "")?;
+    f.write_config(&config(&Family::ALL))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
-    // Paths added by reload start down and need `rise` passed rounds.
-    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(20))?;
+    f.wait_log(&t, "apply_failed", 1, Duration::from_secs(10))?;
+    // Paths added by reload start down and need `rise` passed rounds: once
+    // both are up, they stay out of the balancing route while their
+    // assignments are missing.
+    f.wait_log(&t, "family=ipv6 from=Down to=Up", 2, Duration::from_secs(20))?;
+    for _ in 0..4 {
+        assert!(
+            balancing_members(&t, Family::V6)?.is_empty(),
+            "no IPv6 path before its assignment"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::fs::remove_file(&flag)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(70))?;
     t.reset_counters()?;
     let r = t.connect_many(Node::Client, Family::V6, 50, 200, false)?;
     let counts = tally(&r);
@@ -696,13 +716,18 @@ fn dhcpv6_lease(t: &testbed::Topology) -> Result<Option<(IpAddr, u64)>> {
         .find_map(|a| Some((a.local, a.valid_lft?))))
 }
 
-/// The router's LAN address from the prefix that B delegated.
-fn delegated_lan_address(t: &testbed::Topology) -> Result<Option<IpAddr>> {
+/// The router's LAN address from the prefix that B delegated, and its
+/// valid lifetime (the delegated prefix's).
+fn delegated_lan(t: &testbed::Topology) -> Result<Option<(IpAddr, u64)>> {
     let pool: plan::Prefix = DELEGATED_POOL.parse()?;
     Ok(t.addresses("lan", Family::V6, "global")?
         .into_iter()
-        .map(|a| a.local)
-        .find(|a| pool.contains(*a)))
+        .filter(|a| pool.contains(a.local))
+        .find_map(|a| Some((a.local, a.valid_lft?))))
+}
+
+fn delegated_lan_address(t: &testbed::Topology) -> Result<Option<IpAddr>> {
+    Ok(delegated_lan(t)?.map(|(a, _)| a))
 }
 
 /// AS-44 (DHCPv6 with prefix delegation and the server-unicast variant):
@@ -750,8 +775,13 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
     wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(20))?;
     let (leased, _) = dhcpv6_lease(&t)?.expect("the lease just seen");
     let lan = delegated_lan_address(&t)?;
+    // The address and the delegated prefix, both renewed: a lease kept
+    // without its prefix would leave the LAN at the prefix's first expiry.
     let renewed = || -> Result<bool> {
-        Ok(dhcpv6_lease(&t)?.is_some_and(|(a, valid)| a == leased && valid + 10 >= DHCPV6_VALID))
+        let fresh = |l: Option<(IpAddr, u64)>, address: Option<IpAddr>| {
+            l.is_some_and(|(a, valid)| Some(a) == address && valid + 10 >= DHCPV6_VALID)
+        };
+        Ok(fresh(dhcpv6_lease(&t)?, Some(leased)) && fresh(delegated_lan(&t)?, lan))
     };
 
     // Renewal at T1 by unicast through B, the only member of the active set.

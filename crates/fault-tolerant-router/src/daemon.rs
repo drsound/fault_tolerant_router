@@ -1189,6 +1189,7 @@ impl Daemon {
         self.reread_expired();
         if !self.reread.is_empty() {
             let tables: Vec<_> = std::mem::take(&mut self.reread).into_iter().collect();
+            debug!(?tables, "re-reading tables");
             if let Err(e) = observer::reread(&self.dumper, &self.scope, &mut self.system, &tables).await {
                 warn!("re-reading tables: {e}");
             }
@@ -1338,6 +1339,7 @@ impl Daemon {
             // before the next pass. FR-ROUTE-2's case: a failed IPv6
             // replacement can leave the table empty (the kernel removes the
             // members it inserted, and the old route is gone).
+            debug!(%family, table, "re-reading the table of the failed update");
             self.reread.insert((family, table));
             if let Some(key) = self
                 .paths

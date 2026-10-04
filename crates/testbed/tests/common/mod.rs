@@ -282,3 +282,23 @@ pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
     assert!(f.log().contains(needle), "expected {needle:?} in:\n{}", f.log());
     Ok(())
 }
+
+/// An `nft` wrapper for `firewall.nft_path` whose invocations containing one
+/// of `failing` (for example `list flowtables`) fail while the returned flag
+/// file exists.
+pub fn nft_wrapper(t: &Topology, f: &ftr::Ftr, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
+    let nft = t.router().sh("command -v nft")?.trim().to_owned();
+    let flag = f.dir.join("nft-fails");
+    let wrapper = t.exec_dir()?.join("nft");
+    let patterns: Vec<String> = failing.iter().map(|p| format!("*\" {p} \"*")).collect();
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in {}) echo 'injected nft failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
+            patterns.join("|"),
+            flag = flag.display()
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    Ok((wrapper, flag))
+}
