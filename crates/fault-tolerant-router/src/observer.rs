@@ -159,6 +159,9 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Vie
             }
         }
     }
+    // A route read within the last clock tick before its expiry shows
+    // none (FR-DISC-5).
+    new.keep_expiries(old);
     Ok(View {
         system: new,
         interrupted,

@@ -10,6 +10,8 @@
 //! - `flow` (client): one long-lived TCP connection exchanging a counter at
 //!   a fixed interval until standard input closes; prints a [`FlowReport`].
 //! - `udp-send` (client): a one-way UDP flow from a fixed local port.
+//! - `send-ra` (provider): one Router Advertisement without options, which
+//!   changes a router lifetime without prefix information (FR-DISC-5).
 //!
 //! The agents use the standard library only and blocking threads, which
 //! keeps them independent of the daemon's runtime.
@@ -463,4 +465,32 @@ pub fn udp_send(dst: SocketAddr, src_port: u16, count: u32, interval: Duration) 
         thread::sleep(interval);
     }
     Ok(sent)
+}
+
+/// Sends one Router Advertisement without options to all nodes on
+/// `device`: current hop limit 64, the given flags and router lifetime. The
+/// kernel picks the interface's link-local address as the source and fills
+/// in the ICMPv6 checksum; neighbour discovery needs a hop limit of 255.
+pub fn send_ra(device: &str, lifetime: u16, flags: u8) -> Result<()> {
+    let ifindex: u32 = std::fs::read_to_string(format!("/sys/class/net/{device}/ifindex"))
+        .with_context(|| format!("interface {device}"))?
+        .trim()
+        .parse()?;
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::RAW,
+        Some(socket2::Protocol::ICMPV6),
+    )?;
+    s.bind_device(Some(device.as_bytes()))?;
+    s.set_multicast_if_v6(ifindex)?;
+    s.set_multicast_hops_v6(255)?;
+    let mut ra = [0u8; 16];
+    ra[0] = 134;
+    ra[4] = 64;
+    ra[5] = flags;
+    ra[6..8].copy_from_slice(&lifetime.to_be_bytes());
+    let all_nodes = SocketAddrV6::new(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 0, 0, ifindex);
+    s.send_to(&ra, &SocketAddr::V6(all_nodes).into())
+        .context("sending the Router Advertisement")?;
+    Ok(())
 }

@@ -716,38 +716,42 @@ impl Daemon {
                 }
                 self.dirty = true;
             }
-            Change::RouterAdvertisement(i) => {
-                // FR-DISC-5: the advertisement may have refreshed or
-                // shortened the lifetime of the default routes it installed
-                // on the interface, without a route notification; their
-                // creation and their deletion by a zero lifetime are
-                // notified. A route of the kernel's Router Advertisement
-                // protocol counts even without a known expiry: a read
-                // within a clock tick of the expiry shows none.
-                if self.uplink_on(i).is_some() {
-                    let ra = u8::from(netlink_packet_route::route::RouteProtocol::Ra);
-                    let tables: BTreeSet<(Family, u32)> = self
-                        .discovery_defaults()
-                        .filter(|r| {
-                            r.family == Family::V6
-                                && (r.expires_at.is_some() || r.protocol == ra)
-                                && r.nexthops.iter().any(|h| h.ifindex == i)
-                        })
-                        .map(|r| (r.family, r.table))
-                        .collect();
-                    if !tables.is_empty() {
-                        debug!(
-                            ifindex = i,
-                            ?tables,
-                            "router advertisement: re-reading the tables of its routes"
-                        );
-                        self.reread.extend(tables);
-                        self.dirty = true;
-                    }
-                }
-            }
+            Change::RouterAdvertisement(i) => self.router_advertisement(i),
             Change::Route { .. } | Change::Rule { .. } | Change::Nexthop { .. } => self.dirty = true,
             Change::None => {}
+        }
+    }
+
+    /// A Router Advertisement arrived on an interface (seen by the
+    /// listener of `ra.rs`, or announced by `RTM_NEWPREFIX` when it carries
+    /// prefix information). FR-DISC-5: it may have refreshed or shortened
+    /// the lifetime of the default routes it installed on the interface
+    /// without a route notification; their creation and their deletion by a
+    /// zero lifetime are notified. A route of the kernel's Router
+    /// Advertisement protocol counts even without a known expiry: a read
+    /// within a clock tick of the expiry shows none.
+    fn router_advertisement(&mut self, i: u32) {
+        if self.uplink_on(i).is_none() {
+            return;
+        }
+        let ra = u8::from(netlink_packet_route::route::RouteProtocol::Ra);
+        let tables: BTreeSet<(Family, u32)> = self
+            .discovery_defaults()
+            .filter(|r| {
+                r.family == Family::V6
+                    && (r.expires_at.is_some() || r.protocol == ra)
+                    && r.nexthops.iter().any(|h| h.ifindex == i)
+            })
+            .map(|r| (r.family, r.table))
+            .collect();
+        if !tables.is_empty() {
+            debug!(
+                ifindex = i,
+                ?tables,
+                "router advertisement: re-reading the tables of its routes"
+            );
+            self.reread.extend(tables);
+            self.dirty = true;
         }
     }
 
@@ -798,20 +802,24 @@ impl Daemon {
             .map(|t| Instant::from_std(t) + Duration::from_millis(50))
     }
 
-    /// Re-reads the tables of expired routes before the next evaluation:
-    /// later Router Advertisements may have refreshed them without a
-    /// notification (FR-DISC-5). The re-read lists a route that has
-    /// expired but is not collected yet with an expiry in the past, which
-    /// counts as handled.
+    /// Re-reads the tables of routes whose known expiry has passed since
+    /// the last check, before the next evaluation, which would otherwise
+    /// count them as gone: an advertisement may have refreshed them without
+    /// a notification (FR-DISC-5). Every pass does it, not only the
+    /// expiry's own wake-up 50 ms later, since another event can come
+    /// first. The re-read lists a route that has expired but is not
+    /// collected yet with an expiry in the past, which counts as handled.
     fn reread_expired(&mut self) {
         let now = std::time::Instant::now();
-        let tables: Vec<(Family, u32)> = self
+        let tables: BTreeSet<(Family, u32)> = self
             .discovery_defaults()
-            .filter(|r| r.expired(now))
+            .filter(|r| r.expires_at.is_some_and(|t| t > self.expiry_checked) && r.expired(now))
             .map(|r| (r.family, r.table))
             .collect();
-        debug!(?tables, "re-reading the tables of expired routes");
-        self.reread.extend(tables);
+        if !tables.is_empty() {
+            debug!(?tables, "re-reading the tables of expired routes");
+            self.reread.extend(tables);
+        }
         self.expiry_checked = now;
     }
 
@@ -1160,6 +1168,7 @@ impl Daemon {
                 return;
             }
         }
+        self.reread_expired();
         if !self.reread.is_empty() {
             let tables: Vec<_> = std::mem::take(&mut self.reread).into_iter().collect();
             if let Err(e) = observer::reread(&self.dumper, &self.scope, &mut self.system, &tables).await {
@@ -1466,6 +1475,18 @@ impl Daemon {
         let mut int = signal(SignalKind::interrupt())?;
         let mut hup = signal(SignalKind::hangup())?;
         let mut next_full = Instant::now() + self.cfg.routing.reconcile_interval;
+        let (ra_tx, mut ra_rx) = mpsc::unbounded_channel();
+        let listener = match crate::ra::spawn(ra_tx) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                // RTM_NEWPREFIX still covers advertisements with prefix
+                // information.
+                warn!(
+                    "cannot listen to Router Advertisements: {e}; a lifetime shortened without prefix information is seen at its previous expiry"
+                );
+                None
+            }
+        };
         loop {
             if self.dirty {
                 self.dirty = false;
@@ -1497,12 +1518,14 @@ impl Daemon {
                     None => bail!("the netlink subscription closed"),
                 },
                 r = probe_rx.recv() => if let Some(r) = r { self.probe_report(r) },
+                Some(i) = ra_rx.recv() => self.router_advertisement(i),
                 _ = sleep_until(wake) => {
                     if Instant::now() >= next_full {
                         next_full = Instant::now() + self.cfg.routing.reconcile_interval;
                         self.full_reconciliation().await;
                     } else {
-                        self.reread_expired();
+                        // An expiry, a retry or a warning: the pass handles
+                        // each (an expiry by reread_expired).
                         self.dirty = true;
                     }
                 }
@@ -1513,6 +1536,9 @@ impl Daemon {
             }
         }
         info!("daemon_stopping");
+        if let Some(h) = listener {
+            h.abort();
+        }
         for p in self.paths.values_mut() {
             if let Some((_, h)) = p.prober.take() {
                 h.abort();

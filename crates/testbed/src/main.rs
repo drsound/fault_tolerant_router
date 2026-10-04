@@ -103,6 +103,18 @@ enum AgentCommand {
         timeout_ms: u64,
         dst: SocketAddr,
     },
+    /// One Router Advertisement without options (RFC 4861 §4.2) to all
+    /// nodes, from the interface's link-local address.
+    SendRa {
+        #[arg(long)]
+        device: String,
+        /// Router lifetime in seconds.
+        #[arg(long)]
+        lifetime: u16,
+        /// The flags byte (managed 0x80, other configuration 0x40).
+        #[arg(long, default_value_t = 0)]
+        flags: u8,
+    },
     UdpSend {
         #[arg(long)]
         src_port: u16,
@@ -212,6 +224,11 @@ fn run(cli: Cli) -> Result<()> {
                 let r = agent::bulk(dst, bytes, Duration::from_millis(timeout_ms));
                 println!("{}", serde_json::to_string(&r)?);
             }
+            AgentCommand::SendRa {
+                device,
+                lifetime,
+                flags,
+            } => agent::send_ra(&device, lifetime, flags)?,
             AgentCommand::UdpSend {
                 src_port,
                 count,

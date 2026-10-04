@@ -230,6 +230,14 @@ impl System {
         }
     }
 
+    /// Gives the routes of a new view, built from a full dump, the expiries
+    /// that `old` knows and the dump showed as none (see [`keep_expiry`]).
+    pub fn keep_expiries(&mut self, old: &System) {
+        for (k, r) in &mut self.routes {
+            keep_expiry(old.routes.get(k).and_then(|o| o.expires_at), r);
+        }
+    }
+
     /// Adds a route as a dump would.
     #[cfg(test)]
     pub fn insert_route(&mut self, scope: &Scope, r: ObservedRoute) {
@@ -437,6 +445,27 @@ mod tests {
         // FTR's own tables and tables outside the scope never need it.
         assert_eq!(stale(&s, route(1000, 6, "fe80::5", 100), false, 0x100), None);
         assert_eq!(stale(&s, route(300, 6, "fe80::5", 1024), false, 0x100), None);
+    }
+
+    #[test]
+    fn a_new_view_keeps_an_expiry_due_within_a_second() {
+        let scope = scope();
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut old = System::default();
+        let mut new = System::default();
+        for (ifindex, expiry) in [(5, soon), (6, later)] {
+            let m = route(254, ifindex, "fe80::1", 1024);
+            let mut r = ObservedRoute::parse(&m).unwrap();
+            new.insert_route(&scope, r.clone());
+            r.expires_at = Some(expiry);
+            old.insert_route(&scope, r);
+        }
+        new.keep_expiries(&old);
+        let expiries: Vec<_> = new.routes.values().map(|r| r.expires_at).collect();
+        // A dump within the last clock tick shows no expiry; one that shows
+        // none a minute before the known expiry is a refresh without one.
+        assert_eq!(expiries, [Some(soon), None]);
     }
 
     #[test]

@@ -242,6 +242,65 @@ fn as28_identical_link_local_gateways_and_router_expiry() -> Result<()> {
     Ok(())
 }
 
+/// FR-DISC-5: an advertisement without prefix information shortens the
+/// router lifetime of A's default route. The kernel notifies neither the
+/// change nor the later expiry, and sends no `RTM_NEWPREFIX`: FTR sees the
+/// advertisement itself, and A is not ready within a second of the expiry.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
+    let t = build();
+    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
+    let before = ra_expiry(&t, "wana")?.expect("A's default route");
+    assert!(before > 60, "A's router lifetime: {before} s");
+    // From now on only advertisements without options leave the providers
+    // (56 bytes with the IPv6 header). dnsmasq's carry prefix information:
+    // their RTM_NEWPREFIX, B's too, would re-read the main table, which
+    // holds both default routes.
+    for p in [Node::IspA, Node::IspB] {
+        t.ns(p).nft(
+            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert meta length != 56 drop\n  }\n}\n",
+        )?;
+    }
+    // Advertisements already sent arrive first.
+    std::thread::sleep(Duration::from_secs(1));
+    t.ns(Node::IspA).run(
+        &t.agent_bin().to_string_lossy(),
+        [
+            "agent",
+            "send-ra",
+            "--device",
+            "wan",
+            "--lifetime",
+            "4",
+            // dnsmasq's managed and other-configuration flags (0xc0): a change of
+            // flags would also notify the interface's IPv6 settings.
+            "--flags",
+            "192",
+        ],
+    )?;
+    t.wait_for(
+        "A's default route with the short lifetime",
+        Duration::from_secs(5),
+        || Ok(ra_expiry(&t, "wana")?.is_some_and(|s| s <= 4)),
+    )?;
+    let start = std::time::Instant::now();
+    let left = ra_expiry(&t, "wana")?.unwrap_or(0);
+    t.wait_for("A's path route withdrawn", Duration::from_secs(left + 5), || {
+        Ok(path_route(&t, Family::V6, 1001)?.is_empty())
+    })?;
+    let took = start.elapsed();
+    // As in AS-28: `expires` is rounded down to the second.
+    assert!(
+        took <= Duration::from_secs(left + 2) && took + Duration::from_secs(1) >= Duration::from_secs(left),
+        "withdrawn after {took:?}, expiry in {left} s"
+    );
+    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(2))?;
+    Ok(())
+}
+
 /// AS-35: IPv6 over PPP with the peer's link-local gateway: C's path joins
 /// and leaves a multi-member active set (single → multiple → single) and
 /// every route installation succeeds. Then C reconnects with a new
