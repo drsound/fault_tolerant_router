@@ -1,5 +1,7 @@
 # M0 spikes
 
+Written before the project was renamed PolyWAN (M3): "FTR", `fault-tolerant-router` and the scripts' `ftr` names are the names of that time.
+
 Throw-away experiments required by SPEC.md §15 before the corresponding code is written. Each spike lives in its own directory with the scripts or crates that reproduce it and a `README.md` that records the environment, what was tested, the observed behaviour and the resulting conclusions or proposed amendments to SPEC.md (by requirement identifier).
 
 Every spike runs on two environments:

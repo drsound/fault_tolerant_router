@@ -43,13 +43,13 @@ pub enum Dhcpv6Client {
 }
 
 impl Dhcpv6Client {
-    /// `FTR_TEST_DHCPV6_CLIENT` (`dhcpcd` or `dhclient`); otherwise dhcpcd
+    /// `POLYWAN_TEST_DHCPV6_CLIENT` (`dhcpcd` or `dhclient`); otherwise dhcpcd
     /// when installed, ISC dhclient when not.
     pub fn detect() -> Result<Dhcpv6Client> {
-        match std::env::var("FTR_TEST_DHCPV6_CLIENT").as_deref() {
+        match std::env::var("POLYWAN_TEST_DHCPV6_CLIENT").as_deref() {
             Ok("dhcpcd") => return Ok(Dhcpv6Client::Dhcpcd),
             Ok("dhclient") => return Ok(Dhcpv6Client::Dhclient),
-            Ok(other) => bail!("FTR_TEST_DHCPV6_CLIENT={other}: expected dhcpcd or dhclient"),
+            Ok(other) => bail!("POLYWAN_TEST_DHCPV6_CLIENT={other}: expected dhcpcd or dhclient"),
             Err(_) => {}
         }
         if installed("dhcpcd")? {
@@ -203,7 +203,7 @@ fn kea_config() -> String {
 /// prefix on the LAN. Nothing else (no resolver configuration).
 fn dhclient_script() -> &'static str {
     r#"#!/bin/sh
-# ftr-testbed dhclient script for DHCPv6 with prefix delegation.
+# polywan-testbed dhclient script for DHCPv6 with prefix delegation.
 case "$reason" in
   BOUND6|RENEW6|REBIND6|REBOOT6)
     life="valid_lft ${new_max_life:-forever} preferred_lft ${new_preferred_life:-forever}"

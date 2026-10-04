@@ -1,6 +1,6 @@
 # testbed
 
-Network namespace test harness for Fault Tolerant Router 2.0 (SPEC.md §14.1–14.2). It builds the reference topology out of network namespaces and veth pairs, gives the router under test real providers (DHCPv4, DHCPv6, Router Advertisements, CGNAT, PPPoE), and offers the helpers that acceptance tests need: commands inside namespaces, failure injection, traffic with per-connection uplink attribution, and leak detection.
+Network namespace test harness for PolyWAN 2.0 (SPEC.md §14.1–14.2). It builds the reference topology out of network namespaces and veth pairs, gives the router under test real providers (DHCPv4, DHCPv6, Router Advertisements, CGNAT, PPPoE), and offers the helpers that acceptance tests need: commands inside namespaces, failure injection, traffic with per-connection uplink attribution, and leak detection.
 
 ## Topology
 
@@ -28,15 +28,15 @@ The router gets its uplink configuration the way an operating system would: `udh
 
 ## Helpers
 
-- `Topology::build(Options)`, `Topology::ns(Node)`, `Ns::run/ip/sh/nft/sysctl/spawn`: build the topology and run commands in any node. Dropping the `Topology` kills every process of the run, deletes its namespaces and removes its working directory (`/tmp/ftr-testbed/<run>`).
+- `Topology::build(Options)`, `Topology::ns(Node)`, `Ns::run/ip/sh/nft/sysctl/spawn`: build the topology and run commands in any node. Dropping the `Topology` kills every process of the run, deletes its namespaces and removes its working directory (`/tmp/polywan-testbed/<run>`).
 - Failure injection (`src/inject.rs`): carrier loss (`carrier_down`), router interface down (`router_link`), provider disconnected upstream with the link up (`upstream_down`), deterministic nftables drop patterns in a provider (`drop_probe_echoes(uplink, 3)` drops every third echo request towards the probe targets; `provider_rules` for anything else), `tc netem` (`netem`), PPPoE session reset with a new `ppp0` ifindex (`pppoe_reset`), DHCP renewal (`dhcp_renew`).
 - Traffic (`src/traffic.rs`): `connect_many` opens N TCP or UDP connections with distinct 5-tuples from a node to up to 254 destinations and reports, for each, the outcome (`ok`, `unreachable`, `refused`, `timeout`) and the source address seen by the server, from which `ConnResult::uplink` attributes the egress uplink; `start_flow` runs a long-lived TCP flow and reports its longest stall (`FlowReport::continuous`); `udp_send` sends a one-way UDP flow from a fixed source port, attributed through the server log (`server_events`); `ping` distinguishes reply, ICMP unreachable and timeout.
-- Leak detection: every operating-system default route of the router carries realm 99, and the harness table `ip tb_observe` counts IPv4 packets routed by such a route (`ipv4_leaks`); any non-zero count while FTR is installed violates INV-3. IPv6 routes have no realm, so for IPv6 the harness offers per-uplink egress counters (`egress_packets`, table `inet tb_egress`) for scenarios where no packet may leave, plus route lookups with `ip -6 route get`.
+- Leak detection: every operating-system default route of the router carries realm 99, and the harness table `ip tb_observe` counts IPv4 packets routed by such a route (`ipv4_leaks`); any non-zero count while PolyWAN is installed violates INV-3. IPv6 routes have no realm, so for IPv6 the harness offers per-uplink egress counters (`egress_packets`, table `inet tb_egress`) for scenarios where no packet may leave, plus route lookups with `ip -6 route get`.
 - The daemon under test runs in the router namespace with `start_daemon(binary, args, env)`; the binary path is a parameter.
-- `testbed::ftr` runs the daemon under test (`FTR_DAEMON_BIN`) for the acceptance scenarios (`tests/m1.rs`): configuration and state under `/run/ftr-tests/<run>`, start, reload, stop, kill, CLI commands, its log. `Ftr::set_env` passes environment variables to the daemon's test hooks, compiled with the `test-hooks` feature that `run-suite.sh` enables: `FTR_TEST_BOOTTIME_SHIFT_MS` (boot-time clock moved forward), `FTR_TEST_GATEWAY_WARNING_MS` (delay of the FR-SYS-3 warning about an IPv6 path without a discovered gateway, 30 s otherwise) and `FTR_TEST_FAULTS` (a control file holding n lets the next n reconciler or cleanup steps succeed and fails the following ones until it is removed).
-- `Topology::start_dhcpv6_client` runs the router's DHCPv6 client on B (dhcpcd in manager mode, which alone honours the server-unicast option, or ISC dhclient where dhcpcd is not installed; `FTR_TEST_DHCPV6_CLIENT` chooses), asking for an address and a prefix whose first /64 goes to the LAN. dhcpcd gets private `/run/dhcpcd` and `/var/lib/dhcpcd` in the mount namespace of `ip netns exec`; kea-dhcp6 and dhclient run as copies outside their AppArmor profiles.
+- `testbed::polywan` runs the daemon under test (`POLYWAN_DAEMON_BIN`) for the acceptance scenarios (`tests/m1.rs`): configuration and state under `/run/polywan-tests/<run>`, start, reload, stop, kill, CLI commands, its log. `Polywan::set_env` passes environment variables to the daemon's test hooks, compiled with the `test-hooks` feature that `run-suite.sh` enables: `POLYWAN_TEST_BOOTTIME_SHIFT_MS` (boot-time clock moved forward), `POLYWAN_TEST_GATEWAY_WARNING_MS` (delay of the FR-SYS-3 warning about an IPv6 path without a discovered gateway, 30 s otherwise) and `POLYWAN_TEST_FAULTS` (a control file holding n lets the next n reconciler or cleanup steps succeed and fails the following ones until it is removed).
+- `Topology::start_dhcpv6_client` runs the router's DHCPv6 client on B (dhcpcd in manager mode, which alone honours the server-unicast option, or ISC dhclient where dhcpcd is not installed; `POLYWAN_TEST_DHCPV6_CLIENT` chooses), asking for an address and a prefix whose first /64 goes to the LAN. dhcpcd gets private `/run/dhcpcd` and `/var/lib/dhcpcd` in the mount namespace of `ip netns exec`; kea-dhcp6 and dhclient run as copies outside their AppArmor profiles.
 - `Options::uplink_clients = false` builds the topology without starting `udhcpc` and `pppd`; `Topology::start_uplink_clients` starts them later. `Topology::netns_etc(node)` is the node's `/etc/netns/<namespace>` directory, whose entries `ip netns exec` mounts over `/etc`.
-- The harness's own checks (`tests/netns.rs`) run without the daemon: they steer LAN traffic through one uplink with a rule and a table outside FTR's default ranges (priority 90, table 90) and masquerade it.
+- The harness's own checks (`tests/netns.rs`) run without the daemon: they steer LAN traffic through one uplink with a rule and a table outside PolyWAN's default ranges (priority 90, table 90) and masquerade it.
 
 ## Running
 
@@ -56,13 +56,13 @@ Manual use:
 
 ```sh
 cargo build -p testbed
-sudo target/debug/ftr-testbed up            # prints the run identifier
-sudo target/debug/ftr-testbed exec RUN router ip route
-sudo target/debug/ftr-testbed exec RUN client ping 198.18.100.1
-sudo target/debug/ftr-testbed down RUN      # or: down --all
+sudo target/debug/polywan-testbed up            # prints the run identifier
+sudo target/debug/polywan-testbed exec RUN router ip route
+sudo target/debug/polywan-testbed exec RUN client ping 198.18.100.1
+sudo target/debug/polywan-testbed down RUN      # or: down --all
 ```
 
-Environment variables: `FTR_TESTBED_BIN` (path of `ftr-testbed`, used to run the test agents inside namespaces), `FTR_TESTBED_DIR` (root of the working directories, default `/tmp/ftr-testbed`), `FTR_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection).
+Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to run the test agents inside namespaces), `POLYWAN_TESTBED_DIR` (root of the working directories, default `/tmp/polywan-testbed`), `POLYWAN_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection).
 
 ## Environment notes
 

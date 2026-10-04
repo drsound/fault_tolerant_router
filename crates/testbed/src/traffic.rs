@@ -278,14 +278,14 @@ impl Topology {
 
     /// IPv4 packets routed by an operating-system default route of the router
     /// (realm match) since the last [`Topology::reset_counters`]. Any non-zero
-    /// value while FTR is installed is a leak (INV-3).
+    /// value while PolyWAN is installed is a leak (INV-3).
     pub fn ipv4_leaks(&self) -> Result<u64> {
         self.router().counter("ip", "tb_observe", "leak4")
     }
 
     /// IPv6 packets routed by the main table's default route (through the
     /// harness's `leak6` device) since the last [`Topology::reset_counters`].
-    /// Any non-zero value while FTR manages IPv6 is a leak (INV-3).
+    /// Any non-zero value while PolyWAN manages IPv6 is a leak (INV-3).
     pub fn ipv6_leaks(&self) -> Result<u64> {
         self.router().counter("inet", "tb_egress", "leak6")
     }

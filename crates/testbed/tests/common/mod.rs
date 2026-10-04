@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use testbed::ftr::{self, HealthSpec, UplinkSpec};
 use testbed::plan::{Family, Node, Uplink};
+use testbed::polywan::{self, HealthSpec, UplinkSpec};
 use testbed::traffic::tally;
 use testbed::{Options, Outcome, Topology};
 
@@ -17,12 +17,12 @@ pub fn build() -> Topology {
     build_with(Options::default())
 }
 
-/// `opts` with the agent of this build unless `FTR_TESTBED_BIN` names one.
+/// `opts` with the agent of this build unless `POLYWAN_TESTBED_BIN` names one.
 pub fn build_with(opts: Options) -> Topology {
     assert!(testbed::is_root(), "these tests need root: tests/vm/run-suite.sh");
-    let agent_bin = std::env::var_os("FTR_TESTBED_BIN")
+    let agent_bin = std::env::var_os("POLYWAN_TESTBED_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ftr-testbed")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_polywan-testbed")));
     Topology::build(Options { agent_bin, ..opts }).unwrap_or_else(|e| panic!("{e:#}"))
 }
 
@@ -30,7 +30,7 @@ pub fn build_with(opts: Options) -> Topology {
 /// the IPv4 variant; both families for the IPv6 variant, so that IPv6's
 /// artifacts coexist with IPv4's (the dual-stack variants of M2).
 pub fn stack(fam: Family, uplinks: &[UplinkSpec]) -> String {
-    ftr::config(uplinks, stack_families(fam), &HealthSpec::fast(), "", "")
+    polywan::config(uplinks, stack_families(fam), &HealthSpec::fast(), "", "")
 }
 
 /// The families a [`stack`] configuration manages.
@@ -89,9 +89,9 @@ pub fn endpoint(address: &str, port: u16) -> String {
     }
 }
 
-/// Rules of FTR (protocol 249) of a family in the router, as `ip rule`
+/// Rules of PolyWAN (protocol 249) of a family in the router, as `ip rule`
 /// lines.
-pub fn ftr_rules(t: &Topology, fam: Family) -> Result<Vec<String>> {
+pub fn polywan_rules(t: &Topology, fam: Family) -> Result<Vec<String>> {
     Ok(t.router()
         .run("ip", [fam.flag(), "rule", "show"])?
         .lines()
@@ -233,7 +233,7 @@ pub fn provider_counter(t: &Topology, node: Node, family: &str, table: &str, nam
     t.ns(node).counter(family, table, name)
 }
 
-/// The IPv6 settings that FTR changes on uplinks A and B and gives back when
+/// The IPv6 settings that PolyWAN changes on uplinks A and B and gives back when
 /// it no longer manages IPv6 (AS-45, FR-REC-9), as paths under
 /// `/proc/sys`.
 pub const IPV6_SETTINGS: [&str; 4] = [
@@ -248,17 +248,15 @@ pub fn sysctl_values(t: &Topology, keys: &[&str]) -> Result<Vec<String>> {
     keys.iter().map(|k| t.router().sysctl_get(k)).collect()
 }
 
-/// FTR's IPv6 artifacts in the router, one line each: its IPv6 rules and
+/// PolyWAN's IPv6 artifacts in the router, one line each: its IPv6 rules and
 /// routes (protocol 249, in any table) and the IPv6 rules of its nftables
-/// table. Empty when FTR manages no IPv6 (AS-45).
+/// table. Empty when PolyWAN manages no IPv6 (AS-45).
 pub fn ipv6_artifacts(t: &Topology) -> Result<Vec<String>> {
-    let mut left = ftr_rules(t, Family::V6)?;
+    let mut left = polywan_rules(t, Family::V6)?;
     let routes = t
         .router()
         .run("ip", ["-6", "route", "show", "table", "all", "proto", "249"])?;
-    let table = t
-        .router()
-        .run("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
+    let table = t.router().run("nft", ["list", "table", "inet", "polywan"])?;
     left.extend(
         routes
             .lines()
@@ -269,13 +267,13 @@ pub fn ipv6_artifacts(t: &Topology) -> Result<Vec<String>> {
     Ok(left)
 }
 
-/// Starts FTR with `config` while the router holds a foreign object that
+/// Starts PolyWAN with `config` while the router holds a foreign object that
 /// collides with it: online `check-config` fails and startup is refused,
 /// both naming `needle` (AS-33).
 pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
-    let mut f = t.prepare_ftr(config)?;
+    let mut f = t.prepare_polywan(config)?;
     let check = f.cli_config(&["check-config"])?;
-    let text = ftr::output_text(&check);
+    let text = polywan::output_text(&check);
     assert!(!check.status.success() && text.contains(needle), "check-config: {text}");
     f.start(t)?;
     f.wait_exit(t, Duration::from_secs(10))?;
@@ -286,7 +284,7 @@ pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
 /// An `nft` wrapper for `firewall.nft_path` whose invocations containing one
 /// of `failing` (for example `list flowtables`) fail while the returned flag
 /// file exists.
-pub fn nft_wrapper(t: &Topology, f: &ftr::Ftr, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
+pub fn nft_wrapper(t: &Topology, f: &polywan::Polywan, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
     let nft = t.router().sh("command -v nft")?.trim().to_owned();
     let flag = f.dir.join("nft-fails");
     let wrapper = t.exec_dir()?.join("nft");

@@ -1,4 +1,4 @@
-//! `ftr-testbed`: manual control of the namespace test topology, and the
+//! `polywan-testbed`: manual control of the namespace test topology, and the
 //! agents that the harness runs inside namespaces.
 
 #![forbid(unsafe_code)]
@@ -14,9 +14,9 @@ use testbed::{Node, Options, Topology, agent, topology};
 
 #[derive(Parser)]
 #[command(
-    name = "ftr-testbed",
+    name = "polywan-testbed",
     version,
-    about = "Network namespace test topology for Fault Tolerant Router 2.0"
+    about = "Network namespace test topology for PolyWAN 2.0"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,7 +36,7 @@ enum Command {
         /// Skip provider C (PPPoE).
         #[arg(long)]
         no_pppoe: bool,
-        /// Working directory root (default /tmp/ftr-testbed or FTR_TESTBED_DIR).
+        /// Working directory root (default /tmp/polywan-testbed or POLYWAN_TESTBED_DIR).
         #[arg(long)]
         work_root: Option<PathBuf>,
     },
@@ -139,7 +139,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("ftr-testbed: {e:#}");
+            eprintln!("polywan-testbed: {e:#}");
             ExitCode::FAILURE
         }
     }

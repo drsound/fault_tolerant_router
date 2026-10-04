@@ -42,7 +42,7 @@ pub struct Options {
     pub run_id: Option<String>,
     /// Parent of the run's working directory (configuration files, logs, leases).
     pub work_root: PathBuf,
-    /// The `ftr-testbed` executable, used to run test agents inside namespaces.
+    /// The `polywan-testbed` executable, used to run test agents inside namespaces.
     pub agent_bin: PathBuf,
     /// Configure IPv6 (RA, SLAAC, DHCPv6) on the providers.
     pub ipv6: bool,
@@ -75,9 +75,9 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             run_id: None,
-            work_root: std::env::var_os("FTR_TESTBED_DIR")
+            work_root: std::env::var_os("POLYWAN_TESTBED_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp/ftr-testbed")),
+                .unwrap_or_else(|| PathBuf::from("/tmp/polywan-testbed")),
             agent_bin: default_agent_bin(),
             ipv6: true,
             pppoe: true,
@@ -86,17 +86,17 @@ impl Default for Options {
             router_default_rp_filter: 2,
             icmp_ratelimit: false,
             lan_delay: Some(Duration::from_millis(1)),
-            keep: std::env::var_os("FTR_TESTBED_KEEP").is_some_and(|v| v == "1"),
+            keep: std::env::var_os("POLYWAN_TESTBED_KEEP").is_some_and(|v| v == "1"),
         }
     }
 }
 
-/// `FTR_TESTBED_BIN`, or the current executable when it is `ftr-testbed`.
+/// `POLYWAN_TESTBED_BIN`, or the current executable when it is `polywan-testbed`.
 fn default_agent_bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("FTR_TESTBED_BIN") {
+    if let Some(p) = std::env::var_os("POLYWAN_TESTBED_BIN") {
         return PathBuf::from(p);
     }
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ftr-testbed"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("polywan-testbed"))
 }
 
 /// A running topology. Dropping it tears everything down unless `keep` is set.
@@ -111,12 +111,12 @@ pub struct Topology {
 /// Where scenarios keep the daemon's configuration and state: the daemon
 /// refuses configuration files whose parent directories are writable by
 /// group or others (FR-CFG-5), which excludes `/tmp`.
-pub const FTR_ROOT: &str = "/run/ftr-tests";
+pub const POLYWAN_ROOT: &str = "/run/polywan-tests";
 
 /// Where scenarios keep executables that the daemon runs (an `nft_path`
-/// wrapper): owned by root up to `/` like [`FTR_ROOT`], but not under `/run`,
+/// wrapper): owned by root up to `/` like [`POLYWAN_ROOT`], but not under `/run`,
 /// which may be mounted `noexec`.
-pub const EXEC_ROOT: &str = "/var/lib/ftr-tests";
+pub const EXEC_ROOT: &str = "/var/lib/polywan-tests";
 
 /// Reserves a run identifier: its working directory, created exclusively,
 /// and no namespace of that run. `None` when the identifier is taken.
@@ -551,7 +551,7 @@ impl Topology {
         let common = DNSMASQ_ARGS.join(" ");
         let up = format!(
             r#"#!/bin/sh
-# ftr-testbed provider C, pppd ipv6-up: $1 is the interface.
+# polywan-testbed provider C, pppd ipv6-up: $1 is the interface.
 ip -6 addr add 2001:db8:c:ffff::1/64 dev "$1" nodad
 exec dnsmasq {common} \
   --interface="$1" --enable-ra --dhcp-range=::,constructor:"$1",ra-only,64 \
@@ -560,7 +560,7 @@ exec dnsmasq {common} \
 "#
         );
         let down = format!(
-            "#!/bin/sh\n# ftr-testbed provider C, pppd ipv6-down.\n[ -f {d}/dnsmasq-c-\"$1\".pid ] && kill \"$(cat {d}/dnsmasq-c-\"$1\".pid)\"\nexit 0\n"
+            "#!/bin/sh\n# polywan-testbed provider C, pppd ipv6-down.\n[ -f {d}/dnsmasq-c-\"$1\".pid ] && kill \"$(cat {d}/dnsmasq-c-\"$1\".pid)\"\nexit 0\n"
         );
         for (name, text) in [("ipv6-up", up), ("ipv6-down", down)] {
             let p = dir.join(name);
@@ -922,13 +922,13 @@ impl Drop for Topology {
     fn drop(&mut self) {
         if self.opts.keep && !self.torn_down {
             eprintln!(
-                "ftr-testbed: keeping run {} (FTR_TESTBED_KEEP=1); remove it with `ftr-testbed down {}`",
+                "polywan-testbed: keeping run {} (POLYWAN_TESTBED_KEEP=1); remove it with `polywan-testbed down {}`",
                 self.run_id, self.run_id
             );
             return;
         }
         if let Err(e) = self.teardown() {
-            eprintln!("ftr-testbed: teardown of run {} failed: {e:#}", self.run_id);
+            eprintln!("polywan-testbed: teardown of run {} failed: {e:#}", self.run_id);
         }
     }
 }
@@ -1057,7 +1057,7 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
             let _ = fs::remove_dir_all(etc);
         }
     }
-    for root in [FTR_ROOT, EXEC_ROOT] {
+    for root in [POLYWAN_ROOT, EXEC_ROOT] {
         let _ = fs::remove_dir_all(Path::new(root).join(run_id));
     }
     let _ = fs::remove_file(format!("/run/ppp-tb-{run_id}-c.pid"));
@@ -1083,7 +1083,7 @@ pub(crate) fn chmod_x(p: &Path) -> Result<()> {
 /// harness realm on the route.
 fn udhcpc_script() -> &'static str {
     r#"#!/bin/sh
-# ftr-testbed udhcpc script: address and default route with a per-interface
+# polywan-testbed udhcpc script: address and default route with a per-interface
 # metric (TB_METRIC) and realm (TB_REALM).
 metric=${TB_METRIC:-100}
 realm=${TB_REALM:-99}
@@ -1108,6 +1108,6 @@ exit 0
 
 fn ppp_ip_up_script(metric: u32) -> String {
     format!(
-        "#!/bin/sh\n# ftr-testbed pppd ip-up: $1 is the interface.\nip -4 route replace default dev \"$1\" metric {metric} realm {OS_ROUTE_REALM} proto static\n"
+        "#!/bin/sh\n# polywan-testbed pppd ip-up: $1 is the interface.\nip -4 route replace default dev \"$1\" metric {metric} realm {OS_ROUTE_REALM} proto static\n"
     )
 }

@@ -1,4 +1,4 @@
-//! Test agents, run inside namespaces as `ftr-testbed agent ...`.
+//! Test agents, run inside namespaces as `polywan-testbed agent ...`.
 //!
 //! - `serve` (internet node): TCP on [`TCP_PORT`] and [`TCP_PORT_HTTPS`]
 //!   writes the peer address as the first line, then echoes; UDP on
@@ -78,7 +78,7 @@ pub fn serve(log_path: Option<&str>) -> Result<()> {
             handles.push(thread::spawn(move || udp_loop(&s, port, reply, &log)));
         }
     }
-    eprintln!("ftr-testbed agent: serving");
+    eprintln!("polywan-testbed agent: serving");
     for h in handles {
         let _ = h.join();
     }
@@ -279,7 +279,7 @@ fn one(dst: SocketAddr, udp: bool, timeout: Duration, binding: &Binding) -> Conn
             s.connect(dst)?;
             r.local = s.local_addr().ok();
             s.set_read_timeout(Some(timeout))?;
-            s.send(b"ftr-testbed")?;
+            s.send(b"polywan-testbed")?;
             let mut buf = [0u8; 256];
             let n = s.recv(&mut buf)?;
             Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
@@ -459,7 +459,7 @@ pub fn udp_send(dst: SocketAddr, src_port: u16, count: u32, interval: Duration) 
     let s = UdpSocket::bind(&bind).with_context(|| format!("binding {bind}"))?;
     let mut sent = 0;
     for i in 0..count {
-        if s.send_to(format!("ftr-testbed {i}").as_bytes(), dst).is_ok() {
+        if s.send_to(format!("polywan-testbed {i}").as_bytes(), dst).is_ok() {
             sent += 1;
         }
         thread::sleep(interval);

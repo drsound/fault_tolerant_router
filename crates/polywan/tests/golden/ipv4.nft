@@ -1,0 +1,186 @@
+table inet polywan {
+  # §4.7 step 1: restore the path of known connections, assign new inbound ones.
+  chain prerouting {
+    type filter hook prerouting priority -150; policy accept;
+    meta nfproto != ipv4 return
+    # Only tracked unicast traffic is marked (§4.8).
+    ct state untracked return
+    meta pkttype != host return
+    # Restore the path value of the connection, for every path id (FR-MARK-3).
+    ct mark & 0x00ff0000 == 0x00010000 meta mark set meta mark & 0xff00ffff | 0x00010000 return
+    ct mark & 0x00ff0000 == 0x00020000 meta mark set meta mark & 0xff00ffff | 0x00020000 return
+    ct mark & 0x00ff0000 == 0x00030000 meta mark set meta mark & 0xff00ffff | 0x00030000 return
+    ct mark & 0x00ff0000 == 0x00040000 meta mark set meta mark & 0xff00ffff | 0x00040000 return
+    ct mark & 0x00ff0000 == 0x00050000 meta mark set meta mark & 0xff00ffff | 0x00050000 return
+    ct mark & 0x00ff0000 == 0x00060000 meta mark set meta mark & 0xff00ffff | 0x00060000 return
+    ct mark & 0x00ff0000 == 0x00070000 meta mark set meta mark & 0xff00ffff | 0x00070000 return
+    ct mark & 0x00ff0000 == 0x00080000 meta mark set meta mark & 0xff00ffff | 0x00080000 return
+    ct mark & 0x00ff0000 == 0x00090000 meta mark set meta mark & 0xff00ffff | 0x00090000 return
+    ct mark & 0x00ff0000 == 0x000a0000 meta mark set meta mark & 0xff00ffff | 0x000a0000 return
+    ct mark & 0x00ff0000 == 0x000b0000 meta mark set meta mark & 0xff00ffff | 0x000b0000 return
+    ct mark & 0x00ff0000 == 0x000c0000 meta mark set meta mark & 0xff00ffff | 0x000c0000 return
+    ct mark & 0x00ff0000 == 0x000d0000 meta mark set meta mark & 0xff00ffff | 0x000d0000 return
+    ct mark & 0x00ff0000 == 0x000e0000 meta mark set meta mark & 0xff00ffff | 0x000e0000 return
+    ct mark & 0x00ff0000 == 0x000f0000 meta mark set meta mark & 0xff00ffff | 0x000f0000 return
+    ct mark & 0x00ff0000 == 0x00100000 meta mark set meta mark & 0xff00ffff | 0x00100000 return
+    ct mark & 0x00ff0000 == 0x00110000 meta mark set meta mark & 0xff00ffff | 0x00110000 return
+    ct mark & 0x00ff0000 == 0x00120000 meta mark set meta mark & 0xff00ffff | 0x00120000 return
+    ct mark & 0x00ff0000 == 0x00130000 meta mark set meta mark & 0xff00ffff | 0x00130000 return
+    ct mark & 0x00ff0000 == 0x00140000 meta mark set meta mark & 0xff00ffff | 0x00140000 return
+    ct mark & 0x00ff0000 == 0x00150000 meta mark set meta mark & 0xff00ffff | 0x00150000 return
+    ct mark & 0x00ff0000 == 0x00160000 meta mark set meta mark & 0xff00ffff | 0x00160000 return
+    ct mark & 0x00ff0000 == 0x00170000 meta mark set meta mark & 0xff00ffff | 0x00170000 return
+    ct mark & 0x00ff0000 == 0x00180000 meta mark set meta mark & 0xff00ffff | 0x00180000 return
+    ct mark & 0x00ff0000 == 0x00190000 meta mark set meta mark & 0xff00ffff | 0x00190000 return
+    ct mark & 0x00ff0000 == 0x001a0000 meta mark set meta mark & 0xff00ffff | 0x001a0000 return
+    ct mark & 0x00ff0000 == 0x001b0000 meta mark set meta mark & 0xff00ffff | 0x001b0000 return
+    ct mark & 0x00ff0000 == 0x001c0000 meta mark set meta mark & 0xff00ffff | 0x001c0000 return
+    ct mark & 0x00ff0000 == 0x001d0000 meta mark set meta mark & 0xff00ffff | 0x001d0000 return
+    ct mark & 0x00ff0000 == 0x001e0000 meta mark set meta mark & 0xff00ffff | 0x001e0000 return
+    ct mark & 0x00ff0000 == 0x001f0000 meta mark set meta mark & 0xff00ffff | 0x001f0000 return
+    ct mark & 0x00ff0000 == 0x00200000 meta mark set meta mark & 0xff00ffff | 0x00200000 return
+    ct mark & 0x00ff0000 == 0x00210000 meta mark set meta mark & 0xff00ffff | 0x00210000 return
+    ct mark & 0x00ff0000 == 0x00220000 meta mark set meta mark & 0xff00ffff | 0x00220000 return
+    ct mark & 0x00ff0000 == 0x00230000 meta mark set meta mark & 0xff00ffff | 0x00230000 return
+    ct mark & 0x00ff0000 == 0x00240000 meta mark set meta mark & 0xff00ffff | 0x00240000 return
+    ct mark & 0x00ff0000 == 0x00250000 meta mark set meta mark & 0xff00ffff | 0x00250000 return
+    ct mark & 0x00ff0000 == 0x00260000 meta mark set meta mark & 0xff00ffff | 0x00260000 return
+    ct mark & 0x00ff0000 == 0x00270000 meta mark set meta mark & 0xff00ffff | 0x00270000 return
+    ct mark & 0x00ff0000 == 0x00280000 meta mark set meta mark & 0xff00ffff | 0x00280000 return
+    ct mark & 0x00ff0000 == 0x00290000 meta mark set meta mark & 0xff00ffff | 0x00290000 return
+    ct mark & 0x00ff0000 == 0x002a0000 meta mark set meta mark & 0xff00ffff | 0x002a0000 return
+    ct mark & 0x00ff0000 == 0x002b0000 meta mark set meta mark & 0xff00ffff | 0x002b0000 return
+    ct mark & 0x00ff0000 == 0x002c0000 meta mark set meta mark & 0xff00ffff | 0x002c0000 return
+    ct mark & 0x00ff0000 == 0x002d0000 meta mark set meta mark & 0xff00ffff | 0x002d0000 return
+    ct mark & 0x00ff0000 == 0x002e0000 meta mark set meta mark & 0xff00ffff | 0x002e0000 return
+    ct mark & 0x00ff0000 == 0x002f0000 meta mark set meta mark & 0xff00ffff | 0x002f0000 return
+    ct mark & 0x00ff0000 == 0x00300000 meta mark set meta mark & 0xff00ffff | 0x00300000 return
+    ct mark & 0x00ff0000 == 0x00310000 meta mark set meta mark & 0xff00ffff | 0x00310000 return
+    ct mark & 0x00ff0000 == 0x00320000 meta mark set meta mark & 0xff00ffff | 0x00320000 return
+    ct mark & 0x00ff0000 == 0x00330000 meta mark set meta mark & 0xff00ffff | 0x00330000 return
+    ct mark & 0x00ff0000 == 0x00340000 meta mark set meta mark & 0xff00ffff | 0x00340000 return
+    ct mark & 0x00ff0000 == 0x00350000 meta mark set meta mark & 0xff00ffff | 0x00350000 return
+    ct mark & 0x00ff0000 == 0x00360000 meta mark set meta mark & 0xff00ffff | 0x00360000 return
+    ct mark & 0x00ff0000 == 0x00370000 meta mark set meta mark & 0xff00ffff | 0x00370000 return
+    ct mark & 0x00ff0000 == 0x00380000 meta mark set meta mark & 0xff00ffff | 0x00380000 return
+    ct mark & 0x00ff0000 == 0x00390000 meta mark set meta mark & 0xff00ffff | 0x00390000 return
+    ct mark & 0x00ff0000 == 0x003a0000 meta mark set meta mark & 0xff00ffff | 0x003a0000 return
+    ct mark & 0x00ff0000 == 0x003b0000 meta mark set meta mark & 0xff00ffff | 0x003b0000 return
+    ct mark & 0x00ff0000 == 0x003c0000 meta mark set meta mark & 0xff00ffff | 0x003c0000 return
+    ct mark & 0x00ff0000 == 0x003d0000 meta mark set meta mark & 0xff00ffff | 0x003d0000 return
+    ct mark & 0x00ff0000 == 0x003e0000 meta mark set meta mark & 0xff00ffff | 0x003e0000 return
+    ct mark & 0x00ff0000 == 0x003f0000 meta mark set meta mark & 0xff00ffff | 0x003f0000 return
+    # Multicast and broadcast that the packet type misses (tunnels deliver
+    # them as host packets) are not assigned either (S2).
+    ip daddr { 224.0.0.0/4, 255.255.255.255 } return
+    ip6 daddr ff00::/8 return
+    meta nfproto ipv4 fib daddr type broadcast return
+    # New inbound connection on an uplink: assign that uplink's path (INV-5).
+    # uplink "a", ipv4
+    meta nfproto ipv4 iifname "wana" ct direction original ct mark set ct mark & 0xff00ffff | 0x00010000 meta mark set meta mark & 0xff00ffff | 0x00010000 return
+    # uplink "c", ipv4
+    meta nfproto ipv4 iifname "ppp0" ct direction original ct mark set ct mark & 0xff00ffff | 0x00030000 meta mark set meta mark & 0xff00ffff | 0x00030000 return
+    # uplink "b", ipv4
+    meta nfproto ipv4 iifname "wanb" ct direction original ct mark set ct mark & 0xff00ffff | 0x00020000 meta mark set meta mark & 0xff00ffff | 0x00020000 return
+  }
+  # §4.7 step 2: route chain, so that a restored mark triggers a new routing decision.
+  chain output {
+    type route hook output priority -150; policy accept;
+    meta nfproto != ipv4 return
+    # Probe traffic keeps its probe value (INV-6).
+    meta mark & 0x00c00000 == 0x00400000 return
+    ct state untracked return
+    # Restore the path value of the connection, for every path id (FR-MARK-3).
+    ct mark & 0x00ff0000 == 0x00010000 meta mark set meta mark & 0xff00ffff | 0x00010000 return
+    ct mark & 0x00ff0000 == 0x00020000 meta mark set meta mark & 0xff00ffff | 0x00020000 return
+    ct mark & 0x00ff0000 == 0x00030000 meta mark set meta mark & 0xff00ffff | 0x00030000 return
+    ct mark & 0x00ff0000 == 0x00040000 meta mark set meta mark & 0xff00ffff | 0x00040000 return
+    ct mark & 0x00ff0000 == 0x00050000 meta mark set meta mark & 0xff00ffff | 0x00050000 return
+    ct mark & 0x00ff0000 == 0x00060000 meta mark set meta mark & 0xff00ffff | 0x00060000 return
+    ct mark & 0x00ff0000 == 0x00070000 meta mark set meta mark & 0xff00ffff | 0x00070000 return
+    ct mark & 0x00ff0000 == 0x00080000 meta mark set meta mark & 0xff00ffff | 0x00080000 return
+    ct mark & 0x00ff0000 == 0x00090000 meta mark set meta mark & 0xff00ffff | 0x00090000 return
+    ct mark & 0x00ff0000 == 0x000a0000 meta mark set meta mark & 0xff00ffff | 0x000a0000 return
+    ct mark & 0x00ff0000 == 0x000b0000 meta mark set meta mark & 0xff00ffff | 0x000b0000 return
+    ct mark & 0x00ff0000 == 0x000c0000 meta mark set meta mark & 0xff00ffff | 0x000c0000 return
+    ct mark & 0x00ff0000 == 0x000d0000 meta mark set meta mark & 0xff00ffff | 0x000d0000 return
+    ct mark & 0x00ff0000 == 0x000e0000 meta mark set meta mark & 0xff00ffff | 0x000e0000 return
+    ct mark & 0x00ff0000 == 0x000f0000 meta mark set meta mark & 0xff00ffff | 0x000f0000 return
+    ct mark & 0x00ff0000 == 0x00100000 meta mark set meta mark & 0xff00ffff | 0x00100000 return
+    ct mark & 0x00ff0000 == 0x00110000 meta mark set meta mark & 0xff00ffff | 0x00110000 return
+    ct mark & 0x00ff0000 == 0x00120000 meta mark set meta mark & 0xff00ffff | 0x00120000 return
+    ct mark & 0x00ff0000 == 0x00130000 meta mark set meta mark & 0xff00ffff | 0x00130000 return
+    ct mark & 0x00ff0000 == 0x00140000 meta mark set meta mark & 0xff00ffff | 0x00140000 return
+    ct mark & 0x00ff0000 == 0x00150000 meta mark set meta mark & 0xff00ffff | 0x00150000 return
+    ct mark & 0x00ff0000 == 0x00160000 meta mark set meta mark & 0xff00ffff | 0x00160000 return
+    ct mark & 0x00ff0000 == 0x00170000 meta mark set meta mark & 0xff00ffff | 0x00170000 return
+    ct mark & 0x00ff0000 == 0x00180000 meta mark set meta mark & 0xff00ffff | 0x00180000 return
+    ct mark & 0x00ff0000 == 0x00190000 meta mark set meta mark & 0xff00ffff | 0x00190000 return
+    ct mark & 0x00ff0000 == 0x001a0000 meta mark set meta mark & 0xff00ffff | 0x001a0000 return
+    ct mark & 0x00ff0000 == 0x001b0000 meta mark set meta mark & 0xff00ffff | 0x001b0000 return
+    ct mark & 0x00ff0000 == 0x001c0000 meta mark set meta mark & 0xff00ffff | 0x001c0000 return
+    ct mark & 0x00ff0000 == 0x001d0000 meta mark set meta mark & 0xff00ffff | 0x001d0000 return
+    ct mark & 0x00ff0000 == 0x001e0000 meta mark set meta mark & 0xff00ffff | 0x001e0000 return
+    ct mark & 0x00ff0000 == 0x001f0000 meta mark set meta mark & 0xff00ffff | 0x001f0000 return
+    ct mark & 0x00ff0000 == 0x00200000 meta mark set meta mark & 0xff00ffff | 0x00200000 return
+    ct mark & 0x00ff0000 == 0x00210000 meta mark set meta mark & 0xff00ffff | 0x00210000 return
+    ct mark & 0x00ff0000 == 0x00220000 meta mark set meta mark & 0xff00ffff | 0x00220000 return
+    ct mark & 0x00ff0000 == 0x00230000 meta mark set meta mark & 0xff00ffff | 0x00230000 return
+    ct mark & 0x00ff0000 == 0x00240000 meta mark set meta mark & 0xff00ffff | 0x00240000 return
+    ct mark & 0x00ff0000 == 0x00250000 meta mark set meta mark & 0xff00ffff | 0x00250000 return
+    ct mark & 0x00ff0000 == 0x00260000 meta mark set meta mark & 0xff00ffff | 0x00260000 return
+    ct mark & 0x00ff0000 == 0x00270000 meta mark set meta mark & 0xff00ffff | 0x00270000 return
+    ct mark & 0x00ff0000 == 0x00280000 meta mark set meta mark & 0xff00ffff | 0x00280000 return
+    ct mark & 0x00ff0000 == 0x00290000 meta mark set meta mark & 0xff00ffff | 0x00290000 return
+    ct mark & 0x00ff0000 == 0x002a0000 meta mark set meta mark & 0xff00ffff | 0x002a0000 return
+    ct mark & 0x00ff0000 == 0x002b0000 meta mark set meta mark & 0xff00ffff | 0x002b0000 return
+    ct mark & 0x00ff0000 == 0x002c0000 meta mark set meta mark & 0xff00ffff | 0x002c0000 return
+    ct mark & 0x00ff0000 == 0x002d0000 meta mark set meta mark & 0xff00ffff | 0x002d0000 return
+    ct mark & 0x00ff0000 == 0x002e0000 meta mark set meta mark & 0xff00ffff | 0x002e0000 return
+    ct mark & 0x00ff0000 == 0x002f0000 meta mark set meta mark & 0xff00ffff | 0x002f0000 return
+    ct mark & 0x00ff0000 == 0x00300000 meta mark set meta mark & 0xff00ffff | 0x00300000 return
+    ct mark & 0x00ff0000 == 0x00310000 meta mark set meta mark & 0xff00ffff | 0x00310000 return
+    ct mark & 0x00ff0000 == 0x00320000 meta mark set meta mark & 0xff00ffff | 0x00320000 return
+    ct mark & 0x00ff0000 == 0x00330000 meta mark set meta mark & 0xff00ffff | 0x00330000 return
+    ct mark & 0x00ff0000 == 0x00340000 meta mark set meta mark & 0xff00ffff | 0x00340000 return
+    ct mark & 0x00ff0000 == 0x00350000 meta mark set meta mark & 0xff00ffff | 0x00350000 return
+    ct mark & 0x00ff0000 == 0x00360000 meta mark set meta mark & 0xff00ffff | 0x00360000 return
+    ct mark & 0x00ff0000 == 0x00370000 meta mark set meta mark & 0xff00ffff | 0x00370000 return
+    ct mark & 0x00ff0000 == 0x00380000 meta mark set meta mark & 0xff00ffff | 0x00380000 return
+    ct mark & 0x00ff0000 == 0x00390000 meta mark set meta mark & 0xff00ffff | 0x00390000 return
+    ct mark & 0x00ff0000 == 0x003a0000 meta mark set meta mark & 0xff00ffff | 0x003a0000 return
+    ct mark & 0x00ff0000 == 0x003b0000 meta mark set meta mark & 0xff00ffff | 0x003b0000 return
+    ct mark & 0x00ff0000 == 0x003c0000 meta mark set meta mark & 0xff00ffff | 0x003c0000 return
+    ct mark & 0x00ff0000 == 0x003d0000 meta mark set meta mark & 0xff00ffff | 0x003d0000 return
+    ct mark & 0x00ff0000 == 0x003e0000 meta mark set meta mark & 0xff00ffff | 0x003e0000 return
+    ct mark & 0x00ff0000 == 0x003f0000 meta mark set meta mark & 0xff00ffff | 0x003f0000 return
+  }
+  # §4.7 step 3: outgoing connections get the path they actually left through.
+  chain postrouting {
+    type filter hook postrouting priority -150; policy accept;
+    meta nfproto != ipv4 return
+    meta mark & 0x00c00000 == 0x00400000 return
+    ct state untracked return
+    # Only unicast traffic is marked (§4.8).
+    ip daddr { 224.0.0.0/4, 255.255.255.255 } return
+    ip6 daddr ff00::/8 return
+    # Subnet-directed broadcasts of the egress interface (S2).
+    meta nfproto ipv4 fib daddr . oif type broadcast return
+    # Connections that already have a path keep it (INV-2).
+    ct mark & 0x00ff0000 != 0 return
+    # uplink "a", ipv4
+    meta nfproto ipv4 oifname "wana" ct direction original ct mark set ct mark & 0xff00ffff | 0x00010000 meta mark set meta mark & 0xff00ffff | 0x00010000 return
+    # uplink "c", ipv4
+    meta nfproto ipv4 oifname "ppp0" ct direction original ct mark set ct mark & 0xff00ffff | 0x00030000 meta mark set meta mark & 0xff00ffff | 0x00030000 return
+    # uplink "b", ipv4
+    meta nfproto ipv4 oifname "wanb" ct direction original ct mark set ct mark & 0xff00ffff | 0x00020000 meta mark set meta mark & 0xff00ffff | 0x00020000 return
+  }
+  # §6: source NAT of traffic from the downlinks.
+  chain nat {
+    type nat hook postrouting priority 110; policy accept;
+    # uplink "a", ipv4: masquerade
+    meta nfproto ipv4 iifname { "lan", "dnat" } oifname "wana" masquerade
+    # uplink "c", ipv4: snat ip to 203.0.113.10
+    meta nfproto ipv4 iifname { "lan", "dnat" } oifname "ppp0" snat ip to 203.0.113.10
+  }
+}

@@ -1,275 +1,70 @@
-# Fault Tolerant Router
+# PolyWAN
 
-[![Gem Version](https://badge.fury.io/rb/fault_tolerant_router.svg)](http://badge.fury.io/rb/fault_tolerant_router)
-[![PayPayl donate button](https://img.shields.io/badge/paypal-donate-yellow.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=96LFVQRFGRPFW&lc=GB&item_name=Alessandro%20Zarrilli&item_number=fault_tolerant_router&currency_code=EUR&bn=PP%2dDonationsBF%3abtn_donate_SM%2egif%3aNonHosted "Donate once-off to this project using Paypal")
+[![PayPal donate button](https://img.shields.io/badge/paypal-donate-yellow.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=96LFVQRFGRPFW&lc=GB&item_name=Alessandro%20Zarrilli&item_number=polywan&currency_code=EUR&bn=PP%2dDonationsBF%3abtn_donate_SM%2egif%3aNonHosted "Donate once-off to this project using PayPal")
 
-## In brief
+*Formerly Fault Tolerant Router.*
 
-Do you have multiple internet connections (uplinks) with several providers? Do you want to transparently use all of the available bandwidth? Do you want to remain online even if some uplinks go down? This tool may help you!
+Do you have several internet connections, from different providers, on one Linux router? Do you want to use all of their bandwidth and stay online when some of them fail? PolyWAN is a daemon for exactly that.
 
-## A more formal description
+## Status
 
-Fault Tolerant Router is a daemon, running in background on a Linux router or firewall, monitoring the state of multiple internet uplinks and changing the routing accordingly. LAN/DMZ internet traffic (outgoing connections) is load balanced between the uplinks using Linux *multipath routing*. The daemon monitors the state of the uplinks by routinely pinging well known IP addresses (Google public DNS servers, etc.) through each outgoing interface: once an uplink goes down, it is excluded from the *multipath routing*, when it comes back up, it is included again. An uplink may be assigned to a priority group: lower priority uplinks will only be used if all higher priority ones are down. That's useful to only use pay-per-traffic uplinks if no regular uplink is working. All of the routing changes are notified to the administrator by email.
+PolyWAN 2.0 is a ground-up rewrite in Rust, under development on this branch (`v2`). It has not been released yet: there are no packages, and configuration, command line and paths may still change until 2.0.0. The contract the code is built and tested against is [SPEC.md](SPEC.md); the milestones are recorded in [milestones/](milestones/).
 
-Fault Tolerant Router is well tested and has been used in production for several years, in several sites.
+| Milestone | Scope | State |
+|---|---|---|
+| M1 | IPv4 core: configuration, discovery, probes, health, routing, nftables, `run`, `check-config`, `export-nft`, `cleanup`, `forget-uplink` | complete |
+| M2 | IPv6 | complete |
+| M3 | Operations: status API and the rest of the command line, drain, policies, events, email, hooks, Prometheus metrics, quality gates | in progress |
+| M4 | Release: packages, documentation, migration guide from 1.x | planned |
 
-## Alternatives
+Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
 
-Fault Tolerant Router has been featured on Slashdot, see [article](http://linux.slashdot.org/story/15/03/03/1910206/linux-and-multiple-internet-uplinks-a-new-tool) comments for interesting hints and alternatives.
+## What it does
 
-## Interaction between *multipath routing*, *iptables* and *ip policy routing*
+PolyWAN runs on a general-purpose Linux distribution (Debian, Ubuntu, Fedora, Arch, Raspberry Pi OS, a virtual machine, …) used as a router or firewall with two or more uplinks: fibre plus a 5G or Starlink backup, two lines in an office, a metered line kept for emergencies.
 
-The system is based on the interaction between Linux *multipath routing*, *iptables* and *ip policy routing*. Outgoing (from LAN/DMZ to WAN) and incoming (from WAN to LAN/DMZ) connections have a different behaviour:
+- New outgoing connections from the internal networks are spread over the healthy uplinks with the kernel's multipath routing, according to weights and priority groups: a lower priority group is used only when no uplink of a better one is usable.
+- Every connection keeps the uplink it started on for its whole life, and inbound connections are answered through the uplink they arrived on (connection marks plus policy routing).
+- Each uplink is probed through its own interface (ICMP echo or TCP handshakes to well-known public hosts), so that "link up but provider cut off from the internet" is detected; failed uplinks leave the multipath route and come back when they recover.
+- IPv4 and IPv6 are independent: an uplink can be healthy for one family and failed for the other.
+- Uplinks can be static, DHCP, SLAAC/Router Advertisement or PPP. PolyWAN does not configure interfaces: it observes what the operating system (systemd-networkd, NetworkManager, ifupdown, pppd, …) does, through netlink, and coexists with the operating system's own default routes.
+- Marking and optional source NAT live in an nftables table that PolyWAN owns and replaces atomically, or, in external mode, in a ruleset the administrator loads (`polywan export-nft`). PolyWAN never adds filtering verdicts and never touches objects it does not own.
+- Coming with M3: a status API on a Unix socket and the commands that use it (`status`, `events`, `drain`, `undrain`, `reload`, `notify-test`), policies that send matching traffic through a given uplink, link quality gates (loss, latency, jitter), email notifications, event hooks and Prometheus metrics.
 
-* **Outgoing connections (from LAN/DMZ to WAN)**:
-  * **New connections**:
-The outgoing interface (uplink) is decided by the Linux *multipath routing*, in a round-robin fashion. Then, just before the packet leaves the router (in the *iptables* POSTROUTING chain), *iptables* marks the connection with the outgoing interface id, so that all subsequent connection packets will be sent through the same interface.
-NB: all the packets of the same connection should be originating from the same IP address, otherwise the server you are connecting to would refuse them, unless you are using specific protocols.
-  * **Established connections**:
-Before the packet is routed (in the *iptables* PREROUTING chain), *iptables* marks it with the outgoing interface id that was previously assigned to the connection. This way, thanks to *ip policy routing*, the packet will pass through a specific routing table directing it to the connection outgoing interface.
-* **Incoming connections (from WAN to LAN/DMZ)**:
-The incoming interface is obviously decided by the connecting host, connecting to one of the IP addresses assigned to an uplink interface. Just after the packet enters the router (in the *iptables* PREROUTING chain), *iptables* marks the connection with the incoming interface id. Then, when the packet reaches the LAN or DMZ, a return packet is generated by the receiving host and sent back to the connecting host. Once this return packet hits the router, before it is actually routed (in the *iptables* PREROUTING chain), *iptables* marks it with the outgoing interface id that was previously assigned to that connection. This way, thanks to *ip policy routing*, the return packet will pass through a specific routing table directing it to the connection outgoing interface.
-
-## The uplink monitor daemon
-
-The daemon monitors the state of the uplinks by routinely pinging well known IP addresses through each uplink: if enough pings are successful the uplink is considered up, if not it's considered down. If an uplink state change is detected, the default *multipath routing* table (used for LAN/DMZ to WAN new connections) is changed accordingly and the administrator is notified by email.
-
-The IP addresses to ping and the number of required successful pings are configurable. Here are some things to consider in order not to get false positives or negatives:
-
-* Some ping packets can randomly get lost along the way: do not require 100% of the pings to be successful!
-* Some of the hosts you are pinging (see *tests/ips* configuration parameter) may be temporarily down.
-* It's better not to ping too near hosts (for example your provider routers), because your provider could be temporarily disconnected from the rest of the internet (it happened to me), so the uplink would look as up while it's actually unusable.
-* Sometimes an uplink can be not completely up or down, it can be just "disturbed", losing a high percentage of packets and being almost unusable: it's better to consider such uplink as down, so do not require too few successful pings, otherwise it may be considered up, because a few pings may pass through a "disturbed" link.
-
-The order of IP addresses listed in *tests/ips* configuration parameter is not important, because the list is shuffled before every uplink check.
+How it works, in detail, is in [SPEC.md](SPEC.md) §4 (routing model), §5 (discovery and health) and §7 (firewall integration).
 
 ## Requirements
 
-* [Ruby](https://www.ruby-lang.org)
-* A Linux kernel with the following compiled in options (they are standard in mainstream Linux distributions):
-  * CONFIG_IP_ADVANCED_ROUTER
-  * CONFIG_IP_MULTIPLE_TABLES
-  * CONFIG_IP_ROUTE_MULTIPATH
+- Linux 6.1 or later, on x86_64, aarch64 or armv7.
+- nftables 1.0.6 or later, for the managed firewall mode.
+- Root privileges. A systemd unit with sandboxing will ship with the packages; systemd is not required at runtime.
 
-## Installation
+## Building and trying it
 
-`$ gem install fault_tolerant_router`
+There are no release binaries yet. With a Rust toolchain (1.89 or later):
 
-## Usage
-
-Fault Tolerant Router should be run **as root**, or as an high privileges user, able to modify routing, etc.
-
-1. Configure your router interfaces as usual, with every uplink connected to it's own physical interface. An interface may have more than one IP address if needed (from the same uplink of course). **Don't** set any default route.
-2. Save an example configuration file in /etc/fault_tolerant_router.conf (use the `--config` option to set another location):
-`$ fault_tolerant_router generate_config`
-3. Edit /etc/fault_tolerant_router.conf
-4. _(Optional)_ Demo how Fault Tolerant Router works, to familiarize with it:
-`$ fault_tolerant_router --demo monitor`
-5. Generate *iptables* rules and integrate them with your existing ones:
-`$ fault_tolerant_router generate_iptables`
-6. _(Optional)_ Test email notification, to be sure SMTP parameters are correct and the administrator will get notifications:
-`$ fault_tolerant_router email_test`
-7. Run the daemon:
-`$ fault_tolerant_router monitor`
-Previous command will actually run Fault Tolerant Router in foreground. To run it in background you should use your Linux distribution specific method to start it as a system service. See for example [start-stop-daemon](http://manned.org/start-stop-daemon).
-If you want a quick and dirty way to run the program in background, just add an ampersand at the end of the command line:
-`$ fault_tolerant_router monitor &`
-
-## Configuration file
-
-The fault_tolerant_router.conf configuration file is in [YAML](http://en.wikipedia.org/wiki/YAML) format. Here is the explanation of the parameters:
-
-* **uplinks**: Array of uplinks. The example configuration has 3 uplinks, but you can have from 2 to as many as you wish.
-  * **interface**: The network interface where the uplink is connected. Until today Fault Tolerant Router has always been used with each uplink on it's own physical interface, never tried it with VLAN interfaces (it's in the to do list).
-  * **type**: Specify *static* for any kind of static IP interface or *ppp* for a PPP dynamic IP interface.
-  * **ip**: Primary IP address of the network interface. You can have more than one IP address assigned to the interface, just specify here the primary one that will be used as standard SNAT source. Omit this parameter in case of a PPP dynamic IP interface.
-  * **gateway**: The uplink gateway, usually the provider's router IP address. Omit this parameter in case of a PPP dynamic IP interface.
-  * **description**: Uplink name, used in notifications.
-  * **priority_group**: An integer value, representing the priority group the uplink is assigned to. Priority groups with lower values have higher priority. A priority group is considered available when at least one of its members is up. When choosing a default route, available priority groups are selected, then the highest priority of these is choosen and it's members are load balanced: lower priority group members are not used. That's useful for example to only use pay-per-traffic uplinks if no regular uplink is working: just set the pay-per-traffic uplinks to a lower priority then the regular.
-  If no value is specified, the uplink is excluded from the *multipath routing*, i.e. the uplink will never be selected when choosing one for a new outgoing connection. There's an exception to this if some kind of outgoing connection is forced to pass through this uplink, see [Iptables rules](#iptables-rules) section. Note this parameter only affects outgoing connections: even if no value is specified incoming connections are still possible. Use cases to left this parameter empty:
-    * Want to reserve an uplink for incoming connections only, excluding it from outgoing LAN internet traffic. Tipically you may want this because you have a mail server, web server, VPN server, etc. listening on an uplink.
-    * Temporarily force all of the outgoing LAN internet traffic to pass through the other uplinks, to stress test them and determine their bandwidth.
-    * Temporarily exclude an uplink to reconfigure it, for example because of and internet provider change.
-  * **weight**: Optional parameter, it's the preference to assign to this uplink when choosing one for a new outgoing connection. Use when you have uplinks with different bandwidths. See http://www.policyrouting.org/PolicyRoutingBook/ONLINE/CH05.web.html
-* **downlinks**
-  * **lan**: LAN interface
-  * **dmz**: DMZ interface, leave blank if you have no DMZ
-* **tests**
-  * **ips**: An array of IP addresses to ping to verify the uplinks state. You can add as many as you wish. Predefined ones are Google DNS, OpenDNS DNS, other public DNS. Every time an uplink is tested the IP addresses are shuffled, so listing order is not important.
-  * **required_successful**: Number of successfully pinged IP addresses to consider an uplink to be functional
-  * **ping_retries**: Number of ping retries before giving up on an IP
-  * **interval**: Seconds between a check of the uplinks and the next one
-* **log**
-  * **file**: Log file path
-  * **max_size**: Maximum log file size (in bytes). Once reached this size, the log file will be rotated.
-  * **old_files**: Number of old rotated files to keep
-* **email**
-  * **send**: Set to *true* or *false* to enable or disable email notification
-  * **sender**: Email sender
-  * **recipients**: An array of email recipients
-  * **smtp_parameters**: See http://ruby-doc.org/stdlib-2.3.1/libdoc/net/smtp/rdoc/Net/SMTP.html
-* **base_table**: Base IP route table number, just need to change if you are already using [multiple routing tables](http://lartc.org/howto/lartc.rpdb.html), to avoid overlapping.
-* **base_priority**: Just need to change if you are already using [ip policy routing](http://lartc.org/howto/lartc.rpdb.html), to avoid overlapping. Must be higher than 32767 (the default routing table priority, see `ip rule` command output).
-* **base_fwmark**: Just need to change if you are already using packet marking, to avoid overlapping.
-
-## *Iptables* rules
-
-*Iptables* rules are generated with the command:
-`$ fault_tolerant_router generate_iptables`
-Rules are in [iptables-save](http://manned.org/iptables-save.8) format, you should integrate them with your existing ones.
-Documentation is included as comments in the output, here is a dump using the standard example configuration:
-```
-#Integrate with your existing "iptables-save" configuration, or adapt to work
-#with any other iptables configuration system
-
-*mangle
-:PREROUTING ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-:INPUT ACCEPT [0:0]
-
-#New outbound connections: force a connection to use a specific uplink instead
-#of participating in the multipath routing. This can be useful if you have an
-#SMTP server that should always send emails originating from a specific IP
-#address (because of PTR DNS records), or if you have some service that you want
-#always to use a particular slow/fast uplink.
-#
-#Uncomment if needed.
-#
-#NB: these are just examples, you can add as many options as needed: -s, -d,
-#    --sport, etc.
-
-#Example Provider 1
-#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 1
-#Example Provider 2
-#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 2
-#Example Provider 3
-#[0:0] -A PREROUTING -i eth0 -m conntrack --ctstate NEW -p tcp --dport XXX -j CONNMARK --set-mark 3
-
-#Mark packets with the outgoing interface:
-#
-#- Established outbound connections: mark non-first packets (first packet will
-#  be marked as 0, as a standard unmerked packet, because the connection has not
-#  yet been marked with CONNMARK --set-mark)
-#
-#- New outbound connections: mark first packet, only effective if marking has
-#  been done in the section above
-#
-#- Inbound connections: mark returning packets (from LAN/DMZ to WAN)
-
-[0:0] -A PREROUTING -i eth0 -j CONNMARK --restore-mark
-
-#New inbound connections: mark the connection with the incoming interface.
-
-#Example Provider 1
-[0:0] -A PREROUTING -i eth1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 1
-#Example Provider 2
-[0:0] -A PREROUTING -i eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
-#Example Provider 3
-[0:0] -A PREROUTING -i ppp0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
-
-#New outbound connections: mark the connection with the outgoing interface
-#(chosen by the multipath routing).
-
-#Example Provider 1
-[0:0] -A POSTROUTING -o eth1 -m conntrack --ctstate NEW -j CONNMARK --set-mark 1
-#Example Provider 2
-[0:0] -A POSTROUTING -o eth2 -m conntrack --ctstate NEW -j CONNMARK --set-mark 2
-#Example Provider 3
-[0:0] -A POSTROUTING -o ppp0 -m conntrack --ctstate NEW -j CONNMARK --set-mark 3
-
-COMMIT
-
-
-*nat
-:PREROUTING ACCEPT [0:0]
-:POSTROUTING ACCEPT [0:0]
-:OUTPUT ACCEPT [0:0]
-
-#DNAT: WAN --> LAN/DMZ. The original destination IP (-d) can be any of the IP
-#addresses assigned to the uplink interface. XXX.XXX.XXX.XXX can be any of your
-#LAN/DMZ IPs.
-#
-#Uncomment if needed.
-#
-#NB: these are just examples, you can add as many options as you wish: -s,
-#    --sport, --dport, etc.
-
-#Example Provider 1
-#[0:0] -A PREROUTING -i eth1 -d 1.0.0.2 -j DNAT --to-destination XXX.XXX.XXX.XXX
-#Example Provider 2
-#[0:0] -A PREROUTING -i eth2 -d 2.0.0.2 -j DNAT --to-destination XXX.XXX.XXX.XXX
-#Example Provider 3
-#[0:0] -A PREROUTING -i ppp0 -j DNAT --to-destination XXX.XXX.XXX.XXX
-
-#SNAT: LAN/DMZ --> WAN. Force an outgoing connection to use a specific source
-#address instead of the default one of the outgoing interface. Of course this
-#only makes sense if more than one IP address is assigned to the uplink
-#interface.
-#
-#Uncomment if needed.
-#
-#NB: these are just examples, you can add as many options as needed: -d,
-#    --sport, --dport, etc.
-
-#Example Provider 1
-#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o eth1 -j SNAT --to-source YYY.YYY.YYY.YYY
-#Example Provider 2
-#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o eth2 -j SNAT --to-source YYY.YYY.YYY.YYY
-#Example Provider 3
-#[0:0] -A POSTROUTING -s XXX.XXX.XXX.XXX -o ppp0 -j SNAT --to-source YYY.YYY.YYY.YYY
-
-#SNAT: LAN --> WAN
-
-#Example Provider 1
-[0:0] -A POSTROUTING -o eth1 -j SNAT --to-source 1.0.0.2
-#Example Provider 2
-[0:0] -A POSTROUTING -o eth2 -j SNAT --to-source 2.0.0.2
-#Example Provider 3
-[0:0] -A POSTROUTING -o ppp0 -j MASQUERADE
-
-COMMIT
-
-
-*filter
-
-:INPUT DROP [0:0]
-:FORWARD DROP [0:0]
-:OUTPUT ACCEPT [0:0]
-:LAN_WAN - [0:0]
-:WAN_LAN - [0:0]
-
-#This is just a very basic example, add your own rules for the FORWARD chain.
-
-[0:0] -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-[0:0] -A FORWARD -i eth0 -o eth1 -j LAN_WAN
-[0:0] -A FORWARD -i eth0 -o eth2 -j LAN_WAN
-[0:0] -A FORWARD -i eth0 -o ppp0 -j LAN_WAN
-[0:0] -A FORWARD -i eth1 -o eth0 -j WAN_LAN
-[0:0] -A FORWARD -i eth2 -o eth0 -j WAN_LAN
-[0:0] -A FORWARD -i ppp0 -o eth0 -j WAN_LAN
-
-[0:0] -A LAN_WAN -j ACCEPT
-[0:0] -A WAN_LAN -j REJECT
-
-COMMIT
+```sh
+cargo build --release -p polywan
+target/release/polywan generate-config > config.toml   # a commented example
+target/release/polywan check-config --config config.toml
+target/release/polywan export-nft --config config.toml # the ruleset of the managed mode
+sudo target/release/polywan run --config config.toml --dry-run
 ```
 
-## Changelog
+`run --dry-run` computes and logs every change without applying it. The default configuration path is `/etc/polywan/config.toml`, the state directory `/var/lib/polywan`. `polywan cleanup` removes everything PolyWAN installed.
 
-* v1.0.0: First release
-* v1.1.0: Dynamic IP PPP interfaces support
-* v1.2.0: Uplink priority groups
+## Testing
 
-## To do
+Every functional requirement is verified by acceptance scenarios that move real packets through network namespaces: a router, a client, three providers (DHCP, CGNAT and PPPoE, dual-stack) and an internet with probe targets. `tests/vm/run-suite.sh --host` builds and runs the whole suite on the running kernel (as root, through sudo); `tests/vm/run-suite.sh --vm ROOTFS` runs it in a virtme-ng virtual machine booted from a root filesystem made by `tests/vm/build-rootfs.sh`, which is how CI covers Debian 12 (Linux 6.1, nftables 1.0.6). The harness is described in [crates/testbed/README.md](crates/testbed/README.md).
 
-See [issues](https://github.com/drsound/fault_tolerant_router/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) tagged as *enhancement* on GitHub.
+## Coming from Fault Tolerant Router 1.x
+
+2.0 does not read 1.x YAML configurations, and it no longer needs hand-integrated iptables rules or a main table without default routes. The release will include a migration guide with the 2.0 equivalent of every 1.x parameter. Fault Tolerant Router 1.x was featured on [Slashdot](http://linux.slashdot.org/story/15/03/03/1910206/linux-and-multiple-internet-uplinks-a-new-tool) in 2015.
 
 ## License
 
-Version 2.0, under development on the `v2` branch, is licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or the MIT license (LICENSE-MIT), at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions. Version 1.x (the Ruby code on the `master` branch) was released under the GNU General Public License v2.0.
+PolyWAN 2.0 is licensed under either of the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) or the MIT license ([LICENSE-MIT](LICENSE-MIT)), at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions. Fault Tolerant Router 1.x (the Ruby code on the `legacy/ruby` branch) was released under the GNU General Public License v2.0.
 
 ## Author
 
-Alessandro Zarrilli (Firenze - Italy)
-alessandro@zarrilli.net
+Alessandro Zarrilli (Firenze, Italy), alessandro@zarrilli.net

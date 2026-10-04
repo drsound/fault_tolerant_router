@@ -1,6 +1,6 @@
 [package]
 name = "testbed"
-description = "Network namespace test harness for Fault Tolerant Router 2.0"
+description = "Network namespace test harness for PolyWAN 2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -10,7 +10,7 @@ repository.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "ftr-testbed"
+name = "polywan-testbed"
 path = "src/main.rs"
 
 [dependencies]

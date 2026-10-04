@@ -32,7 +32,7 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 target=x86_64-unknown-linux-musl
 target_dir=${CARGO_TARGET_DIR:-$repo/target}
 bindir=$target_dir/netns-suite
-# The daemon's kernel tests (crates/fault-tolerant-router/tests/kernel_*.rs).
+# The daemon's kernel tests (crates/polywan/tests/kernel_*.rs).
 kernel_tests="kernel_netlink kernel_probe kernel_handoff"
 cd "$repo"
 
@@ -40,9 +40,9 @@ if [ -n "$prebuilt" ]; then
   bindir=$(cd "$prebuilt" && pwd)
 else
   # The daemon under test has the hooks of the acceptance scenarios
-  # (crates/fault-tolerant-router/src/test_hooks.rs).
-  cargo build --target $target -p testbed --bin ftr-testbed -p fault-tolerant-router --bin fault-tolerant-router \
-    --features fault-tolerant-router/test-hooks
+  # (crates/polywan/src/test_hooks.rs).
+  cargo build --target $target -p testbed --bin polywan-testbed -p polywan --bin polywan \
+    --features polywan/test-hooks
   # Test executables by target name, one cargo call per package.
   test_exes() { # PACKAGE TEST...
     pkg=$1
@@ -56,9 +56,9 @@ else
   mkdir -p "$bindir"
   # Copied before the test builds: the daemon's integration tests rebuild
   # its executable without the hooks.
-  cp "$target_dir/$target/debug/ftr-testbed" "$target_dir/$target/debug/fault-tolerant-router" "$bindir/"
+  cp "$target_dir/$target/debug/polywan-testbed" "$target_dir/$target/debug/polywan" "$bindir/"
   # netns: the harness's own checks; m1, m2: the acceptance scenarios.
-  { test_exes testbed netns m1 m2; test_exes fault-tolerant-router $kernel_tests; } \
+  { test_exes testbed netns m1 m2; test_exes polywan $kernel_tests; } \
     | while read -r name exe; do cp "$exe" "$bindir/$name"; done
   for t in netns m1 m2 $kernel_tests; do
     [ -x "$bindir/$t" ] || { echo "test executable $t was not built" >&2; exit 1; }
@@ -69,15 +69,15 @@ if [ "$mode" = build ]; then
   exit 0
 fi
 # The M1 and M2 scenarios run once per fwmark_mask (AS-43: offsets 16, 0
-# and 24); FTR_TEST_MASKS narrows the list; on the host,
-# FTR_PARALLEL_MASKS=1 runs them at the same time.
-masks=${FTR_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
+# and 24); POLYWAN_TEST_MASKS narrows the list; on the host,
+# POLYWAN_PARALLEL_MASKS=1 runs them at the same time.
+masks=${POLYWAN_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
 scenarios="m1 m2"
 m1_in_vm=
 for mask in $masks; do
   m1_in_vm="$m1_in_vm && echo '== M1 and M2 scenarios with fwmark_mask $mask'"
   for s in $scenarios; do
-    m1_in_vm="$m1_in_vm && FTR_TESTBED_BIN=/mnt/ftr-testbed FTR_DAEMON_BIN=/mnt/fault-tolerant-router FTR_TEST_FWMARK_MASK=$mask /mnt/$s --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
+    m1_in_vm="$m1_in_vm && POLYWAN_TESTBED_BIN=/mnt/polywan-testbed POLYWAN_DAEMON_BIN=/mnt/polywan POLYWAN_TEST_FWMARK_MASK=$mask /mnt/$s --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
   done
 done
 # They change rules and routes, so each runs in a private network namespace.
@@ -95,18 +95,18 @@ case $mode in
     for t in $kernel_tests; do
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
-    $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" "$bindir/netns" --ignored "$@"
+    $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" "$bindir/netns" --ignored "$@"
     m1() { # m1 MASK TEST-ARGS...: every scenario binary, whatever fails
       m1_mask=$1
       shift
       m1_status=0
       for s in $scenarios; do
-        $sudo env FTR_TESTBED_BIN="$bindir/ftr-testbed" FTR_DAEMON_BIN="$bindir/fault-tolerant-router" \
-          FTR_TEST_FWMARK_MASK="$m1_mask" "$bindir/$s" --ignored "$@" || m1_status=1
+        $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$bindir/polywan" \
+          POLYWAN_TEST_FWMARK_MASK="$m1_mask" "$bindir/$s" --ignored "$@" || m1_status=1
       done
       return $m1_status
     }
-    if [ "${FTR_PARALLEL_MASKS:-0}" = 1 ]; then
+    if [ "${POLYWAN_PARALLEL_MASKS:-0}" = 1 ]; then
       # The scenarios wait more than they compute: with enough cores, the
       # masks can run at the same time, each in its own process.
       out=$(mktemp -d)
@@ -143,7 +143,7 @@ case $mode in
     # virtme-ng passes the --exec command on the kernel command line
     # (base64, within its 2048 bytes): the suite's commands go to a script
     # in the shared directory.
-    printf '%s\n' "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm" \
+    printf '%s\n' "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm POLYWAN_TESTBED_BIN=/mnt/polywan-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm" \
       > "$bindir/vm-suite.sh"
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \

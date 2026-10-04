@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fault-tolerant-router", "crates/testbed"]
+members = ["crates/polywan", "crates/testbed"]
 # Spike crates are standalone throw-away experiments (spikes/README.md).
 exclude = ["spikes"]
 
@@ -9,7 +9,7 @@ version = "2.0.0-dev"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/drsound/fault_tolerant_router"
+repository = "https://github.com/drsound/polywan"
 authors = ["Alessandro Zarrilli <alessandro@zarrilli.net>"]
 
 [workspace.dependencies]

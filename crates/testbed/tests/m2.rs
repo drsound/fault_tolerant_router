@@ -1,6 +1,6 @@
 //! M2 acceptance scenarios (SPEC.md §14.3, §17) that exist only for IPv6
 //! or for both families together; the IPv6 variants of the M1 scenarios are
-//! in `m1.rs`. The daemon under test (`FTR_DAEMON_BIN`) runs in the router
+//! in `m1.rs`. The daemon under test (`POLYWAN_DAEMON_BIN`) runs in the router
 //! namespace.
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use testbed::dhcpv6::{DELEGATED_POOL, DHCPV6_T1, DHCPV6_T2, DHCPV6_UNICAST, DHCPV6_VALID, Dhcpv6Client};
-use testbed::ftr;
 use testbed::plan::{self, Family, Node, Uplink};
+use testbed::polywan;
 use testbed::traffic::tally;
 
 mod common;
@@ -23,7 +23,7 @@ use common::*;
 #[ignore = "needs root and network namespaces"]
 fn as12_ipv6_fails_on_a_while_ipv4_stays_healthy() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::dual(&ab()))?;
+    let f = t.start_polywan(&polywan::dual(&ab()))?;
     f.wait_installed(&t)?;
     for fam in Family::ALL {
         wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -60,14 +60,14 @@ fn as12_ipv6_fails_on_a_while_ipv4_stays_healthy() -> Result<()> {
 /// AS-45(b): a reload removes the last IPv6 path of a dual-stack
 /// configuration while pinned IPv4 connections run: IPv6 is handed back as
 /// FR-REC-9 describes (rules, routes and nftables rules of IPv6 gone, IPv6
-/// settings restored to what they were before FTR), and the IPv4
+/// settings restored to what they were before PolyWAN), and the IPv4
 /// connections are not interrupted.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
     let t = build();
     let before = sysctl_values(&t, &IPV6_SETTINGS)?;
-    let f = t.start_ftr(&ftr::dual(&ab()))?;
+    let f = t.start_polywan(&polywan::dual(&ab()))?;
     f.wait_installed(&t)?;
     for fam in Family::ALL {
         wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -79,15 +79,13 @@ fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
     );
     let flows = start_flows(&t, Family::V4, 1, 16)?;
     std::thread::sleep(Duration::from_secs(1));
-    f.write_config(&ftr::ipv4(&ab()))?;
+    f.write_config(&polywan::ipv4(&ab()))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     t.wait_for("IPv6 handed back", Duration::from_secs(10), || {
         Ok(ipv6_artifacts(&t)?.is_empty() && sysctl_values(&t, &IPV6_SETTINGS)? == before)
     })?;
-    let table = t
-        .router()
-        .run("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
+    let table = t.router().run("nft", ["list", "table", "inet", "polywan"])?;
     assert!(table.contains("meta nfproto != ipv4 return"), "{table}");
     std::thread::sleep(Duration::from_secs(1));
     flows_on_continuous(flows, &[Uplink::A, Uplink::B])?;
@@ -111,11 +109,11 @@ fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
     // The replacement that installs the IPv6 assignments fails at first.
     let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
     let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
-    let config = |families: &[Family]| ftr::config(&ab(), families, &ftr::HealthSpec::fast(), "", &firewall);
+    let config = |families: &[Family]| polywan::config(&ab(), families, &polywan::HealthSpec::fast(), "", &firewall);
     f.write_config(&config(&[Family::V4]))?;
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -211,8 +209,8 @@ fn as28_identical_link_local_gateways_and_router_expiry() -> Result<()> {
                 .all(|u| gateway(&t, Family::V6, *u).is_ok_and(|g| g == "fe80::1")))
         },
     )?;
-    let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
-    f.set_env("FTR_LOG", "debug");
+    let mut f = t.prepare_polywan(&polywan::family(&ab(), Family::V6))?;
+    f.set_env("POLYWAN_LOG", "debug");
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -246,7 +244,7 @@ fn as28_identical_link_local_gateways_and_router_expiry() -> Result<()> {
     })?;
     let took = start.elapsed();
     // `expires` is rounded down to the second: the route expires within
-    // `left + 1` s, and FTR acts within the following second.
+    // `left + 1` s, and PolyWAN acts within the following second.
     assert!(
         took <= Duration::from_secs(left + 2) && took + Duration::from_secs(1) >= Duration::from_secs(left),
         "withdrawn after {took:?}, expiry in {left} s"
@@ -264,13 +262,13 @@ fn as28_identical_link_local_gateways_and_router_expiry() -> Result<()> {
 
 /// FR-DISC-5: an advertisement without prefix information shortens the
 /// router lifetime of A's default route. The kernel notifies neither the
-/// change nor the later expiry, and sends no `RTM_NEWPREFIX`: FTR sees the
+/// change nor the later expiry, and sends no `RTM_NEWPREFIX`: PolyWAN sees the
 /// advertisement itself, and A is not ready within a second of the expiry.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
     let before = ra_expiry(&t, "wana")?.expect("A's default route");
@@ -330,8 +328,8 @@ fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn fr_disc_5_advertisement_flood() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
-    f.set_env("FTR_LOG", "debug");
+    let mut f = t.prepare_polywan(&polywan::family(&ab(), Family::V6))?;
+    f.set_env("POLYWAN_LOG", "debug");
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -384,7 +382,7 @@ fn fr_disc_5_advertisement_flood() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as35_ipv6_over_ppp_joins_and_leaves_a_multipath_route() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&abc(), Family::V6))?;
+    let f = t.start_polywan(&polywan::family(&abc(), Family::V6))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["ppp0", "wana", "wanb"], Duration::from_secs(10))?;
     assert!(path_route(&t, Family::V6, 1003)?.contains("via fe80::1 dev ppp0"));
@@ -434,7 +432,7 @@ fn as35_ipv6_over_ppp_joins_and_leaves_a_multipath_route() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as49_nexthop_objects_and_groups() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::dual(&ab()))?;
+    let f = t.start_polywan(&polywan::dual(&ab()))?;
     f.wait_installed(&t)?;
     for fam in Family::ALL {
         wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -494,12 +492,14 @@ fn as49_nexthop_objects_and_groups() -> Result<()> {
     })?;
     f.wait_log(
         &t,
-        "use a nexthop group, which FTR does not use",
+        "use a nexthop group, which PolyWAN does not use",
         2,
         Duration::from_secs(2),
     )?;
     assert_eq!(
-        f.log().matches("use a nexthop group, which FTR does not use").count(),
+        f.log()
+            .matches("use a nexthop group, which PolyWAN does not use")
+            .count(),
         2,
         "{}",
         f.log()
@@ -512,7 +512,7 @@ fn as49_nexthop_objects_and_groups() -> Result<()> {
 /// on an uplink with an automatic IPv6 gateway while forwarding is enabled;
 /// an IPv6 path without a discovered gateway 30 s after startup gets a
 /// warning that names the likely causes. The daemon's test hook
-/// `FTR_TEST_GATEWAY_WARNING_MS` shortens the 30 s to 3 s.
+/// `POLYWAN_TEST_GATEWAY_WARNING_MS` shortens the 30 s to 3 s.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn fr_sys_3_router_advertisement_warnings() -> Result<()> {
@@ -522,13 +522,13 @@ fn fr_sys_3_router_advertisement_warnings() -> Result<()> {
     // B: no Router Advertisement processing and no default route.
     r.sysctl(&["net.ipv6.conf.wanb.accept_ra=0"])?;
     drop_ra_default_routes(&t, "wanb")?;
-    let f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
+    let f = t.prepare_polywan(&polywan::family(&ab(), Family::V6))?;
     let out = f.cli_config(&["check-config"])?;
-    let text = ftr::output_text(&out);
+    let text = polywan::output_text(&out);
     assert!(text.contains("wana has accept_ra = 1"), "{text}");
     let mut f = f;
     let delay = Duration::from_secs(3);
-    f.set_env("FTR_TEST_GATEWAY_WARNING_MS", &delay.as_millis().to_string());
+    f.set_env("POLYWAN_TEST_GATEWAY_WARNING_MS", &delay.as_millis().to_string());
     let started = std::time::Instant::now();
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -601,13 +601,13 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     let b = address(&t, Family::V6, Uplink::B)?;
     r.ip(&format!("addr del {b}/64 dev wanb"))?;
     route_lan_via(Uplink::B, "2001:db8:fff0:b::2")?;
-    let snat = ftr::family(
-        &[ftr::UplinkSpec::new(Uplink::B, 2)
+    let snat = polywan::family(
+        &[polywan::UplinkSpec::new(Uplink::B, 2)
             .ipv6_nat(Some("snat"))
             .path(Family::V6, &format!("source = \"{}\"", plan::LAN_ROUTER_V6))],
         Family::V6,
     );
-    let mut f = t.start_ftr(&snat)?;
+    let mut f = t.start_polywan(&snat)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(10))?;
     assert!(path_route(&t, Family::V6, 1002)?.contains(&format!("src {}", plan::LAN_ROUTER_V6)));
@@ -625,7 +625,10 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     f.stop()?;
     // `nat = "none"` on A, whose provider now routes the LAN prefix.
     route_lan_via(Uplink::A, "2001:db8:fff0:a::2")?;
-    let none = ftr::family(&[ftr::UplinkSpec::new(Uplink::A, 1).ipv6_nat(Some("none"))], Family::V6);
+    let none = polywan::family(
+        &[polywan::UplinkSpec::new(Uplink::A, 1).ipv6_nat(Some("none"))],
+        Family::V6,
+    );
     f.write_config(&none)?;
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -641,7 +644,7 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     Ok(())
 }
 
-/// AS-33 for IPv6: a foreign rule in FTR's IPv6 priority range, or a route
+/// AS-33 for IPv6: a foreign rule in PolyWAN's IPv6 priority range, or a route
 /// in its IPv6 table range, refuses online `check-config` and startup, and
 /// the foreign objects stay.
 #[test]
@@ -661,10 +664,10 @@ fn as33_colliding_ipv6_rule_and_route() -> Result<()> {
         ),
     ] {
         t.router().ip(setup)?;
-        assert_refused(&t, &ftr::dual(&ab()), needle)?;
+        assert_refused(&t, &polywan::dual(&ab()), needle)?;
         t.router().ip(undo)?;
     }
-    let f = t.start_ftr(&ftr::dual(&ab()))?;
+    let f = t.start_polywan(&polywan::dual(&ab()))?;
     f.wait_installed(&t)?;
     Ok(())
 }
@@ -695,7 +698,7 @@ fn configure_ipv6(t: &testbed::Topology, u: Uplink) -> Result<()> {
     t.router_link(u, true)
 }
 
-/// AS-44 (IPv6 parts without prefix delegation): the router starts FTR,
+/// AS-44 (IPv6 parts without prefix delegation): the router starts PolyWAN,
 /// for both families, before any uplink is configured: no lease, no global
 /// address, no default route, an empty active set. Then router
 /// solicitation and advertisement, duplicate address detection (the router
@@ -718,11 +721,14 @@ fn as44_ipv6_boot_before_any_uplink_is_configured() -> Result<()> {
             assert_eq!(t.os_default_route(u, fam)?, None, "{u} has no {fam} default route yet");
         }
     }
-    let f = t.start_ftr(&ftr::dual(&abc()))?;
+    let f = t.start_polywan(&polywan::dual(&abc()))?;
     f.wait_installed(&t)?;
     for fam in Family::ALL {
         assert!(balancing_members(&t, fam)?.is_empty(), "empty {fam} active set");
-        assert!(!ftr_rules(&t, fam)?.is_empty(), "FTR's {fam} rules are installed");
+        assert!(
+            !polywan_rules(&t, fam)?.is_empty(),
+            "PolyWAN's {fam} rules are installed"
+        );
     }
     for u in [Uplink::A, Uplink::B] {
         configure_ipv6(&t, u)?;
@@ -789,7 +795,7 @@ fn delegated_lan_address(t: &testbed::Topology) -> Result<Option<IpAddr>> {
 }
 
 /// AS-44 (DHCPv6 with prefix delegation and the server-unicast variant):
-/// FTR runs for IPv6 on A and B before either is configured (empty active
+/// PolyWAN runs for IPv6 on A and B before either is configured (empty active
 /// set). B's provider runs a DHCPv6 server that delegates prefixes and
 /// announces the server-unicast option at an address outside the uplink's
 /// on-link prefix; the router's client (dhcpcd, or ISC dhclient where
@@ -816,7 +822,7 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
     }
     t.start_dhcpv6_server()?;
     dhcpv6_counters(&t)?;
-    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     assert!(balancing_members(&t, Family::V6)?.is_empty(), "empty active set");
 
@@ -916,7 +922,7 @@ fn as44_dhcpv6_acquisition_while_another_uplink_is_active() -> Result<()> {
     }
     t.start_dhcpv6_server()?;
     dhcpv6_counters(&t)?;
-    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     configure_ipv6(&t, Uplink::A)?;
     wait_members(&t, Family::V6, &["wana"], Duration::from_secs(20))?;

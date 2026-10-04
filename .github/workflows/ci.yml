@@ -68,7 +68,7 @@ jobs:
         id: nft-cache
         uses: actions/cache@v6
         with:
-          path: ~/.cache/ftr-nftables
+          path: ~/.cache/polywan-nftables
           key: nftables-ubuntu-26.04-${{ hashFiles('tests/ci/build-nftables.sh') }}
       - name: Build the newest upstream nftables
         # The runner's distribution ships an older nftables; §14.1 asks for a
@@ -77,14 +77,14 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends libjansson-dev
           if [ "${{ steps.nft-cache.outputs.cache-hit }}" != true ]; then
-            tests/ci/build-nftables.sh ~/.cache/ftr-nftables
+            tests/ci/build-nftables.sh ~/.cache/polywan-nftables
           fi
-          sudo ln -sf ~/.cache/ftr-nftables/sbin/nft /usr/local/sbin/nft
+          sudo ln -sf ~/.cache/polywan-nftables/sbin/nft /usr/local/sbin/nft
       - run: uname -r && sudo nft --version
       - run: tests/vm/run-suite.sh --host
         env:
           # The scenarios wait more than they compute.
-          FTR_PARALLEL_MASKS: 1
+          POLYWAN_PARALLEL_MASKS: 1
 
   netns-minimum:
     name: namespace suite (Linux 6.1, nftables 1.0.6)
@@ -138,12 +138,12 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p fault-tolerant-router \
+          cargo build --release --locked --target ${{ matrix.target }} -p polywan \
             --config 'target.${{ matrix.target }}.linker="rust-lld"'
-          file target/${{ matrix.target }}/release/fault-tolerant-router
-          file target/${{ matrix.target }}/release/fault-tolerant-router | grep -Eq 'statically linked|static-pie linked'
+          file target/${{ matrix.target }}/release/polywan
+          file target/${{ matrix.target }}/release/polywan | grep -Eq 'statically linked|static-pie linked'
       - uses: actions/upload-artifact@v7
         with:
-          name: fault-tolerant-router-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/fault-tolerant-router
+          name: polywan-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/polywan
           if-no-files-found: error

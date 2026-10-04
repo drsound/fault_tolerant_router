@@ -1,4 +1,4 @@
-//! Network namespace test harness for Fault Tolerant Router 2.0.
+//! Network namespace test harness for PolyWAN 2.0.
 //!
 //! Builds the reference topology of SPEC.md §14.2 out of network namespaces
 //! and veth pairs (an "internet" node, three providers, the router under test
@@ -8,16 +8,16 @@
 //!
 //! Everything a run creates is named after a random run identifier
 //! (`tb-<run>-<node>`), so several runs can share a host, and is removed when
-//! the [`Topology`] is dropped or by `ftr-testbed down`.
+//! the [`Topology`] is dropped or by `polywan-testbed down`.
 
 #![forbid(unsafe_code)]
 
 pub mod agent;
 pub mod dhcpv6;
-pub mod ftr;
 pub mod inject;
 pub mod netns;
 pub mod plan;
+pub mod polywan;
 pub mod topology;
 pub mod traffic;
 

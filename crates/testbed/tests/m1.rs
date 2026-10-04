@@ -1,5 +1,5 @@
 //! M1 acceptance scenarios (SPEC.md §14.3, §17), IPv4, with the daemon
-//! under test (`FTR_DAEMON_BIN`) in the router namespace.
+//! under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use testbed::ftr::{self, HealthSpec, UplinkSpec};
 use testbed::plan::{Family, Node, TCP_PORT, Uplink};
+use testbed::polywan::{self, HealthSpec, UplinkSpec};
 use testbed::traffic::tally;
 use testbed::{Options, Outcome, Topology};
 
@@ -44,7 +44,7 @@ per_family!(as01_equal_weights_split_connections_evenly);
 /// connections (§14.3).
 fn as01_equal_weights_split_connections_evenly(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t, fam)?, ["wana", "wanb"]);
     t.reset_counters()?;
@@ -59,7 +59,7 @@ per_family!(as04_carrier_loss_withdraws_the_uplink_within_a_second);
 /// connections use B (FR-HEALTH-5).
 fn as04_carrier_loss_withdraws_the_uplink_within_a_second(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t, fam)?, ["wana", "wanb"]);
     let start = Instant::now();
@@ -78,14 +78,14 @@ fn as04_carrier_loss_withdraws_the_uplink_within_a_second(fam: Family) -> Result
 per_family!(as14_no_uplink_rejects_without_leaking);
 
 /// AS-14: every uplink loses carrier; new connections are rejected and no
-/// packet leaves through a route that FTR did not install (INV-3), although
+/// packet leaves through a route that PolyWAN did not install (INV-3), although
 /// an operating-system default route through an unmanaged interface stays
-/// usable; without FTR's final guard, that route carries them (control).
+/// usable; without PolyWAN's final guard, that route carries them (control).
 fn as14_no_uplink_rejects_without_leaking(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.start_ftr(&ftr::family(&abc(), fam))?;
+    let mut f = t.start_polywan(&polywan::family(&abc(), fam))?;
     f.wait_installed(&t)?;
-    // An escape: a default route of main through an interface FTR does not
+    // An escape: a default route of main through an interface PolyWAN does not
     // manage, with the realm of operating-system routes (IPv4); for IPv6,
     // the harness's `leak6` route is one.
     let r = t.router();
@@ -127,7 +127,7 @@ fn as45a_ipv4_only_leaves_ipv6_alone() -> Result<()> {
     let mut keys = IPV6_SETTINGS.to_vec();
     keys.push("net/ipv6/conf/wana/forwarding");
     let before = sysctl_values(&t, &keys)?;
-    let f = t.start_ftr(&ftr::ipv4(&ab()))?;
+    let f = t.start_polywan(&polywan::ipv4(&ab()))?;
     f.wait_installed(&t)?;
     let left = ipv6_artifacts(&t)?;
     assert!(left.is_empty(), "IPv6 artifacts: {left:#?}");
@@ -143,7 +143,7 @@ per_family!(as02_weights_three_to_one);
 fn as02_weights_three_to_one(fam: Family) -> Result<()> {
     let t = build();
     let ups = [UplinkSpec::new(Uplink::A, 1).weight(3), UplinkSpec::new(Uplink::B, 2)];
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     split(&t, fam, 750, 50)
 }
@@ -154,7 +154,7 @@ per_family!(as03_connections_on_a_survive_failure_and_recovery_of_b);
 /// and recovers (INV-2).
 fn as03_connections_on_a_survive_failure_and_recovery_of_b(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, fam, 1, 16)?;
@@ -175,7 +175,7 @@ per_family!(as05_silent_upstream_failure_within_the_detection_bound);
 /// the default health settings (FR-HEALTH-5), reason `probe_failed`.
 fn as05_silent_upstream_failure_within_the_detection_bound(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::config(&ab(), &[fam], &HealthSpec::defaults(), "", ""))?;
+    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::defaults(), "", ""))?;
     f.wait_installed(&t)?;
     // Past the cold start: the first rounds have completed.
     std::thread::sleep(Duration::from_secs(6));
@@ -206,7 +206,7 @@ fn as08_priority_groups_fail_over_and_back(fam: Family) -> Result<()> {
         UplinkSpec::new(Uplink::B, 2),
         UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
     ];
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(5))?;
     t.upstream_down(Uplink::A)?;
@@ -231,7 +231,7 @@ fn as13_all_probes_failing_keeps_the_best_group(fam: Family) -> Result<()> {
         UplinkSpec::new(Uplink::B, 2),
         UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
     ];
-    let f = t.start_ftr(&ftr::config(
+    let f = t.start_polywan(&polywan::config(
         &ups,
         &[fam],
         &HealthSpec::fast(),
@@ -262,7 +262,7 @@ per_family!(as20_invalid_reload_keeps_the_running_configuration);
 /// AS-20: an invalid configuration on reload keeps the running one.
 fn as20_invalid_reload_keeps_the_running_configuration(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&stack(fam, &ab()))?;
+    let f = t.start_polywan(&stack(fam, &ab()))?;
     f.wait_installed(&t)?;
     // For IPv6, an IPv6 section without its required `nat` (FR-NAT-1).
     let (invalid, reason) = match fam {
@@ -301,7 +301,7 @@ fn as20_an_untrusted_nft_path_never_runs() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
     let open = f.dir.join("open");
     std::fs::create_dir(&open)?;
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777))?;
@@ -313,19 +313,19 @@ fn as20_an_untrusted_nft_path_never_runs() -> Result<()> {
     std::os::unix::fs::symlink(&nft, &link)?;
     let untrusted = |mode: &str| {
         let firewall = format!("[firewall]\nmode = \"{mode}\"\nnft_path = \"{}\"\n", link.display());
-        ftr::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", &firewall)
+        polywan::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", &firewall)
     };
     let refusal = format!("{} is writable by group or others", open.display());
     for mode in ["managed", "external"] {
         f.write_config(&untrusted(mode))?;
         let out = f.cli_config(&["check-config"])?;
-        let text = ftr::output_text(&out);
+        let text = polywan::output_text(&out);
         assert!(!out.status.success() && text.contains(&refusal), "{mode}: {text}");
         f.start(&t)?;
         f.wait_exit(&t, Duration::from_secs(5))?;
         assert!(f.log().contains(&refusal), "{mode}: {}", f.log());
     }
-    f.write_config(&ftr::ipv4(&ab()))?;
+    f.write_config(&polywan::ipv4(&ab()))?;
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
@@ -346,20 +346,20 @@ per_family!(as24_foreign_mark_bits_are_preserved);
 /// preserved end to end (INV-7).
 fn as24_foreign_mark_bits_are_preserved(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     t.router().nft(
         &format!(
             "table inet admin {{\n  chain pre {{\n    type filter hook prerouting priority -300; policy accept;\n    iifname \"lan\" meta mark set meta mark | {p:#010x}\n  }}\n  chain ctmark {{\n    type filter hook prerouting priority -190; policy accept;\n    iifname \"lan\" ct state new ct mark set ct mark | {c:#010x}\n  }}\n}}\n",
-            p = ftr::foreign_bit(0),
-            c = ftr::foreign_bit(8)
+            p = polywan::foreign_bit(0),
+            c = polywan::foreign_bit(8)
         ),
     )?;
     // Packets to the test servers: with the foreign bits and a path in
-    // both marks; or invalid ones, which FTR leaves alone (§4.7): foreign
+    // both marks; or invalid ones, which PolyWAN leaves alone (§4.7): foreign
     // bit kept, no path. Nothing else.
-    let (nm, m) = (!ftr::mask(), ftr::mask());
-    let (p, c) = (ftr::foreign_bit(0), ftr::foreign_bit(8));
+    let (nm, m) = (!polywan::mask(), polywan::mask());
+    let (p, c) = (polywan::foreign_bit(0), polywan::foreign_bit(8));
     let (ipk, srv) = (ip(fam), servers_prefix(fam));
     t.router().nft(&format!(
         "table inet t_as24 {{\n  counter total {{}}\n  counter kept {{}}\n  counter skipped {{}}\n  counter other {{}}\n  chain post {{\n    type filter hook postrouting priority 300; policy accept;\n    oifname {{ \"wana\", \"wanb\" }} {ipk} daddr {srv} jump count\n  }}\n  chain count {{\n    counter name total\n    meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} != 0 ct mark & {c:#010x} == {c:#010x} ct mark & {m:#010x} != 0 counter name kept return\n    ct state invalid meta mark & {nm:#010x} == {p:#010x} meta mark & {m:#010x} == 0 counter name skipped return\n    counter name other\n  }}\n}}\n"
@@ -384,7 +384,7 @@ per_family!(as26_more_specific_main_routes_take_precedence);
 /// AS-26: more-specific routes in main are followed (main bypass, INV-1).
 fn as26_more_specific_main_routes_take_precedence(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     let (gwa, gwb) = (gateway(&t, fam, Uplink::A)?, gateway(&t, fam, Uplink::B)?);
     // Servers 128-255, and the two halves of the address space.
@@ -419,7 +419,7 @@ fn as26_more_specific_main_routes_take_precedence(fam: Family) -> Result<()> {
         counts.contains_key(&Some(Uplink::A)) && counts.contains_key(&Some(Uplink::B)),
         "others balanced: {counts:?}"
     );
-    // A VPN-style pair of /1 routes overrides FTR for everything (by design).
+    // A VPN-style pair of /1 routes overrides PolyWAN for everything (by design).
     for half in halves {
         t.router().ip(&format!("{flag} route add {half} via {gwa} dev wana"))?;
     }
@@ -449,7 +449,7 @@ fn as29_probes_leave_through_their_path(fam: Family) -> Result<()> {
         UplinkSpec::new(Uplink::A, 1).priority(None),
         UplinkSpec::new(Uplink::B, 2),
     ];
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t, fam)?, ["wanb"]);
     let (gwb, a) = (gateway(&t, fam, Uplink::B)?, address(&t, fam, Uplink::A)?);
@@ -495,7 +495,7 @@ fn as29_probes_leave_through_their_path(fam: Family) -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as33_collisions_and_flowtables() -> Result<()> {
     let t = build();
-    let only_a = ftr::config(
+    let only_a = polywan::config(
         &[UplinkSpec::new(Uplink::A, 1)],
         &[Family::V4],
         &HealthSpec::fast(),
@@ -505,7 +505,7 @@ fn as33_collisions_and_flowtables() -> Result<()> {
     let refused = |setup: &str, undo: &str, needle: &str| -> Result<()> {
         t.router().run("sh", ["-c", setup])?;
         let before = foreign_objects(&t)?;
-        assert_refused(&t, &ftr::ipv4(&ab()), needle)?;
+        assert_refused(&t, &polywan::ipv4(&ab()), needle)?;
         assert_eq!(foreign_objects(&t)?, before, "foreign objects unchanged");
         t.router().run("sh", ["-c", undo])?;
         Ok(())
@@ -513,14 +513,14 @@ fn as33_collisions_and_flowtables() -> Result<()> {
     refused(
         "ip rule add pref 1650 lookup 5",
         "ip rule del pref 1650",
-        "collides with FTR",
+        "collides with PolyWAN",
     )?;
     let ft = |devs: &str| flowtable("ft", devs);
     refused(&ft("wana"), "nft delete table inet ft", "matches the uplink wana")?;
     refused(&ft("lan"), "nft delete table inet ft", "matches the downlink lan")?;
 
     // Runtime detection and recovery.
-    let mut f = t.start_ftr(&only_a)?;
+    let mut f = t.start_polywan(&only_a)?;
     f.wait_installed(&t)?;
     t.router().run("sh", ["-c", &ft("wana")])?;
     f.wait_log(&t, "status_degraded", 1, Duration::from_secs(15))?;
@@ -529,7 +529,7 @@ fn as33_collisions_and_flowtables() -> Result<()> {
     f.wait_log(&t, "status_recovered", 1, Duration::from_secs(15))?;
     // A flowtable on wanb matches only the proposed configuration.
     t.router().run("sh", ["-c", &ft("wanb")])?;
-    f.write_config(&ftr::config(
+    f.write_config(&polywan::config(
         &ab(),
         &[Family::V4],
         &HealthSpec::fast(),
@@ -555,7 +555,7 @@ fn flowtable(table: &str, devs: &str) -> String {
     )
 }
 
-/// The router's rules and its nftables ruleset without FTR's table and the
+/// The router's rules and its nftables ruleset without PolyWAN's table and the
 /// harness's counters, for checks that foreign objects stay unchanged.
 fn foreign_objects(t: &Topology) -> Result<String> {
     let rules = t.router().run("ip", ["-4", "rule", "show"])?;
@@ -565,7 +565,7 @@ fn foreign_objects(t: &Topology) -> Result<String> {
     let mut keep = false;
     for l in nft.lines() {
         if l.starts_with("table ") {
-            keep = !l.contains("fault_tolerant_router") && !l.contains(" tb_");
+            keep = !l.contains("polywan") && !l.contains(" tb_");
         }
         if keep {
             tables.push_str(l);
@@ -579,7 +579,7 @@ fn foreign_objects(t: &Topology) -> Result<String> {
 /// with foreign-rule or foreign-route management enabled (both default to
 /// yes) makes online `check-config` fail and startup be refused, naming each
 /// setting; a networkd in another namespace is not considered; a drop-in
-/// disabling both lets FTR start. The networkd process is a stand-in with its
+/// disabling both lets PolyWAN start. The networkd process is a stand-in with its
 /// name, and the configuration is the router namespace's `/etc/systemd`
 /// (`ip netns exec` mounts it): the check is by process and configuration.
 #[test]
@@ -594,10 +594,10 @@ fn as33_networkd_foreign_management() -> Result<()> {
     let fake = fake.display().to_string();
     let dropins = t.netns_etc(Node::Router).join("systemd/networkd.conf.d");
     std::fs::create_dir_all(&dropins)?;
-    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
-    let check = |f: &ftr::Ftr| -> Result<(bool, String)> {
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let check = |f: &polywan::Polywan| -> Result<(bool, String)> {
         let out = f.cli_config(&["check-config"])?;
-        let text = ftr::output_text(&out);
+        let text = polywan::output_text(&out);
         Ok((out.status.success(), text))
     };
     let enabled = |key: &str| format!("systemd-networkd is active with {key} enabled");
@@ -636,7 +636,7 @@ fn as33_networkd_foreign_management() -> Result<()> {
     }
     // Rules disabled, routes still enabled.
     std::fs::write(
-        dropins.join("50-ftr.conf"),
+        dropins.join("50-polywan.conf"),
         "[Network]\nManageForeignRoutingPolicyRules=no\n",
     )?;
     f.start(&t)?;
@@ -649,7 +649,7 @@ fn as33_networkd_foreign_management() -> Result<()> {
     );
     // Both disabled.
     std::fs::write(
-        dropins.join("50-ftr.conf"),
+        dropins.join("50-polywan.conf"),
         "[Network]\nManageForeignRoutingPolicyRules=no\nManageForeignRoutes=no\n",
     )?;
     let (ok, text) = check(&f)?;
@@ -678,7 +678,7 @@ fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
     r.ip("link set ftx up")?;
     r.sh(&flowtable("unrelated", "ftx"))?;
     let only_a = |extra: &str| {
-        ftr::config(
+        polywan::config(
             &[UplinkSpec::new(Uplink::A, 1)],
             &[Family::V4],
             &HealthSpec::fast(),
@@ -686,7 +686,7 @@ fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
             extra,
         )
     };
-    let mut f = t.prepare_ftr(&only_a(""))?;
+    let mut f = t.prepare_polywan(&only_a(""))?;
     let (wrapper, flag) = nft_wrapper(&t, &f, &["list ruleset", "list flowtables"])?;
     let managed = only_a(&format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display()));
     f.write_config(&managed)?;
@@ -718,7 +718,7 @@ fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
     f.write_config(&external)?;
     r.sh(&flowtable("ftm", "lan"))?;
     let out = f.cli_config(&["check-config"])?;
-    let text = ftr::output_text(&out);
+    let text = polywan::output_text(&out);
     assert!(
         !out.status.success() && text.contains("matches the downlink lan"),
         "{text}"
@@ -763,17 +763,17 @@ fn as40_foreign_earlier_rule_and_missing_local_rule(fam: Family) -> Result<()> {
     let t = build();
     let flag = fam.flag();
     t.router().ip(&format!("{flag} rule add pref 500 lookup 5"))?;
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     assert!(
-        f.log().contains("the rule at priority 500 precedes FTR's rules"),
+        f.log().contains("the rule at priority 500 precedes PolyWAN's rules"),
         "{}",
         f.log()
     );
     drop(f);
     t.router().ip(&format!("{flag} rule del pref 500"))?;
     t.router().ip(&format!("{flag} rule del pref 0"))?;
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_exit(&t, Duration::from_secs(10))?;
     assert!(
         f.log().contains("local-table rule at priority 0 is missing"),
@@ -803,7 +803,7 @@ fn as09_inbound_replies_leave_through_the_arrival_uplink(fam: Family) -> Result<
         UplinkSpec::new(Uplink::B, 2),
         UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
     ];
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     inbound_via_each_uplink(&t, fam, &[Uplink::A, Uplink::B, Uplink::C])?;
     Ok(())
@@ -873,7 +873,7 @@ per_family!(as17_third_party_deletions_are_repaired);
 /// lead to `ownership_conflict` and later recovery (FR-COEX-3, FR-COEX-4).
 fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::config(
+    let f = t.start_polywan(&polywan::config(
         &ab(),
         stack_families(fam),
         &HealthSpec::fast(),
@@ -881,15 +881,15 @@ fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
         "",
     ))?;
     f.wait_installed(&t)?;
-    let rules = ftr_rules(&t, fam)?;
+    let rules = polywan_rules(&t, fam)?;
     // In the dual-stack variant, IPv4's rules are left alone.
-    let rules4 = ftr_rules(&t, Family::V4)?;
+    let rules4 = polywan_rules(&t, Family::V4)?;
     let r = t.router();
     let flag = fam.flag();
     let start = Instant::now();
     r.ip(&format!("{flag} rule del pref 1600"))?;
     t.wait_for("the balancing rule back", Duration::from_secs(2), || {
-        Ok(ftr_rules(&t, fam)? == rules)
+        Ok(polywan_rules(&t, fam)? == rules)
     })?;
     assert!(
         start.elapsed() <= Duration::from_secs(1),
@@ -908,12 +908,12 @@ fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
         start.elapsed()
     );
     let table = || -> Result<String> {
-        let out = r.output("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
+        let out = r.output("nft", ["list", "table", "inet", "polywan"])?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     };
     let installed = table()?;
     assert!(installed.contains("chain"), "{installed}");
-    r.run("nft", ["delete", "table", "inet", "fault_tolerant_router"])?;
+    r.run("nft", ["delete", "table", "inet", "polywan"])?;
     t.wait_for("the same nftables table back", Duration::from_secs(13), || {
         Ok(table()? == installed)
     })?;
@@ -924,17 +924,21 @@ fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
         r.ip(&format!("{flag} rule del pref 1699"))?;
         if n < 3 {
             t.wait_for("the final guard back", Duration::from_secs(2), || {
-                Ok(ftr_rules(&t, fam)? == rules)
+                Ok(polywan_rules(&t, fam)? == rules)
             })?;
         }
     }
     f.wait_log(&t, "ownership_conflict", 1, Duration::from_secs(3))?;
     std::thread::sleep(Duration::from_millis(1500));
-    assert_ne!(ftr_rules(&t, fam)?, rules, "no immediate repair during the conflict");
+    assert_ne!(
+        polywan_rules(&t, fam)?,
+        rules,
+        "no immediate repair during the conflict"
+    );
     t.wait_for(
         "the final guard back at a full reconciliation",
         Duration::from_secs(12),
-        || Ok(ftr_rules(&t, fam)? == rules),
+        || Ok(polywan_rules(&t, fam)? == rules),
     )?;
     f.wait_log(&t, "ownership conflict cleared", 1, Duration::from_secs(25))?;
     f.wait_log(&t, "status_recovered", 1, Duration::from_secs(2))?;
@@ -949,7 +953,7 @@ fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
     flows_on_continuous(flows, &[Uplink::A])?;
     assert_eq!(t.leaks(fam)?, 0, "INV-3");
     inbound_via_each_uplink(&t, fam, &[Uplink::A, Uplink::B])?;
-    assert_eq!(ftr_rules(&t, Family::V4)?, rules4);
+    assert_eq!(polywan_rules(&t, Family::V4)?, rules4);
     Ok(())
 }
 
@@ -960,7 +964,7 @@ per_family!(as18_crash_and_restart_keep_state_and_connections);
 /// set after the restart, no duplicate artifacts.
 fn as18_crash_and_restart_keep_state_and_connections(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.start_ftr(&stack(fam, &ab()))?;
+    let mut f = t.start_polywan(&stack(fam, &ab()))?;
     f.wait_installed(&t)?;
     t.upstream_down(Uplink::A)?;
     wait_members(&t, fam, &["wanb"], Duration::from_secs(10))?;
@@ -969,7 +973,7 @@ fn as18_crash_and_restart_keep_state_and_connections(fam: Family) -> Result<()> 
     let all_rules = || -> Result<Vec<String>> {
         let mut v = Vec::new();
         for g in stack_families(fam) {
-            v.extend(ftr_rules(&t, *g)?);
+            v.extend(polywan_rules(&t, *g)?);
         }
         Ok(v)
     };
@@ -1006,7 +1010,7 @@ fn as20_state_dir_moves_only_while_stopped() -> Result<()> {
     let t = build();
     let svm = || t.router().sysctl_get("net.ipv4.conf.wana.src_valid_mark");
     let before = svm()?;
-    let mut f = t.start_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.start_polywan(&polywan::ipv4(&ab()))?;
     f.wait_installed(&t)?;
     assert_eq!(svm()?, "1");
     t.upstream_down(Uplink::A)?;
@@ -1017,11 +1021,11 @@ fn as20_state_dir_moves_only_while_stopped() -> Result<()> {
         Duration::from_millis(50),
     )?;
     std::thread::sleep(Duration::from_millis(500));
-    let rules = ftr_rules(&t, Family::V4)?;
+    let rules = polywan_rules(&t, Family::V4)?;
     let old = f.state.clone();
     let new = f.dir.join("moved-state");
     f.state = new.clone();
-    f.write_config(&ftr::ipv4(&ab()))?;
+    f.write_config(&polywan::ipv4(&ab()))?;
     f.reload()?;
     f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
     assert!(f.log().contains("state_dir cannot change on reload"), "{}", f.log());
@@ -1039,7 +1043,7 @@ fn as20_state_dir_moves_only_while_stopped() -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(ftr_rules(&t, Family::V4)?, rules, "no duplicate or missing rule");
+    assert_eq!(polywan_rules(&t, Family::V4)?, rules, "no duplicate or missing rule");
     assert!(!old.exists(), "nothing is written to the old directory");
     let report = flow.stop()?;
     assert_eq!(report.uplink(), Some(Uplink::B));
@@ -1059,13 +1063,13 @@ per_family!(as19_reload_adds_removes_reorders_and_protects_ids);
 /// uplink is refused until `forget-uplink`.
 fn as19_reload_adds_removes_reorders_and_protects_ids(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let mut f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, fam, 20, 12)?;
     std::thread::sleep(Duration::from_millis(500));
     // C added first in the file, A removed, B unchanged.
-    f.write_config(&ftr::family(
+    f.write_config(&polywan::family(
         &[UplinkSpec::new(Uplink::C, 3), UplinkSpec::new(Uplink::B, 2)],
         fam,
     ))?;
@@ -1077,7 +1081,7 @@ fn as19_reload_adds_removes_reorders_and_protects_ids(fam: Family) -> Result<()>
     flows_on_continuous(flows, &[Uplink::B])?;
     // Id 1 belonged to A: reusing it for another name is refused.
     let reuse = [UplinkSpec::new(Uplink::A, 1), UplinkSpec::new(Uplink::B, 2)];
-    let text = ftr::family(&reuse, fam).replace("name = \"a\"", "name = \"fiber\"");
+    let text = polywan::family(&reuse, fam).replace("name = \"a\"", "name = \"fiber\"");
     f.write_config(&text)?;
     f.reload()?;
     f.wait_log(&t, "reload_failed", 1, Duration::from_secs(5))?;
@@ -1097,15 +1101,15 @@ per_family!(as32_conntrack_flush);
 /// daemon unaffected (FR-CT-3).
 fn as32_conntrack_flush(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
-    let rules = ftr_rules(&t, fam)?;
+    let rules = polywan_rules(&t, fam)?;
     let flow = t.start_flow(Node::Client, testbed::plan::server(fam, 30), Duration::from_millis(50))?;
     std::thread::sleep(Duration::from_millis(500));
     t.router().run("conntrack", ["-F"])?;
     std::thread::sleep(Duration::from_secs(2));
     let _ = flow.stop()?;
-    assert_eq!(ftr_rules(&t, fam)?, rules);
+    assert_eq!(polywan_rules(&t, fam)?, rules);
     assert_eq!(balancing_members(&t, fam)?, ["wana", "wanb"]);
     let r = t.connect_many(Node::Client, fam, 10, 50, false)?;
     assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
@@ -1131,7 +1135,7 @@ fn as41_downlink_prefix_and_off_subnet_gateway(fam: Family) -> Result<()> {
         ),
     };
     t.router().ip(&format!("{} route del {lan} dev lan", fam.flag()))?;
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     assert!(
         f.log().contains(&format!("the prefix {lan} is not in the main table")),
@@ -1146,9 +1150,9 @@ fn as41_downlink_prefix_and_off_subnet_gateway(fam: Family) -> Result<()> {
     let off = |onlink: bool| {
         let extra = if onlink { "gateway_onlink = true\n" } else { "" };
         let a = UplinkSpec::new(Uplink::A, 1).path(fam, &format!("gateway = \"{gw}\"\n{extra}"));
-        ftr::family(&[a, UplinkSpec::new(Uplink::B, 2)], fam)
+        polywan::family(&[a, UplinkSpec::new(Uplink::B, 2)], fam)
     };
-    let f = t.start_ftr(&off(false))?;
+    let f = t.start_polywan(&off(false))?;
     f.wait_installed(&t)?;
     assert_eq!(
         balancing_members(&t, fam)?,
@@ -1156,7 +1160,7 @@ fn as41_downlink_prefix_and_off_subnet_gateway(fam: Family) -> Result<()> {
         "A not ready without gateway_onlink"
     );
     drop(f);
-    let f = t.start_ftr(&off(true))?;
+    let f = t.start_polywan(&off(true))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(5))?;
     let route = path_route(&t, fam, 1001)?;
@@ -1183,7 +1187,7 @@ fn as42_router_reply_from_a_secondary_address(fam: Family) -> Result<()> {
     };
     let nodad = if fam == Family::V6 { " nodad" } else { "" };
     t.router().ip(&format!("addr add {secondary}/{len} dev wana{nodad}"))?;
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     assert!(balancing_members(&t, fam)?.is_empty(), "empty active set");
     let _server = serve_in(&t, Node::Router)?;
@@ -1211,13 +1215,13 @@ fn as42_router_reply_from_a_secondary_address(fam: Family) -> Result<()> {
     Ok(())
 }
 
-/// AS-10: the DHCP lease of A changes address and gateway; FTR's artifacts
+/// AS-10: the DHCP lease of A changes address and gateway; PolyWAN's artifacts
 /// follow within 1 s; connections on B are unaffected.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::ipv4(&ab()))?;
+    let f = t.start_polywan(&polywan::ipv4(&ab()))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, Family::V4, 40, 12)?;
@@ -1250,7 +1254,7 @@ fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
     )?;
     let took = start.elapsed();
     assert!(took <= Duration::from_secs(1), "updated after {took:?}");
-    let rules = ftr_rules(&t, Family::V4)?.join("\n");
+    let rules = polywan_rules(&t, Family::V4)?.join("\n");
     assert!(
         rules.contains("from 192.0.2.77") && !rules.contains(&format!("from {old} ")),
         "{rules}"
@@ -1262,7 +1266,7 @@ fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
 }
 
 /// AS-10, IPv6: A is renumbered (a new address, the old one removed) and a
-/// better router appears on its link; FTR's artifacts follow within 1 s,
+/// better router appears on its link; PolyWAN's artifacts follow within 1 s,
 /// connections on B are unaffected. Like the IPv4 variant's DHCP client,
 /// the harness does what SLAAC and a second router's advertisements would,
 /// with SLAAC off on A so that the old address does not come back.
@@ -1272,7 +1276,7 @@ fn as10_lease_change_updates_artifacts_within_a_second_ipv6() -> Result<()> {
     let t = build();
     let r = t.router();
     r.sysctl(&["net.ipv6.conf.wana.autoconf=0"])?;
-    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, Family::V6, 40, 12)?;
@@ -1293,7 +1297,7 @@ fn as10_lease_change_updates_artifacts_within_a_second_ipv6() -> Result<()> {
     )?;
     let took = start.elapsed();
     assert!(took <= Duration::from_secs(1), "updated after {took:?}");
-    let rules = ftr_rules(&t, Family::V6)?.join("\n");
+    let rules = polywan_rules(&t, Family::V6)?.join("\n");
     assert!(
         rules.contains("from 2001:db8:a:ffff::77") && !rules.contains(&format!("from {old} ")),
         "{rules}"
@@ -1312,7 +1316,7 @@ fn as10_lease_change_updates_artifacts_within_a_second_ipv6() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as11_ppp_reconnection_with_a_new_ifindex() -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::ipv4(&abc()))?;
+    let f = t.start_polywan(&polywan::ipv4(&abc()))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["ppp0", "wana", "wanb"], Duration::from_secs(10))?;
     let before = t.ifindex("ppp0").expect("ppp0");
@@ -1338,7 +1342,7 @@ fn as11_ppp_reconnection_with_a_new_ifindex() -> Result<()> {
     let took = start.elapsed();
     assert!(took <= Duration::from_secs(1), "updated after {took:?}");
     t.wait_for("the source rules of the new address", Duration::from_secs(1), || {
-        let rules = ftr_rules(&t, Family::V4)?.join("\n");
+        let rules = polywan_rules(&t, Family::V4)?.join("\n");
         Ok(rules.contains(&format!("from {addr} ")) && !rules.contains(&format!("from {old} ")))
     })?;
     let svm = t.router().sysctl_get("net.ipv4.conf.ppp0.src_valid_mark")?;
@@ -1354,7 +1358,7 @@ per_family!(as22_unanswered_and_one_way_flows_stay_on_their_uplink);
 /// active set changes: every packet of each flow leaves through one uplink.
 fn as22_unanswered_and_one_way_flows_stay_on_their_uplink(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     t.inet().nft("table inet blackhole {\n  chain in {\n    type filter hook prerouting priority 0; policy accept;\n    tcp dport 9999 drop\n  }\n}\n")?;
     // The UDP flows are told apart by their (pre-NAT) source port.
@@ -1444,7 +1448,7 @@ fn as30_replies_with_an_empty_active_set(fam: Family) -> Result<()> {
                 "interval = \"1s\"\ntimeout = \"300ms\"\nattempts = 2\nrequired_reachable = 2\n[health.{fam}]\ntargets = [{targets}]\n"
             ),
         };
-        ftr::config(&ups, &[fam], &health, "", "")
+        polywan::config(&ups, &[fam], &health, "", "")
     };
     if fam == Family::V6 {
         t.router().sysctl(&[
@@ -1469,12 +1473,12 @@ fn as30_replies_with_an_empty_active_set(fam: Family) -> Result<()> {
         ),
     };
     // TCP first; the ICMP configuration stays for the rest.
-    let mut running: Option<ftr::Ftr> = None;
+    let mut running: Option<polywan::Polywan> = None;
     for (kind, targets) in [("TCP", tcp), ("ICMP", icmp)] {
         if let Some(mut f) = running.take() {
             f.stop()?;
         }
-        let f = t.start_ftr(&config(targets))?;
+        let f = t.start_polywan(&config(targets))?;
         f.wait_installed(&t)?;
         assert!(balancing_members(&t, fam)?.is_empty());
         std::thread::sleep(Duration::from_secs(5));
@@ -1532,7 +1536,7 @@ fn as30_replies_with_an_empty_active_set(fam: Family) -> Result<()> {
             "-I",
             "wana",
             "-m",
-            &ftr::encode(0x41).to_string(),
+            &polywan::encode(0x41).to_string(),
             "1.1.1.1",
         ],
     )?;
@@ -1558,7 +1562,7 @@ fn as37_removed_uplink_connections_are_rejected_not_moved(fam: Family) -> Result
         UplinkSpec::new(Uplink::A, 1).priority(Some(2)),
         UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
     ];
-    let f = t.start_ftr(&ftr::family(&ups, fam))?;
+    let f = t.start_polywan(&polywan::family(&ups, fam))?;
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t, fam)?, ["ppp0"]);
     t.reset_counters()?;
@@ -1570,7 +1574,7 @@ fn as37_removed_uplink_connections_are_rejected_not_moved(fam: Family) -> Result
         "moved",
         &format!("oifname {{ \"wana\", \"wanb\" }} {ipk} daddr {{ {s77}, {s78} }}"),
     )?;
-    f.write_config(&ftr::family(&ups[1..], fam))?;
+    f.write_config(&polywan::family(&ups[1..], fam))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(5))?;
@@ -1616,7 +1620,7 @@ per_family!(as38_warm_restart_and_cold_start_after_reboot);
 /// is cold.
 fn as38_warm_restart_and_cold_start_after_reboot(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.start_ftr(&ftr::config(
+    let mut f = t.start_polywan(&polywan::config(
         &ab(),
         &[fam],
         &HealthSpec::fast(),
@@ -1671,13 +1675,13 @@ fn as38_warm_restart_and_cold_start_after_reboot(fam: Family) -> Result<()> {
 
 per_family!(as50_unmanaged_interface_replies_are_not_pinned);
 
-/// AS-50: a connection from a host behind an interface FTR does not manage
+/// AS-50: a connection from a host behind an interface PolyWAN does not manage
 /// to a LAN host, whose replies follow the balancing route: the replies are
 /// never assigned a path and continue through the other uplink when theirs
 /// loses readiness.
 fn as50_unmanaged_interface_replies_are_not_pinned(fam: Family) -> Result<()> {
     let t = build();
-    let f = t.start_ftr(&ftr::family(&ab(), fam))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     let _client = serve_in(&t, Node::Client)?;
     // An unmanaged link between the router and the internet node; the
@@ -1748,7 +1752,7 @@ fn as50_unmanaged_interface_replies_are_not_pinned(fam: Family) -> Result<()> {
         !marks.is_empty()
             && marks
                 .iter()
-                .all(|m| m.trim_start_matches("mark=").parse::<u32>().unwrap_or(1) & ftr::mask() == 0),
+                .all(|m| m.trim_start_matches("mark=").parse::<u32>().unwrap_or(1) & polywan::mask() == 0),
         "{ct}"
     );
     let (a, b) = (counter_value(&t, "a")?, counter_value(&t, "b")?);
@@ -1779,7 +1783,7 @@ per_family!(as21_router_originated_traffic);
 fn as21_router_originated_traffic(fam: Family) -> Result<()> {
     use testbed::agent::Binding;
     let t = build();
-    let f = t.start_ftr(&ftr::family(&abc(), fam))?;
+    let f = t.start_polywan(&polywan::family(&abc(), fam))?;
     f.wait_installed(&t)?;
     let ok = |r: &[testbed::ConnResult]| r.iter().all(|c| c.outcome == Outcome::Ok);
     // Unbound: balanced over A and B.
@@ -1977,14 +1981,14 @@ fn as23_external_firewall_mode(fam: Family) -> Result<()> {
         UplinkSpec::new(Uplink::B, 2),
         UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
     ];
-    let config = ftr::config(
+    let config = polywan::config(
         &ups,
         stack_families(fam),
         &HealthSpec::fast(),
         "reconcile_interval = \"10s\"",
         "[firewall]\nmode = \"external\"\n",
     );
-    let f = t.start_ftr(&config)?;
+    let f = t.start_polywan(&config)?;
     f.wait_installed(&t)?;
     assert!(
         f.log()
@@ -2001,10 +2005,10 @@ fn as23_external_firewall_mode(fam: Family) -> Result<()> {
     .or_else(|_| f.wait_log(&t, "external_ruleset_missing", 1, Duration::from_secs(2)))?;
     assert!(
         !t.router()
-            .output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
+            .output("nft", ["list", "table", "inet", "polywan"])?
             .status
             .success(),
-        "FTR performs no nftables mutation"
+        "PolyWAN performs no nftables mutation"
     );
     let out = f.cli_config(&["export-nft"])?;
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -2036,11 +2040,11 @@ per_family!(as47_startup_with_existing_artifacts);
 /// the administrator's ruleset already loaded (no degradation).
 fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.start_ftr(&stack(fam, &ab()))?;
+    let mut f = t.start_polywan(&stack(fam, &ab()))?;
     f.wait_installed(&t)?;
     t.upstream_down(Uplink::A)?;
     wait_members(&t, fam, &["wanb"], Duration::from_secs(10))?;
-    let rules = ftr_rules(&t, fam)?;
+    let rules = polywan_rules(&t, fam)?;
     let flow = |n| t.start_flow(Node::Client, testbed::plan::server(fam, n), Duration::from_millis(50));
     let intact = flow(90)?;
     std::thread::sleep(Duration::from_millis(500));
@@ -2049,7 +2053,7 @@ fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
     // start. The daemon's boot-time clock moves 11 minutes ahead (a test
     // hook): the host may have booted less than 10 minutes ago.
     f.kill()?;
-    f.set_env("FTR_TEST_BOOTTIME_SHIFT_MS", &(11 * 60 * 1000).to_string());
+    f.set_env("POLYWAN_TEST_BOOTTIME_SHIFT_MS", &(11 * 60 * 1000).to_string());
     f.start(&t)?;
     f.wait_log(
         &t,
@@ -2058,7 +2062,7 @@ fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
         Duration::from_secs(10),
     )?;
     f.wait_installed(&t)?;
-    assert_eq!(ftr_rules(&t, fam)?, rules, "adopted without duplicates");
+    assert_eq!(polywan_rules(&t, fam)?, rules, "adopted without duplicates");
     wait_members(&t, fam, &["wanb"], Duration::from_secs(5))?;
     let report = intact.stop()?;
     assert_eq!(report.uplink(), Some(Uplink::B));
@@ -2083,7 +2087,7 @@ fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
     )?;
     f.wait_installed(&t)?;
     t.wait_for("the layout repaired", Duration::from_secs(3), || {
-        Ok(ftr_rules(&t, fam)? == rules)
+        Ok(polywan_rules(&t, fam)? == rules)
     })?;
     wait_members(&t, fam, &["wanb"], Duration::from_secs(3))?;
     std::thread::sleep(Duration::from_secs(1));
@@ -2097,7 +2101,7 @@ fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
     t.upstream_up(Uplink::A)?;
 
     // (3) External mode with the administrator's ruleset already loaded.
-    let config = ftr::config(
+    let config = polywan::config(
         &ab(),
         stack_families(fam),
         &HealthSpec::fast(),
@@ -2118,16 +2122,16 @@ fn as47_startup_with_existing_artifacts(fam: Family) -> Result<()> {
 
 per_family!(as47_warm_restart_adding_an_uplink);
 
-/// AS-47, an uplink added while FTR was stopped: at the warm restart, its
+/// AS-47, an uplink added while PolyWAN was stopped: at the warm restart, its
 /// assignments are not in the adopted table yet, so it joins the balancing
 /// route only after the replacement installs them, also while that
 /// replacement fails (FR-REC-8, FR-REC-3).
 fn as47_warm_restart_adding_an_uplink(fam: Family) -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&stack(fam, &ab()))?;
+    let mut f = t.prepare_polywan(&stack(fam, &ab()))?;
     let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
     let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
-    f.write_config(&ftr::config(
+    f.write_config(&polywan::config(
         &ab(),
         stack_families(fam),
         &HealthSpec::fast(),
@@ -2138,7 +2142,7 @@ fn as47_warm_restart_adding_an_uplink(fam: Family) -> Result<()> {
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     f.stop()?;
-    f.write_config(&ftr::config(
+    f.write_config(&polywan::config(
         &abc(),
         stack_families(fam),
         &HealthSpec::fast(),
@@ -2175,7 +2179,7 @@ fn as31_path_mtu_discovery_through_pppoe_and_a_provider_bottleneck(fam: Family) 
         UplinkSpec::new(Uplink::A, 1).priority(Some(2)),
         UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
     ];
-    let f = t.start_ftr(&ftr::family(&c_first, fam))?;
+    let f = t.start_polywan(&polywan::family(&c_first, fam))?;
     f.wait_installed(&t)?;
     assert_eq!(balancing_members(&t, fam)?, ["ppp0"]);
     let r = t.bulk(
@@ -2195,7 +2199,7 @@ fn as31_path_mtu_discovery_through_pppoe_and_a_provider_bottleneck(fam: Family) 
         UplinkSpec::new(Uplink::B, 2).priority(Some(2)),
         UplinkSpec::new(Uplink::C, 3).priority(Some(2)),
     ];
-    f.write_config(&ftr::family(&a_first, fam))?;
+    f.write_config(&polywan::family(&a_first, fam))?;
     f.reload()?;
     wait_members(&t, fam, &["wana"], Duration::from_secs(10))?;
     t.ns(Node::IspA).ip("link set core mtu 1300")?;
@@ -2230,7 +2234,7 @@ fn valid_lft(t: &Topology, u: Uplink) -> Result<Option<u64>> {
         .find_map(|a| a.valid_lft))
 }
 
-/// AS-44 (IPv4 parts): the router boots with FTR installed before any uplink
+/// AS-44 (IPv4 parts): the router boots with PolyWAN installed before any uplink
 /// is configured (no lease, no global address, no default route, empty
 /// active set); then DHCPv4 acquisition (A, B) and PPPoE negotiation (C)
 /// succeed, the unicast renewal to the on-link server succeeds (A), and with
@@ -2247,10 +2251,13 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
         assert_eq!(t.uplink_address(u, Family::V4)?, None, "{u} has no address yet");
         assert_eq!(t.os_default_route(u, Family::V4)?, None, "{u} has no default route yet");
     }
-    let f = t.start_ftr(&ftr::ipv4(&abc()))?;
+    let f = t.start_polywan(&polywan::ipv4(&abc()))?;
     f.wait_installed(&t)?;
     assert!(balancing_members(&t, Family::V4)?.is_empty(), "empty active set");
-    assert!(!ftr_rules(&t, Family::V4)?.is_empty(), "FTR's rules are installed");
+    assert!(
+        !polywan_rules(&t, Family::V4)?.is_empty(),
+        "PolyWAN's rules are installed"
+    );
     // Requests to the DHCP servers, by destination: unicast (renewals) and
     // broadcast (discovery, selection, rebinding). Provider B drops unicast
     // renewals, so its client must rebind.
@@ -2300,7 +2307,7 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
     Ok(())
 }
 
-/// The daemon's failure-injection control file (`FTR_TEST_FAULTS`, a test
+/// The daemon's failure-injection control file (`POLYWAN_TEST_FAULTS`, a test
 /// hook of the `test-hooks` build): armed with n, the next n steps of the
 /// reconciler or of cleanup succeed and the following ones fail until it is
 /// disarmed; the steps are listed in `<file>.steps`.
@@ -2309,9 +2316,9 @@ struct Faults {
 }
 
 impl Faults {
-    fn new(f: &mut ftr::Ftr) -> Faults {
+    fn new(f: &mut polywan::Polywan) -> Faults {
         let path = f.dir.join("faults");
-        f.set_env("FTR_TEST_FAULTS", &path.display().to_string());
+        f.set_env("POLYWAN_TEST_FAULTS", &path.display().to_string());
         Faults { path }
     }
 
@@ -2373,8 +2380,8 @@ fn wrong_uplink_counter(t: &Topology) -> Result<()> {
             .collect();
         rules += &format!(
             "    ct mark & {:#x} == {:#x} oifname {{ {} }} counter name c\n",
-            ftr::mask(),
-            ftr::encode(id),
+            polywan::mask(),
+            polywan::encode(id),
             others.join(", ")
         );
     }
@@ -2384,7 +2391,7 @@ fn wrong_uplink_counter(t: &Topology) -> Result<()> {
 }
 
 /// State for an AS-27 failure message.
-fn diagnose(t: &Topology, f: &ftr::Ftr, faults: &Faults, k: usize) -> String {
+fn diagnose(t: &Topology, f: &polywan::Polywan, faults: &Faults, k: usize) -> String {
     let log = f.log();
     let tail: Vec<&str> = log.lines().rev().take(40).collect();
     format!(
@@ -2392,7 +2399,7 @@ fn diagnose(t: &Topology, f: &ftr::Ftr, faults: &Faults, k: usize) -> String {
         faults.steps(),
         balancing_members(t, Family::V4),
         path_route(t, Family::V4, 1003),
-        ftr_rules(t, Family::V4).map(|r| r.join("\n")).unwrap_or_default(),
+        polywan_rules(t, Family::V4).map(|r| r.join("\n")).unwrap_or_default(),
         tail.into_iter().rev().collect::<Vec<_>>().join("\n")
     )
 }
@@ -2429,8 +2436,8 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
     // A path whose route failed is not ready until a discovery change or the
     // next full reconciliation (FR-DISC-7).
     let routing = "reconcile_interval = \"10s\"";
-    let with_c = ftr::config(&abc(), stack_families(fam), &health, routing, "");
-    let without_c = ftr::config(&ab(), stack_families(fam), &health, routing, "");
+    let with_c = polywan::config(&abc(), stack_families(fam), &health, routing, "");
+    let without_c = polywan::config(&ab(), stack_families(fam), &health, routing, "");
     // Leaks of every managed family (the IPv6 variant is dual-stack).
     let leaks = || -> Result<u64> {
         let mut n = 0;
@@ -2439,7 +2446,7 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
         }
         Ok(n)
     };
-    let mut f = t.prepare_ftr(&with_c)?;
+    let mut f = t.prepare_polywan(&with_c)?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -2474,7 +2481,7 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
         f.reload()
     };
     let c_gone = || -> Result<bool> {
-        Ok(path_route(&t, fam, 1003)?.is_empty() && !ftr_rules(&t, fam)?.iter().any(|r| r.contains("lookup 1003")))
+        Ok(path_route(&t, fam, 1003)?.is_empty() && !polywan_rules(&t, fam)?.iter().any(|r| r.contains("lookup 1003")))
     };
     // A secondary address on C.
     let (secondary, len) = match fam {
@@ -2482,7 +2489,7 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
         Family::V6 => ("2001:db8:c:ffff::77", "64 nodad"),
     };
     let has_source = || -> Result<bool> {
-        Ok(ftr_rules(&t, fam)?
+        Ok(polywan_rules(&t, fam)?
             .iter()
             .any(|r| r.contains(&format!("from {secondary} "))))
     };
@@ -2619,7 +2626,7 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as27_a_failing_interface_setting_does_not_hold_back_failover() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&abc()))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -2659,7 +2666,7 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
         UplinkSpec::new(Uplink::B, 2),
         UplinkSpec::new(Uplink::C, 3),
     );
-    let mut f = t.prepare_ftr(&ftr::ipv4(&[a.clone(), c.clone()]))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&[a.clone(), c.clone()]))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -2672,8 +2679,8 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
     })?;
     assert_eq!(balancing_members(&t, Family::V4)?, ["wana"], "C is not ready");
     let svm = || t.router().sysctl_get("net.ipv4.conf.wanb.src_valid_mark");
-    assert_eq!(svm()?, "0", "B is not FTR's yet");
-    f.write_config(&ftr::ipv4(&[a.clone(), b.clone(), c]))?;
+    assert_eq!(svm()?, "0", "B is not PolyWAN's yet");
+    f.write_config(&polywan::ipv4(&[a.clone(), b.clone(), c]))?;
     f.reload()?;
     // Well before C's retry: a shared backoff would hold B back.
     t.wait_for("B's settings", Duration::from_secs(4), || Ok(svm()? == "1"))?;
@@ -2683,7 +2690,7 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
         Ok(joined)
     })?;
     // Before C's next retry: a kept retry would wait for it.
-    f.write_config(&ftr::ipv4(&[a, b]))?;
+    f.write_config(&polywan::ipv4(&[a, b]))?;
     f.reload()?;
     f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(4))?;
     faults.disarm()?;
@@ -2698,7 +2705,7 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
 #[ignore = "needs root and network namespaces"]
 fn as27_disabling_sysctl_management_drops_the_backoffs() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&abc()))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -2713,7 +2720,7 @@ fn as27_disabling_sysctl_management_drops_the_backoffs() -> Result<()> {
     t.wait_for("C's settings failing repeatedly", Duration::from_secs(40), || {
         Ok(failures("ppp0") >= 5)
     })?;
-    // A global setting changed behind FTR's back, then a reload: four
+    // A global setting changed behind PolyWAN's back, then a reload: four
     // failures put its next retry about 8 s away, and hold back the pass.
     t.router()
         .run("sh", ["-c", "echo 0 > /proc/sys/net/ipv4/fib_multipath_hash_policy"])?;
@@ -2723,12 +2730,12 @@ fn as27_disabling_sysctl_management_drops_the_backoffs() -> Result<()> {
         Duration::from_secs(20),
         || Ok(failures("global") >= 4),
     )?;
-    let text = ftr::config(&abc(), &[Family::V4], &HealthSpec::fast(), "manage_sysctls = false", "");
+    let text = polywan::config(&abc(), &[Family::V4], &HealthSpec::fast(), "manage_sysctls = false", "");
     f.write_config(&text)?;
     f.reload()?;
     f.wait_log(&t, "desired state fully applied", 1, Duration::from_secs(4))?;
     assert!(
-        f.log().contains("fib_multipath_hash_policy is 0, FTR needs"),
+        f.log().contains("fib_multipath_hash_policy is 0, PolyWAN needs"),
         "only checked: {}",
         f.log()
     );
@@ -2745,7 +2752,7 @@ fn as27_disabling_sysctl_management_drops_the_backoffs() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as27_startup_with_an_interface_setting_failing() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&abc()))?;
     let faults = Faults::new(&mut f);
     faults.arm_matching("sysctls (wanb)")?;
     f.start(&t)?;
@@ -2778,13 +2785,13 @@ fn as27_startup_with_an_interface_setting_failing() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as27_startup_with_a_global_setting_failing() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&ab()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
     let faults = Faults::new(&mut f);
     faults.arm_matching("sysctls (global)")?;
     f.start(&t)?;
     f.wait_log(&t, "apply_failed", 2, Duration::from_secs(10))?;
     assert!(
-        ftr_rules(&t, Family::V4)?.is_empty(),
+        polywan_rules(&t, Family::V4)?.is_empty(),
         "no rule before the global settings"
     );
     assert!(
@@ -2805,7 +2812,7 @@ fn as27_startup_with_a_global_setting_failing() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as27_a_recreated_interface_gets_its_settings_at_once() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let mut f = t.prepare_polywan(&polywan::ipv4(&abc()))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -2844,15 +2851,15 @@ fn as27_cleanup_step_by_step() -> Result<()> {
     t.router().ip("rule add pref 950 lookup 5")?;
     t.router().sh(&flowtable("unrelated", "lo"))?;
     let foreign = foreign_objects(&t)?;
-    let config = ftr::ipv4(&abc());
-    let mut f = t.prepare_ftr(&config)?;
+    let config = polywan::ipv4(&abc());
+    let mut f = t.prepare_polywan(&config)?;
     let faults = Faults::new(&mut f);
     let mut order = Vec::new();
     for k in 0.. {
         f.start(&t)?;
         f.wait_installed(&t)?;
         f.stop()?;
-        let installed = ftr_rules(&t, Family::V4)?.len();
+        let installed = polywan_rules(&t, Family::V4)?.len();
         faults.arm(k)?;
         let out = f.cli_config(&["cleanup"])?;
         let steps = faults.steps();
@@ -2860,21 +2867,21 @@ fn as27_cleanup_step_by_step() -> Result<()> {
         if out.status.success() {
             assert!(!steps.iter().any(|s| s.ends_with(" failed")), "{steps:?}");
             order = steps;
-            assert!(ftr_rules(&t, Family::V4)?.is_empty());
+            assert!(polywan_rules(&t, Family::V4)?.is_empty());
             break;
         }
         assert_eq!(steps.len(), k + 1, "{steps:?}");
         let removed = steps.iter().filter(|s| s.starts_with("delete ipv4 rule")).count();
         let removed = removed - usize::from(steps[k].starts_with("delete ipv4 rule"));
         assert_eq!(
-            ftr_rules(&t, Family::V4)?.len(),
+            polywan_rules(&t, Family::V4)?.len(),
             installed - removed,
             "after {k} steps: {steps:?}"
         );
         let nft_gone = k > 0;
         assert_eq!(
             t.router()
-                .output("nft", ["list", "table", "inet", "fault_tolerant_router"])?
+                .output("nft", ["list", "table", "inet", "polywan"])?
                 .status
                 .success(),
             !nft_gone,
@@ -2882,7 +2889,7 @@ fn as27_cleanup_step_by_step() -> Result<()> {
         );
         let out = f.cli_config(&["cleanup"])?;
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(ftr_rules(&t, Family::V4)?.is_empty(), "a second cleanup completes");
+        assert!(polywan_rules(&t, Family::V4)?.is_empty(), "a second cleanup completes");
         assert_eq!(foreign_objects(&t)?, foreign, "foreign objects untouched");
     }
     assert_eq!(foreign_objects(&t)?, foreign, "foreign objects untouched");
@@ -2952,7 +2959,7 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let t = build();
-    let mut f = t.prepare_ftr(&stack(fam, &ab()))?;
+    let mut f = t.prepare_polywan(&stack(fam, &ab()))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -3061,7 +3068,7 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as36_ipv6_update_failing_after_the_first_insertion() -> Result<()> {
     let t = build();
-    let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
+    let mut f = t.prepare_polywan(&polywan::family(&ab(), Family::V6))?;
     let faults = Faults::new(&mut f);
     f.start(&t)?;
     f.wait_installed(&t)?;

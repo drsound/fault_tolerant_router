@@ -13,9 +13,9 @@ use testbed::traffic::tally;
 use testbed::{Options, Outcome, PingOutcome, Topology, netns, topology};
 
 fn options() -> Options {
-    let bin = std::env::var_os("FTR_TESTBED_BIN")
+    let bin = std::env::var_os("POLYWAN_TESTBED_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ftr-testbed")));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_polywan-testbed")));
     Options {
         agent_bin: bin,
         ..Options::default()
@@ -40,7 +40,7 @@ fn router_ping(t: &Topology, uplink: Uplink, dst: IpAddr) -> Result<bool> {
 }
 
 /// Steers LAN traffic of both families through one uplink with a rule and
-/// a table outside FTR's default ranges (priority 90, table 90), and
+/// a table outside PolyWAN's default ranges (priority 90, table 90), and
 /// masquerades it: these checks of the harness run without the daemon,
 /// which routes only IPv4 until M2.
 fn steer_lan(t: &Topology, uplink: Uplink) -> Result<()> {
