@@ -6,6 +6,7 @@ use netlink_packet_route::route::{RouteMessage, RouteType};
 use super::*;
 use crate::config;
 use crate::model::UplinkId;
+use crate::netlink::NexthopMessage;
 use crate::netlink::msg::{ObservedHop, ObservedLink};
 
 const CONFIG: &str = r#"version = 2
@@ -133,7 +134,7 @@ fn key(id: u8) -> PathKey {
 }
 
 fn run(cfg: &Config, s: &System) -> BTreeMap<PathKey, Discovered> {
-    discover(cfg, s, &BTreeMap::new(), 249)
+    discover(cfg, s, 249)
 }
 
 #[test]
@@ -223,19 +224,78 @@ fn multipath_defaults_and_nexthop_objects() {
     r.nexthop_id = Some(7);
     s.insert_route(&scope(), r);
     assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 33])));
-    let objects = [(
+    let object = NexthopMessage {
+        id: 7,
+        ifindex: Some(5),
+        gateway: Some(v4([192, 0, 2, 45])),
+        ..NexthopMessage::default()
+    };
+    s.nexthops.insert(7, object.clone());
+    assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 45])));
+    // A dead or linkdown object is not used.
+    s.nexthops.insert(
         7,
-        NexthopObject {
-            ifindex: 5,
-            gateway: Some(v4([192, 0, 2, 45])),
-            onlink: false,
+        NexthopMessage {
+            dead: true,
+            ..object.clone()
         },
-    )]
-    .into();
-    assert_eq!(
-        discover(&cfg, &s, &objects, 249)[&key(1)].ready.unwrap().gateway,
-        Some(v4([192, 0, 2, 45]))
     );
+    assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 33])));
+    s.nexthops.insert(
+        7,
+        NexthopMessage {
+            linkdown: true,
+            ..object
+        },
+    );
+    assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 33])));
+}
+
+#[test]
+fn nexthop_groups_are_never_used() {
+    let cfg = config::parse(CONFIG_V6).unwrap();
+    let mut s = system6();
+    s.routes.retain(|_, r| !r.is_default());
+    // `default nhid 20` over the members 10 (wana) and 11 (wanb), as the
+    // kernel dumps it: the resolved members as multipath next hops.
+    let mut r = ra_route(5, "fe80::1", 600, 0);
+    r.nexthops.push(ObservedHop {
+        ifindex: 6,
+        gateway: Some(v6("fe80::2")),
+        weight: 1,
+        onlink: false,
+        dead: false,
+        linkdown: false,
+    });
+    r.nexthop_id = Some(20);
+    s.insert_route(&scope(), r);
+    s.nexthops.insert(
+        20,
+        NexthopMessage {
+            id: 20,
+            group: vec![10, 11],
+            ..NexthopMessage::default()
+        },
+    );
+    let d = run(&cfg, &s);
+    assert_eq!(d[&key6(1)].ready, Err(Reason::GatewayLost));
+    assert!(d[&key6(1)].group_only && d[&key6(2)].group_only && !d[&key6(3)].group_only);
+    // A single object on A makes A ready; the group stays unused for B.
+    let mut r = ra_route(5, "fe80::1", 512, 0);
+    r.nexthop_id = Some(10);
+    s.insert_route(&scope(), r);
+    s.nexthops.insert(
+        10,
+        NexthopMessage {
+            id: 10,
+            ifindex: Some(5),
+            gateway: Some(v6("fe80::9")),
+            ..NexthopMessage::default()
+        },
+    );
+    let d = run(&cfg, &s);
+    assert_eq!(d[&key6(1)].ready.unwrap().gateway, Some(v6("fe80::9")));
+    assert!(!d[&key6(1)].group_only && d[&key6(2)].group_only);
 }
 
 #[test]
@@ -435,6 +495,9 @@ fn ipv6_point_to_point_paths_need_a_gateway() {
     let cfg = config::parse(CONFIG_V6).unwrap();
     let mut s = system6();
     assert_eq!(run(&cfg, &s)[&key6(3)].ready, Err(Reason::AddressLost));
+    // No Router Advertisement: neither address nor gateway (FR-SYS-3).
+    assert!(run(&cfg, &s)[&key6(3)].gateway_missing);
+    assert!(!run(&cfg, &s)[&key6(1)].gateway_missing);
     let g = addr6(9, "2001:db8:c:ffff::10", 0, AddressFlags::empty());
     s.addresses.insert((g.index, g.address), g);
     // Unlike IPv4, no device-only next hop (Q12).
@@ -442,6 +505,11 @@ fn ipv6_point_to_point_paths_need_a_gateway() {
     s.insert_route(&scope(), ra_route(9, "fe80::1", 1024, 0));
     let r = run(&cfg, &s)[&key6(3)].ready.unwrap();
     assert_eq!((r.ifindex, r.gateway), (9, Some(v6("fe80::1"))));
+    assert!(!run(&cfg, &s)[&key6(3)].gateway_missing);
+    // Without carrier, nothing is awaited.
+    s.links.get_mut(&9).unwrap().lower_up = false;
+    s.routes.clear();
+    assert!(!run(&cfg, &s)[&key6(3)].gateway_missing);
 }
 
 #[test]

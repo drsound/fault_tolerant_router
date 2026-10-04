@@ -77,9 +77,8 @@ priority = 1
 "#;
 
 async fn rules(c: &Client, f: Family) -> Vec<ObservedRule> {
-    let d = c.dump(msg::rule_dump(f)).await.unwrap();
-    d.messages
-        .iter()
+    let d = c.dump(msg::rule_dump(f).into()).await.unwrap();
+    d.routing()
         .filter_map(|m| match m {
             RouteNetlinkMessage::NewRule(r) => ObservedRule::parse(r),
             _ => None,
@@ -88,9 +87,8 @@ async fn rules(c: &Client, f: Family) -> Vec<ObservedRule> {
 }
 
 async fn routes(c: &Client, f: Family, table: u32) -> Vec<ObservedRoute> {
-    let d = c.dump(msg::route_dump(f, Some(table))).await.unwrap();
-    d.messages
-        .iter()
+    let d = c.dump(msg::route_dump(f, Some(table)).into()).await.unwrap();
+    d.routing()
         .filter_map(|m| match m {
             RouteNetlinkMessage::NewRoute(r) => ObservedRoute::parse(r),
             _ => None,
@@ -282,11 +280,10 @@ async fn links_and_addresses_are_parsed() {
     let (d1, _) = topology();
     let c = Client::new().unwrap();
     let links: Vec<ObservedLink> = c
-        .dump(msg::link_dump())
+        .dump(msg::link_dump().into())
         .await
         .unwrap()
-        .messages
-        .iter()
+        .routing()
         .filter_map(|m| match m {
             RouteNetlinkMessage::NewLink(l) => ObservedLink::parse(l),
             _ => None,
@@ -297,9 +294,9 @@ async fn links_and_addresses_are_parsed() {
     assert!(l.up && !l.point_to_point);
     let mut seen = BTreeSet::new();
     for f in Family::ALL {
-        for m in c.dump(msg::address_dump(f)).await.unwrap().messages {
+        for m in c.dump(msg::address_dump(f).into()).await.unwrap().routing() {
             if let RouteNetlinkMessage::NewAddress(a) = m {
-                let a = ObservedAddress::parse(&a).unwrap();
+                let a = ObservedAddress::parse(a).unwrap();
                 if a.index == d1 && a.global() {
                     assert!(!a.tentative(), "nodad");
                     seen.insert(a.address.to_string());
@@ -308,4 +305,65 @@ async fn links_and_addresses_are_parsed() {
         }
     }
     assert_eq!(seen, ["192.0.2.2", "2001:db8:1::2"].map(String::from).into());
+}
+
+/// Nexthop object messages, which FTR parses itself (FR-DISC-3, IMPL-2):
+/// a dump and the notifications of creation, replacement and deletion of
+/// single objects and groups, and the routes that use them.
+#[tokio::test]
+#[ignore = "needs root in a private network namespace"]
+async fn nexthop_objects_are_dumped_and_notified() {
+    use fault_tolerant_router::netlink::{Message, Notification, Subscription, groups};
+    private_netns();
+    let (d1, d2) = topology();
+    let mut sub = Subscription::new(&groups::ALL, 1 << 20).unwrap();
+    ip("nexthop add id 10 via fe80::1 dev d1");
+    ip("nexthop add id 11 via fe80::2 dev d2 onlink");
+    ip("nexthop add id 20 group 10/11");
+    ip("nexthop add id 30 via 192.0.2.1 dev d1");
+    ip("-6 route add default nhid 10 metric 512");
+    let c = Client::new().unwrap();
+    let dump = c.dump(Message::GetNexthops).await.unwrap();
+    let objects: Vec<_> = dump
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::NewNexthop(n) => Some(n.clone()),
+            _ => None,
+        })
+        .collect();
+    let by_id = |id: u32| {
+        objects
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("{id} in {objects:?}"))
+    };
+    let ll1: IpAddr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into();
+    assert_eq!((by_id(10).ifindex, by_id(10).gateway), (Some(d1), Some(ll1)));
+    assert!(by_id(11).onlink && by_id(11).ifindex == Some(d2));
+    assert_eq!(by_id(20).group, vec![10, 11]);
+    assert_eq!(by_id(30).gateway, Some(Ipv4Addr::new(192, 0, 2, 1).into()));
+    // The route that uses object 10 carries its id and its resolved hop.
+    let r = routes(&c, Family::V6, 254).await;
+    let def = r.iter().find(|r| r.is_default()).expect("default route");
+    assert_eq!(def.nexthop_id, Some(10));
+    // Notifications: replacement of the gateway, then deletion.
+    ip("nexthop replace id 10 via fe80::9 dev d1");
+    ip("nexthop del id 10");
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while let Ok(Some(n)) = tokio::time::timeout_at(deadline, sub.next()).await {
+        if let Notification::Message { message, .. } = n {
+            match message {
+                Message::NewNexthop(m) if m.id == 10 => seen.push(format!("new {:?}", m.gateway)),
+                Message::DelNexthop(m) if m.id == 10 => seen.push("del".into()),
+                _ => {}
+            }
+        }
+    }
+    let ll9: IpAddr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9).into();
+    assert!(seen.contains(&format!("new {:?}", Some(ll1))), "{seen:?}");
+    assert!(seen.contains(&format!("new {:?}", Some(ll9))), "{seen:?}");
+    assert_eq!(seen.last().map(String::as_str), Some("del"), "{seen:?}");
+    ip("nexthop flush");
 }

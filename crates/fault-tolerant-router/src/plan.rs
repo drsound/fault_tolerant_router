@@ -282,6 +282,26 @@ impl Layout {
     }
 }
 
+/// `input` with `paths` out of the active sets and the policy tables: paths
+/// whose mark assignments are not installed yet (FR-REC-3).
+pub fn without(input: &Input, paths: &BTreeSet<PathKey>) -> Input {
+    let mut i = input.clone();
+    for (k, p) in i.paths.iter_mut() {
+        if paths.contains(k) {
+            p.healthy = false;
+        }
+    }
+    for (family, set) in i.active.iter_mut() {
+        set.retain(|u| {
+            !paths.contains(&PathKey {
+                uplink: *u,
+                family: *family,
+            })
+        });
+    }
+    i
+}
+
 /// Computes the desired artifacts.
 pub fn plan(config: &Config, input: &Input) -> Desired {
     let layout = Layout::of(config);
@@ -531,6 +551,27 @@ priority = 1
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn paths_without_assignments_stay_out_of_balancing_and_policy_tables() {
+        let cfg = two_uplinks();
+        let a4 = PathKey {
+            uplink: id(1),
+            family: Family::V4,
+        };
+        // A family added to uplink 1 has no assignment yet; uplink 1's
+        // other family and uplink 2 are unaffected.
+        let other = PathKey {
+            uplink: id(1),
+            family: Family::V6,
+        };
+        let d = plan(&cfg, &without(&input(), &[a4].into()));
+        assert!(d.routes.contains_key(&(Family::V4, 1001)), "path table kept");
+        assert!(!d.routes.contains_key(&(Family::V4, 1065)));
+        assert!(!d.routes.contains_key(&(Family::V4, 1129)));
+        assert_eq!(d.routes[&(Family::V4, 1000)].nexthops.len(), 1);
+        assert_eq!(plan(&cfg, &without(&input(), &[other].into())), plan(&cfg, &input()));
     }
 
     #[test]

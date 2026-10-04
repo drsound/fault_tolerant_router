@@ -7,18 +7,10 @@ use std::net::IpAddr;
 use crate::config::{AutoOr, Config, PathSettings, Uplink};
 use crate::health::Reason;
 use crate::model::{Family, PathKey};
+use crate::netlink::NexthopMessage;
 use crate::netlink::msg::{ObservedAddress, ObservedRoute, TABLE_MAIN};
 use crate::plan::ReadyPath;
 use crate::system::System;
-
-/// A single (non-group) nexthop object, resolved (FR-DISC-3). Filled by the
-/// observer once nexthop messages are validated (M2, AS-49).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NexthopObject {
-    pub ifindex: u32,
-    pub gateway: Option<IpAddr>,
-    pub onlink: bool,
-}
 
 /// The discovered state of one path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,20 +21,24 @@ pub struct Discovered {
     pub ready: Result<ReadyPath, Reason>,
     /// Local addresses (FR-DISC-2), each with a source rule and a guard.
     pub local_addresses: BTreeSet<IpAddr>,
+    /// `gateway = "auto"` needs a gateway and none is discovered on the
+    /// interface, which is up with carrier, whatever the readiness reason
+    /// (FR-SYS-3: without Router Advertisements an IPv6 uplink lacks its
+    /// address too).
+    pub gateway_missing: bool,
+    /// No usable gateway, and a default route through a nexthop group uses
+    /// the interface: groups are not used, a static gateway is recommended
+    /// (FR-DISC-3).
+    pub group_only: bool,
 }
 
 /// Discovers every configured path.
-pub fn discover(
-    config: &Config,
-    system: &System,
-    nexthops: &BTreeMap<u32, NexthopObject>,
-    own_protocol: u8,
-) -> BTreeMap<PathKey, Discovered> {
+pub fn discover(config: &Config, system: &System, own_protocol: u8) -> BTreeMap<PathKey, Discovered> {
     let mut out = BTreeMap::new();
     for u in &config.uplinks {
         for family in u.families() {
             let p = u.path(family).expect("families() lists configured paths");
-            let d = discover_path(config, system, nexthops, own_protocol, u, family, p);
+            let d = discover_path(config, system, own_protocol, u, family, p);
             out.insert(PathKey { uplink: u.id, family }, d);
         }
     }
@@ -73,7 +69,6 @@ fn usable(a: &ObservedAddress) -> bool {
 fn discover_path(
     config: &Config,
     system: &System,
-    nexthops: &BTreeMap<u32, NexthopObject>,
     own_protocol: u8,
     u: &Uplink,
     family: Family,
@@ -86,6 +81,8 @@ fn discover_path(
             ifindex: None,
             ready: Err(Reason::InterfaceRemoved),
             local_addresses: local,
+            gateway_missing: false,
+            group_only: false,
         };
     };
     let ifindex = link.index;
@@ -96,10 +93,16 @@ fn discover_path(
         .collect();
     let mut local: BTreeSet<IpAddr> = on_link.iter().map(|a| a.address).collect();
     local.extend(static_source_elsewhere(system, p, Some(ifindex)));
+    let automatic = p.gateway == AutoOr::Auto && !(family == Family::V4 && link.point_to_point);
+    let gateway_missing =
+        automatic && link.usable() && auto_gateway(config, system, own_protocol, family, ifindex).is_none();
+    let group_only = gateway_missing && group_routes(config, system, own_protocol, family, ifindex);
     let discovered = |ready| Discovered {
         ifindex: Some(ifindex),
         ready,
         local_addresses: local.clone(),
+        gateway_missing,
+        group_only,
     };
 
     if !link.usable() {
@@ -124,7 +127,7 @@ fn discover_path(
             reachable.then_some((Some(gw), p.gateway_onlink))
         }
         AutoOr::Auto if family == Family::V4 && link.point_to_point => Some((None, false)),
-        AutoOr::Auto => auto_gateway(config, system, nexthops, own_protocol, family, ifindex),
+        AutoOr::Auto => auto_gateway(config, system, own_protocol, family, ifindex),
     };
     match hop {
         Some((gateway, onlink)) => discovered(Ok(ReadyPath {
@@ -194,7 +197,6 @@ fn contains(net: IpAddr, len: u8, a: IpAddr) -> bool {
 fn auto_gateway(
     config: &Config,
     system: &System,
-    nexthops: &BTreeMap<u32, NexthopObject>,
     own_protocol: u8,
     family: Family,
     ifindex: u32,
@@ -205,15 +207,8 @@ fn auto_gateway(
     let mut best: Option<(Rank, (Option<IpAddr>, bool))> = None;
     let now = std::time::Instant::now();
     for (order, table) in tables.iter().enumerate() {
-        for r in system.routes_in(family, *table) {
-            if !r.is_default()
-                || r.kind != netlink_packet_route::route::RouteType::Unicast
-                || r.protocol == own_protocol
-                || r.expired(now)
-            {
-                continue;
-            }
-            for (gw, onlink) in route_gateways(r, nexthops, ifindex) {
+        for r in candidates(system, own_protocol, family, *table, now) {
+            for (gw, onlink) in route_gateways(r, &system.nexthops, ifindex) {
                 let key = (r.metric, -r.preference, order, gw);
                 if best.as_ref().is_none_or(|(k, _)| key < *k) {
                     best = Some((key, (Some(gw), onlink)));
@@ -224,13 +219,53 @@ fn auto_gateway(
     best.map(|(_, hop)| hop)
 }
 
+/// The default routes of a discovery table that discovery considers.
+fn candidates(
+    system: &System,
+    own_protocol: u8,
+    family: Family,
+    table: u32,
+    now: std::time::Instant,
+) -> impl Iterator<Item = &ObservedRoute> {
+    system.routes_in(family, table).filter(move |r| {
+        r.is_default()
+            && r.kind == netlink_packet_route::route::RouteType::Unicast
+            && r.protocol != own_protocol
+            && !r.expired(now)
+    })
+}
+
+/// Whether a default route through a nexthop group uses the interface
+/// (the kernel reports the group's members as resolved next hops).
+fn group_routes(config: &Config, system: &System, own_protocol: u8, family: Family, ifindex: u32) -> bool {
+    let now = std::time::Instant::now();
+    config.routing.discovery_tables.iter().any(|t| {
+        candidates(system, own_protocol, family, *t, now).any(|r| {
+            r.nexthop_id
+                .and_then(|id| system.nexthops.get(&id))
+                .is_some_and(|n| !n.group.is_empty())
+                && r.nexthops.iter().any(|h| h.ifindex == ifindex)
+        })
+    })
+}
+
 /// Usable gateways of a default route on the interface.
-fn route_gateways(r: &ObservedRoute, nexthops: &BTreeMap<u32, NexthopObject>, ifindex: u32) -> Vec<(IpAddr, bool)> {
+fn route_gateways(r: &ObservedRoute, nexthops: &BTreeMap<u32, NexthopMessage>, ifindex: u32) -> Vec<(IpAddr, bool)> {
     if let Some(id) = r.nexthop_id {
         // Recognised by RTA_NH_ID although the kernel also reports the
-        // resolved gateway; only single nexthop objects are used.
+        // resolved gateway; only single nexthop objects are used (an
+        // object the view lacks is not used either).
         return match nexthops.get(&id) {
-            Some(n) if n.ifindex == ifindex => n.gateway.map(|g| vec![(g, n.onlink)]).unwrap_or_default(),
+            Some(n)
+                if n.group.is_empty()
+                    && !n.blackhole
+                    && !n.fdb
+                    && !n.dead
+                    && !n.linkdown
+                    && n.ifindex == Some(ifindex) =>
+            {
+                n.gateway.map(|g| vec![(g, n.onlink)]).unwrap_or_default()
+            }
             _ => Vec::new(),
         };
     }

@@ -244,7 +244,20 @@ where
                 _ => None,
             },
         };
-        crate::test_hooks::step(&op).map_err(fail)?;
+        if let Err(e) = crate::test_hooks::step(&op) {
+            if let Op::ReplaceRoute(r) = &op
+                && crate::test_hooks::empties(&op)
+            {
+                // The outcome of FR-ROUTE-2's IPv6 failure after the first
+                // insertion, which needs an allocation failure in the
+                // kernel: the old route is gone, the new one not installed.
+                let key = msg::route_delete_key(r.family, r.table, protocol);
+                let _ = client
+                    .mutate(RouteNetlinkMessage::DelRoute(key), Mutation::Delete)
+                    .await;
+            }
+            return Err(fail(e));
+        }
         match &op {
             Op::ApplyNft => nft().await.map_err(fail)?,
             _ => {

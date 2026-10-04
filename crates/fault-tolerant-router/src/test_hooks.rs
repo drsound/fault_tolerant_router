@@ -22,8 +22,9 @@ pub fn boottime_shift_ms() -> u64 {
 /// file is rewritten with N - 1; while it holds 0, the step fails with an
 /// injected error, until the file is removed or rewritten. While it holds
 /// `match:TEXT`, the steps whose name contains TEXT fail and the others
-/// proceed. Every step is appended to `<file>.steps`, followed by ` failed`
-/// when it failed.
+/// proceed; `empty:TEXT` is the same, and a failing route replacement also
+/// removes the route first ([`empties`]). Every step is appended to
+/// `<file>.steps`, followed by ` failed` when it failed.
 #[cfg(feature = "test-hooks")]
 pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
     use std::io::Write;
@@ -34,7 +35,10 @@ pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
     let control = std::fs::read_to_string(&path).unwrap_or_default();
     let control = control.trim();
     let failure = || Err(format!("failure injected before {name}"));
-    let result = if let Some(text) = control.strip_prefix("match:") {
+    let result = if let Some(text) = control
+        .strip_prefix("match:")
+        .or_else(|| control.strip_prefix("empty:"))
+    {
         if name.to_string().contains(text) {
             failure()
         } else {
@@ -56,6 +60,26 @@ pub fn step(name: impl std::fmt::Display) -> Result<(), String> {
         let _ = writeln!(f, "{name}{}", if result.is_err() { " failed" } else { "" });
     }
     result
+}
+
+/// Whether a failing step, injected by `empty:TEXT`, also removes the route
+/// it replaces: the empty-table outcome of an IPv6 multipath replacement
+/// that fails after the first insertion (FR-ROUTE-2, AS-36).
+#[cfg(feature = "test-hooks")]
+pub fn empties(name: impl std::fmt::Display) -> bool {
+    let Some(path) = std::env::var_os("FTR_TEST_FAULTS") else {
+        return false;
+    };
+    let control = std::fs::read_to_string(path).unwrap_or_default();
+    control
+        .trim()
+        .strip_prefix("empty:")
+        .is_some_and(|text| name.to_string().contains(text))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn empties(_name: impl std::fmt::Display) -> bool {
+    false
 }
 
 #[cfg(not(feature = "test-hooks"))]

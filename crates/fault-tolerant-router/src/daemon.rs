@@ -18,11 +18,11 @@ use crate::config::{self, Config, FirewallMode, OnShutdown};
 use crate::discover::{self, Discovered};
 use crate::health::{self, Hysteresis, Machine, Reason, Round};
 use crate::model::{Family, FieldValue, PathKey, UplinkId};
-use crate::netlink::{Client, Notification, Subscription, groups};
+use crate::netlink::{Client, Message, Notification, Subscription, groups};
 use crate::nft;
 use crate::nftctl;
 use crate::observer;
-use crate::plan::{self, Desired, Input, Layout, PathInput};
+use crate::plan::{self, Input, Layout, PathInput};
 use crate::probe;
 use crate::reconcile::{self, DiffInput, Failure, Op};
 use crate::select::{self, Candidate};
@@ -44,7 +44,27 @@ struct PathRuntime {
     since_ms: u64,
     generation: u64,
     prober: Option<(probe::Spec, tokio::task::JoinHandle<()>)>,
+    /// Since when an automatic IPv6 gateway is awaited on a usable link,
+    /// and whether the FR-SYS-3 warning was given.
+    gateway_wait: Option<(Instant, bool)>,
 }
+
+impl PathRuntime {
+    fn new(discovered: Option<Discovered>, machine: Machine) -> PathRuntime {
+        PathRuntime {
+            discovered,
+            machine,
+            since_ms: now_ms(),
+            generation: 0,
+            prober: None,
+            gateway_wait: None,
+        }
+    }
+}
+
+/// FR-SYS-3: how long an IPv6 path waits for a discovered gateway, after
+/// startup or after its link comes up, before the warning.
+const GATEWAY_WARNING: Duration = Duration::from_secs(30);
 
 /// Retry state after a failed application (FR-REC-5).
 struct Retry {
@@ -97,15 +117,16 @@ struct Daemon {
     active: BTreeMap<Family, BTreeSet<UplinkId>>,
     drained: BTreeSet<UplinkId>,
     route_failed: BTreeMap<PathKey, String>,
-    nft_applied: Option<(String, BTreeSet<UplinkId>)>,
+    /// The transaction last applied and the paths it assigns.
+    nft_applied: Option<(String, BTreeSet<PathKey>)>,
     nft_listing: Option<serde_json::Value>,
     nft_missing: bool,
-    /// Configured uplinks that FTR's table found at startup already assigns
+    /// Configured paths that FTR's table found at startup already assigns
     /// (warm adoption, FR-REC-8); `None` without such a table. The others
     /// were added while FTR was stopped: like an addition by reload, they
     /// join the balancing and policy routes only after the replacement
     /// installs their assignments (FR-REC-3).
-    nft_adopted: Option<BTreeSet<UplinkId>>,
+    nft_adopted: Option<BTreeSet<PathKey>>,
     retry: Option<Retry>,
     degraded: BTreeSet<&'static str>,
     ownership: BTreeMap<&'static str, Ownership>,
@@ -215,6 +236,7 @@ pub async fn run(opts: Options) -> Result<()> {
         findings.extend(checks::adoptable(&system, layout, cfg.routing.route_protocol));
     }
     findings.extend(checks::downlinks(&system, &cfg));
+    findings.extend(checks::accept_ra(&cfg, sysctl::read));
     if checks::networkd_running() {
         findings.extend(checks::networkd(Path::new("/")));
     }
@@ -276,20 +298,20 @@ pub async fn run(opts: Options) -> Result<()> {
     if d.cfg.firewall.mode == FirewallMode::Managed
         && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
     {
-        // An uplink whose path assignments the table has, for every family
-        // the uplink configures.
+        // The paths whose assignments the table has.
         let mask = d.cfg.routing.fwmark_mask;
         d.nft_adopted = Some(
-            d.cfg
-                .uplinks
-                .iter()
-                .filter(|u| {
-                    Family::ALL.into_iter().filter(|f| u.path(*f).is_some()).all(|f| {
-                        let nfproto = if f == Family::V4 { "ipv4" } else { "ipv6" };
-                        nftctl::assigns(&listing, nfproto, &u.interface, mask.encode(FieldValue::path(u.id)))
-                    })
+            d.configured_paths()
+                .into_iter()
+                .filter(|k| {
+                    let u = d.cfg.uplink(k.uplink).expect("configured");
+                    nftctl::assigns(
+                        &listing,
+                        k.family.key(),
+                        &u.interface,
+                        mask.encode(FieldValue::path(u.id)),
+                    )
                 })
-                .map(|u| u.id)
                 .collect(),
         );
     }
@@ -335,6 +357,7 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     let families: Vec<Family> = Family::ALL.into_iter().filter(|x| cfg.manages(*x)).collect();
     f.extend(checks::routing(&system, layout, cfg.routing.route_protocol, &families));
     f.extend(checks::downlinks(&system, cfg));
+    f.extend(checks::accept_ra(cfg, sysctl::read));
     if checks::networkd_running() {
         f.extend(checks::networkd(Path::new("/")));
     }
@@ -356,6 +379,17 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
         ));
     }
     Ok(f)
+}
+
+/// The likely causes of a missing IPv6 gateway on an interface, from its
+/// Router Advertisement settings (FR-SYS-3).
+fn gateway_causes(interface: &str) -> String {
+    let read = |name: &str| sysctl::read(&format!("net/ipv6/conf/{interface}/{name}")).unwrap_or_default();
+    match (read("accept_ra").as_str(), read("forwarding").as_str()) {
+        ("1", "1") => "accept_ra = 1 makes the kernel ignore Router Advertisements while IPv6 forwarding is enabled; set accept_ra = 2, or let a user-space client handle them".into(),
+        ("0", _) => "accept_ra = 0: the kernel does not process Router Advertisements, so a user-space client (systemd-networkd, NetworkManager) must install the default route; check that it runs and accepts them".into(),
+        _ => "no Router Advertisement with a non-zero router lifetime arrived: the provider may send none, or they are filtered on the link".into(),
+    }
 }
 
 fn report(f: &checks::Findings) -> Result<()> {
@@ -414,8 +448,11 @@ impl Daemon {
                 None
             }
         };
-        let discovered = discover::discover(&self.cfg, &self.system, &BTreeMap::new(), self.protocol);
+        let discovered = discover::discover(&self.cfg, &self.system, self.protocol);
         for (key, d) in discovered {
+            if d.group_only {
+                self.warn_group_only(key);
+            }
             let ready = d.ready.as_ref().ok();
             let warm = checkpoint.as_ref().and_then(|c| {
                 let p = c
@@ -434,16 +471,7 @@ impl Daemon {
             let reason = d.ready.as_ref().err().copied().unwrap_or(Reason::Startup);
             let machine = Machine::new(ready.is_some(), reason, warm);
             info!(uplink = key.uplink.get(), family = %key.family, state = ?machine.state(), warm = warm.is_some(), "initial path state");
-            self.paths.insert(
-                key,
-                PathRuntime {
-                    discovered: Some(d),
-                    machine,
-                    since_ms: now_ms(),
-                    generation: 0,
-                    prober: None,
-                },
-            );
+            self.paths.insert(key, PathRuntime::new(Some(d), machine));
         }
         if let Some(c) = checkpoint {
             let ids = |v: &[u8]| v.iter().filter_map(|i| UplinkId::new(*i)).collect::<BTreeSet<_>>();
@@ -596,8 +624,35 @@ impl Daemon {
         !self.ownership.get(kind).is_some_and(|o| o.conflict)
     }
 
+    /// FR-DISC-3: a path whose only candidate routes use nexthop groups.
+    fn warn_group_only(&self, key: PathKey) {
+        let u = self.cfg.uplink(key.uplink).expect("configured");
+        warn!(
+            uplink = %u.name,
+            family = %key.family,
+            "the only default routes on {} use a nexthop group, which FTR does not use: the path is not ready; configure a static gateway (FR-DISC-3)",
+            u.interface
+        );
+    }
+
     /// Notification handling (§12.2, FR-COEX-3).
-    fn notification(&mut self, message: RouteNetlinkMessage, port: u32, flags: u16) {
+    fn notification(&mut self, message: Message, port: u32, flags: u16) {
+        let message = match message {
+            Message::Route(m) => m,
+            other => {
+                // A deleted nexthop object takes the IPv4 routes that use
+                // it without a notification (FR-COEX-3): re-read them.
+                if let Change::Nexthop { removed: true } = self.system.apply_message(&self.scope, &other) {
+                    for f in Family::ALL {
+                        for t in &self.cfg.routing.discovery_tables {
+                            self.reread.insert((f, *t));
+                        }
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+        };
         if let Some(table) = self.system.stale_after(&self.scope, &message, flags) {
             self.reread.insert(table);
         }
@@ -660,7 +715,7 @@ impl Daemon {
                 }
                 self.dirty = true;
             }
-            Change::Route { .. } | Change::Rule { .. } => self.dirty = true,
+            Change::Route { .. } | Change::Rule { .. } | Change::Nexthop { .. } => self.dirty = true,
             Change::None => {}
         }
     }
@@ -789,10 +844,14 @@ impl Daemon {
     /// Discovery, readiness, probers and active sets; returns the planner
     /// input.
     fn evaluate(&mut self) -> Input {
-        let discovered = discover::discover(&self.cfg, &self.system, &BTreeMap::new(), self.protocol);
+        let discovered = discover::discover(&self.cfg, &self.system, self.protocol);
         let mut input = Input::default();
         for (key, raw) in discovered {
-            let unchanged = self.paths.get(&key).and_then(|p| p.discovered.as_ref()) == Some(&raw);
+            let previous = self.paths.get(&key).and_then(|p| p.discovered.as_ref());
+            let unchanged = previous == Some(&raw);
+            if raw.group_only && !previous.is_some_and(|d| d.group_only) {
+                self.warn_group_only(key);
+            }
             if !unchanged {
                 // FR-DISC-7: installation is retried at each discovery change.
                 self.route_failed.remove(&key);
@@ -821,13 +880,26 @@ impl Daemon {
                 );
                 d.ready = Err(Reason::RouteInstallFailed);
             }
-            let p = self.paths.entry(key).or_insert_with(|| PathRuntime {
-                discovered: None,
-                machine: Machine::new(false, Reason::Startup, None),
-                since_ms: now_ms(),
-                generation: 0,
-                prober: None,
-            });
+            let p = self
+                .paths
+                .entry(key)
+                .or_insert_with(|| PathRuntime::new(None, Machine::new(false, Reason::Startup, None)));
+            if key.family == Family::V6 && raw.gateway_missing {
+                let (since, warned) = p.gateway_wait.get_or_insert((Instant::now(), false));
+                if !*warned && since.elapsed() >= GATEWAY_WARNING {
+                    *warned = true;
+                    let u = self.cfg.uplink(key.uplink).expect("configured");
+                    warn!(
+                        uplink = %u.name,
+                        "no IPv6 default route discovered on {} {} s after startup or after its link came up: {}; a static gateway avoids depending on Router Advertisements (FR-SYS-3)",
+                        u.interface,
+                        GATEWAY_WARNING.as_secs(),
+                        gateway_causes(&u.interface)
+                    );
+                }
+            } else {
+                p.gateway_wait = None;
+            }
             if !unchanged {
                 info!(uplink = key.uplink.get(), family = %key.family, ready = ?raw.ready.as_ref().map(|r| (r.source, r.gateway, r.ifindex)), "path discovery changed");
             }
@@ -927,20 +999,13 @@ impl Daemon {
         }
     }
 
-    fn desired(&self, input: &Input, exclude: &BTreeSet<UplinkId>) -> Desired {
-        if exclude.is_empty() {
-            return plan::plan(&self.cfg, input);
-        }
-        let mut i = input.clone();
-        for (k, p) in i.paths.iter_mut() {
-            if exclude.contains(&k.uplink) {
-                p.healthy = false;
-            }
-        }
-        for set in i.active.values_mut() {
-            set.retain(|u| !exclude.contains(u));
-        }
-        plan::plan(&self.cfg, &i)
+    /// Every configured path.
+    fn configured_paths(&self) -> BTreeSet<PathKey> {
+        self.cfg
+            .uplinks
+            .iter()
+            .flat_map(|u| u.families().map(|family| PathKey { uplink: u.id, family }))
+            .collect()
     }
 
     /// Every scope of the desired settings: the global ones, then each
@@ -1035,16 +1100,18 @@ impl Daemon {
         let input = self.evaluate();
         let managed = self.cfg.firewall.mode == FirewallMode::Managed;
         let transaction = nft::transaction(&self.cfg);
-        let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
+        let configured = self.configured_paths();
         let nft_pending =
             managed && (self.nft_missing || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
-        let new_uplinks: BTreeSet<UplinkId> = match (&self.nft_applied, &self.nft_adopted, managed) {
+        // Paths without assignments yet, also a family added to an existing
+        // uplink, join the balancing and policy routes after them (FR-REC-3).
+        let new_paths: BTreeSet<PathKey> = match (&self.nft_applied, &self.nft_adopted, managed) {
             (Some((_, applied)), _, true) => configured.difference(applied).copied().collect(),
             (None, Some(adopted), true) => configured.difference(adopted).copied().collect(),
             _ => BTreeSet::new(),
         };
-        let desired = self.desired(&input, &BTreeSet::new());
-        let before = self.desired(&input, &new_uplinks);
+        let desired = plan::plan(&self.cfg, &input);
+        let before = plan::plan(&self.cfg, &plan::without(&input, &new_paths));
         let families: Vec<Family> = Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)).collect();
         let ops = reconcile::diff(
             &self.system,
@@ -1168,6 +1235,12 @@ impl Daemon {
     fn failed(&mut self, f: Failure, attempt: String) {
         error!(operation = %f.op, "apply_failed: {}", f.error);
         self.degrade("apply_failed");
+        // FR-ROUTE-2: a failed IPv6 replacement may have left the table
+        // empty (the kernel removes the members it inserted, and the old
+        // route is gone): the view is corrected by a re-read.
+        if let Some((Family::V6, table)) = f.route {
+            self.reread.insert((Family::V6, table));
+        }
         if let Some((family, table)) = f.route
             && let Some(key) = self
                 .paths
@@ -1338,6 +1411,10 @@ impl Daemon {
                 .chain(self.sysctl_retries.values())
                 .map(|r| r.at)
                 .chain(self.next_expiry())
+                .chain(self.paths.values().filter_map(|p| match p.gateway_wait {
+                    Some((since, false)) => Some(since + GATEWAY_WARNING),
+                    _ => None,
+                }))
                 .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
@@ -1380,21 +1457,13 @@ impl Daemon {
 
     fn dry_run(&mut self) -> Result<()> {
         // Cold-start view: every ready path is up (FR-HEALTH-1).
-        let discovered = discover::discover(&self.cfg, &self.system, &BTreeMap::new(), self.protocol);
+        let discovered = discover::discover(&self.cfg, &self.system, self.protocol);
         for (key, d) in discovered {
             let ready = d.ready.is_ok();
             let reason = d.ready.as_ref().err().copied().unwrap_or(Reason::Startup);
             info!(uplink = key.uplink.get(), family = %key.family, ready, reason = %reason, "dry run: path");
-            self.paths.insert(
-                key,
-                PathRuntime {
-                    discovered: Some(d),
-                    machine: Machine::new(ready, reason, None),
-                    since_ms: 0,
-                    generation: 0,
-                    prober: None,
-                },
-            );
+            self.paths
+                .insert(key, PathRuntime::new(Some(d), Machine::new(ready, reason, None)));
         }
         let mut input = Input::default();
         for (key, p) in &self.paths {

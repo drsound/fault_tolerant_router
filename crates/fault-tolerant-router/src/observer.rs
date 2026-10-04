@@ -16,18 +16,18 @@ use netlink_packet_route::RouteNetlinkMessage;
 
 use crate::model::Family;
 use crate::netlink::msg;
-use crate::netlink::{Client, Dump, KernelError};
+use crate::netlink::{Client, Dump, KernelError, Message};
 use crate::system::{Scope, System};
 
 /// Where dumps come from: a netlink socket, or a scripted source in tests.
 pub trait Dumper: Sized {
-    fn dump(&self, filter: RouteNetlinkMessage) -> impl Future<Output = Result<Dump, KernelError>> + Send;
+    fn dump(&self, filter: Message) -> impl Future<Output = Result<Dump, KernelError>> + Send;
     /// A new source for a retry after a deadline (a new socket).
     fn fresh(&self) -> std::io::Result<Self>;
 }
 
 impl Dumper for Client {
-    fn dump(&self, filter: RouteNetlinkMessage) -> impl Future<Output = Result<Dump, KernelError>> + Send {
+    fn dump(&self, filter: Message) -> impl Future<Output = Result<Dump, KernelError>> + Send {
         Client::dump(self, filter)
     }
 
@@ -44,7 +44,7 @@ pub const DUMP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 const DEADLINE_RETRIES: usize = 3;
 
 /// One dump within the deadline, on `c` first and then on new sockets.
-async fn bounded<D: Dumper>(c: &D, filter: &RouteNetlinkMessage) -> Result<Dump, KernelError> {
+async fn bounded<D: Dumper>(c: &D, filter: &Message) -> Result<Dump, KernelError> {
     match tokio::time::timeout(DUMP_DEADLINE, c.dump(filter.clone())).await {
         Ok(r) => return r,
         Err(_) => tracing::warn!(
@@ -65,7 +65,8 @@ async fn bounded<D: Dumper>(c: &D, filter: &RouteNetlinkMessage) -> Result<Dump,
 }
 
 /// A dump, retried while the kernel flags it as interrupted.
-async fn dump<D: Dumper>(c: &D, filter: RouteNetlinkMessage) -> Result<Dump, KernelError> {
+async fn dump<D: Dumper>(c: &D, filter: impl Into<Message>) -> Result<Dump, KernelError> {
+    let filter = filter.into();
     let mut last = bounded(c, &filter).await?;
     for _ in 0..INTERRUPTED_RETRIES {
         if !last.interrupted {
@@ -85,23 +86,24 @@ pub struct View {
     pub interrupted: bool,
 }
 
-/// The complete view: links, addresses, rules and routes of both families.
+/// The complete view: links, nexthop objects (before the routes that use
+/// them), addresses, rules and routes of both families.
 pub async fn full<D: Dumper>(c: &D, scope: &Scope) -> Result<View, KernelError> {
     let mut v = View {
         system: System::default(),
         interrupted: false,
     };
-    let mut filters = vec![msg::link_dump()];
+    let mut filters = vec![msg::link_dump().into(), Message::GetNexthops];
     for f in Family::ALL {
-        filters.push(msg::address_dump(f));
-        filters.push(msg::rule_dump(f));
-        filters.push(msg::route_dump(f, None));
+        filters.push(msg::address_dump(f).into());
+        filters.push(msg::rule_dump(f).into());
+        filters.push(msg::route_dump(f, None).into());
     }
     for filter in filters {
         let d = dump(c, filter).await?;
         v.interrupted |= d.interrupted;
-        for m in d.messages {
-            v.system.apply(scope, &m);
+        for m in &d.messages {
+            v.system.apply_message(scope, m);
         }
     }
     Ok(v)
@@ -123,7 +125,7 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Vie
     for (f, t) in missing_tables {
         // A strict dump of one table is small enough for one batch.
         let d = dump(c, msg::route_dump(f, Some(t))).await?;
-        for m in &d.messages {
+        for m in d.routing() {
             if let RouteNetlinkMessage::NewRoute(_) = m {
                 new.apply(scope, m);
             }
@@ -135,9 +137,16 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Vie
         .any(|o| !new.rules.iter().any(|n| n.message == o.message));
     if rules_missing {
         for f in Family::ALL {
-            for m in dump(c, msg::rule_dump(f)).await?.messages {
-                new.apply(scope, &m);
+            for m in dump(c, msg::rule_dump(f)).await?.routing() {
+                new.apply(scope, m);
             }
+        }
+    }
+    if old.nexthops.keys().any(|id| !new.nexthops.contains_key(id)) {
+        let d = dump(c, Message::GetNexthops).await?;
+        interrupted |= d.interrupted;
+        for m in &d.messages {
+            new.apply_message(scope, m);
         }
     }
     let addresses_missing = old.addresses.keys().any(|k| !new.addresses.contains_key(k));
@@ -145,8 +154,8 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Vie
         for f in Family::ALL {
             let d = dump(c, msg::address_dump(f)).await?;
             interrupted |= d.interrupted;
-            for m in d.messages {
-                new.apply(scope, &m);
+            for m in d.routing() {
+                new.apply(scope, m);
             }
         }
     }
@@ -168,7 +177,8 @@ pub async fn reread<D: Dumper>(
     tables: &[(Family, u32)],
 ) -> Result<(), KernelError> {
     for &(f, t) in tables {
-        let mut messages = dump(c, msg::route_dump(f, Some(t))).await?.messages;
+        let mut messages: Vec<RouteNetlinkMessage> =
+            dump(c, msg::route_dump(f, Some(t))).await?.routing().cloned().collect();
         // Identities, not counts: a dump can repeat one entry and omit
         // another (S3).
         let mut seen = System::default();
@@ -178,7 +188,7 @@ pub async fn reread<D: Dumper>(
             .keys()
             .any(|k| k.0 == f && k.1 == t && !seen.routes.contains_key(k));
         if missing {
-            messages.extend(dump(c, msg::route_dump(f, Some(t))).await?.messages);
+            messages.extend(dump(c, msg::route_dump(f, Some(t))).await?.routing().cloned());
         }
         system.replace_table(scope, f, t, &messages);
     }

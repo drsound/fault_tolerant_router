@@ -20,12 +20,18 @@ use crate::plan::{Action, Rule, RuleKind};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Kind {
     Links,
+    Nexthops,
     Addresses(Family),
     Rules(Family),
     Routes(Family, Option<u32>),
 }
 
-fn kind(m: &RouteNetlinkMessage) -> Kind {
+fn kind(m: &Message) -> Kind {
+    let m = match m {
+        Message::Route(m) => m,
+        Message::GetNexthops => return Kind::Nexthops,
+        other => panic!("unexpected filter {other:?}"),
+    };
     match m {
         RouteNetlinkMessage::GetLink(_) => Kind::Links,
         RouteNetlinkMessage::GetAddress(a) => Kind::Addresses(msg::family(a.header.family).unwrap()),
@@ -65,7 +71,7 @@ impl Fake {
 }
 
 impl Dumper for Fake {
-    fn dump(&self, filter: RouteNetlinkMessage) -> impl Future<Output = Result<Dump, KernelError>> + Send {
+    fn dump(&self, filter: Message) -> impl Future<Output = Result<Dump, KernelError>> + Send {
         let k = kind(&filter);
         let n = {
             let mut c = self.calls.lock().unwrap();
@@ -76,7 +82,10 @@ impl Dumper for Fake {
         let answer = (self.script)(k, n);
         async move {
             match answer {
-                Some((messages, interrupted)) => Ok(Dump { messages, interrupted }),
+                Some((messages, interrupted)) => Ok(Dump {
+                    messages: messages.into_iter().map(Message::Route).collect(),
+                    interrupted,
+                }),
                 None => std::future::pending().await,
             }
         }
@@ -201,7 +210,7 @@ interface = "wanb"
 
 fn gateway(s: &System, id: u8) -> Option<IpAddr> {
     let cfg = config::parse(CONFIG).unwrap();
-    let d = discover::discover(&cfg, s, &BTreeMap::new(), 249);
+    let d = discover::discover(&cfg, s, 249);
     d[&PathKey {
         uplink: UplinkId::new(id).unwrap(),
         family: Family::V4,

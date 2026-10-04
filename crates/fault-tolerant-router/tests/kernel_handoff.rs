@@ -3,7 +3,6 @@
 //! IPv4-only configuration. Run as root under `unshare -n` (see
 //! kernel_netlink.rs).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -87,7 +86,7 @@ async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pen
     };
     let client = Client::new().unwrap();
     let mut system = observer::full(&client, &scope).await.unwrap().system;
-    let discovered = discover::discover(cfg, &system, &BTreeMap::new(), cfg.routing.route_protocol);
+    let discovered = discover::discover(cfg, &system, cfg.routing.route_protocol);
     let mut input = Input::default();
     for (key, d) in &discovered {
         input.paths.insert(

@@ -8,6 +8,7 @@
 //! sequence number only (S3).
 
 pub mod msg;
+pub mod nexthop;
 
 use std::fmt;
 use std::io;
@@ -21,6 +22,8 @@ use netlink_packet_core::{
 use netlink_packet_route::RouteNetlinkMessage;
 use netlink_proto::ConnectionHandle;
 use netlink_sys::{AsyncSocket, SocketAddr, protocols::NETLINK_ROUTE};
+
+pub use nexthop::{Message, NexthopMessage};
 
 /// A failed kernel operation: errno and the extended acknowledgement message
 /// when the kernel sent one (PLAT-1).
@@ -104,17 +107,27 @@ impl Mutation {
 /// The messages of a dump and whether the kernel flagged it as interrupted.
 #[derive(Debug)]
 pub struct Dump {
-    pub messages: Vec<RouteNetlinkMessage>,
+    pub messages: Vec<Message>,
     pub interrupted: bool,
+}
+
+impl Dump {
+    /// The route netlink messages of the dump (all but nexthop objects).
+    pub fn routing(&self) -> impl Iterator<Item = &RouteNetlinkMessage> {
+        self.messages.iter().filter_map(|m| match m {
+            Message::Route(r) => Some(r),
+            _ => None,
+        })
+    }
 }
 
 /// A request socket: dumps and mutations, never subscribed.
 pub struct Client {
-    handle: ConnectionHandle<RouteNetlinkMessage>,
+    handle: ConnectionHandle<Message>,
     port: u32,
     // Kept open: an unsubscribed socket receives nothing unsolicited, but
     // dropping the receiver would make the connection log warnings.
-    _unsolicited: UnboundedReceiver<(NetlinkMessage<RouteNetlinkMessage>, SocketAddr)>,
+    _unsolicited: UnboundedReceiver<(NetlinkMessage<Message>, SocketAddr)>,
 }
 
 impl Client {
@@ -141,11 +154,7 @@ impl Client {
         self.port
     }
 
-    async fn request(
-        &self,
-        msg: RouteNetlinkMessage,
-        flags: u16,
-    ) -> Result<Vec<NetlinkMessage<RouteNetlinkMessage>>, KernelError> {
+    async fn request(&self, msg: Message, flags: u16) -> Result<Vec<NetlinkMessage<Message>>, KernelError> {
         let mut req = NetlinkMessage::from(msg);
         req.header.flags = flags;
         let mut stream = self
@@ -178,12 +187,12 @@ impl Client {
 
     /// Applies one mutation and waits for its acknowledgement.
     pub async fn mutate(&self, msg: RouteNetlinkMessage, kind: Mutation) -> Result<(), KernelError> {
-        self.request(msg, kind.flags()).await.map(|_| ())
+        self.request(Message::Route(msg), kind.flags()).await.map(|_| ())
     }
 
     /// Runs a dump. With strict checking, the header and attributes of
     /// `filter` select what the kernel returns (S3).
-    pub async fn dump(&self, filter: RouteNetlinkMessage) -> Result<Dump, KernelError> {
+    pub async fn dump(&self, filter: Message) -> Result<Dump, KernelError> {
         let replies = self.request(filter, NLM_F_REQUEST | NLM_F_DUMP).await?;
         let interrupted = replies.iter().any(|m| m.header.flags & NLM_F_DUMP_INTR != 0);
         let messages = replies
@@ -224,7 +233,7 @@ pub mod groups {
 #[derive(Debug)]
 pub enum Notification {
     Message {
-        message: RouteNetlinkMessage,
+        message: Message,
         port: u32,
         flags: u16,
     },
@@ -234,9 +243,9 @@ pub enum Notification {
 
 /// A subscribed socket that never sends requests.
 pub struct Subscription {
-    rx: UnboundedReceiver<(NetlinkMessage<RouteNetlinkMessage>, SocketAddr)>,
+    rx: UnboundedReceiver<(NetlinkMessage<Message>, SocketAddr)>,
     // Never used to send: holding it keeps the connection task alive.
-    _handle: ConnectionHandle<RouteNetlinkMessage>,
+    _handle: ConnectionHandle<Message>,
 }
 
 impl Subscription {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{AutoOr, Config};
 use crate::model::{Family, UplinkId};
 use crate::netlink::msg::{ObservedAction, TABLE_MAIN};
 use crate::nftctl;
@@ -247,6 +247,36 @@ pub fn routing(system: &System, layout: Layout, protocol: u8, families: &[crate:
                     r.table, r.protocol
                 ));
             }
+        }
+    }
+    f
+}
+
+/// FR-SYS-3: with IPv6 forwarding, the kernel ignores Router Advertisements
+/// on interfaces with `accept_ra = 1`, so an IPv6 path with `gateway =
+/// "auto"` there would never get its default route. `read` reads a key
+/// below `/proc/sys`; absent interfaces are skipped.
+pub fn accept_ra(config: &Config, read: impl Fn(&str) -> std::io::Result<String>) -> Findings {
+    let mut f = Findings::default();
+    for u in &config.uplinks {
+        if !u.path(Family::V6).is_some_and(|p| p.gateway == AutoOr::Auto) {
+            continue;
+        }
+        if read(&format!("net/ipv6/conf/{}/accept_ra", u.interface))
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            continue;
+        }
+        let enabled = read(&format!("net/ipv6/conf/{}/forwarding", u.interface)).is_ok_and(|v| v == "1");
+        if config.routing.manage_sysctls || enabled {
+            f.warnings.push(format!(
+                "uplink {}: {} has accept_ra = 1, and the kernel ignores Router Advertisements there while IPv6 forwarding is enabled{}: the IPv6 path with gateway = \"auto\" would get no default route. Set accept_ra = 2, or let a user-space client (systemd-networkd, NetworkManager) handle Router Advertisements with accept_ra = 0 (FR-SYS-3)",
+                u.name,
+                u.interface,
+                if enabled { "" } else { ", which FTR enables" }
+            ));
         }
     }
     f
@@ -573,5 +603,30 @@ mod tests {
             "a trailing * is a possible prefix; unrelated devices are fine: {e:?}"
         );
         assert!(e[0].contains("inet f ft") && e[0].contains("\"wan*\"") && e[0].contains("uplink wana"));
+    }
+
+    #[test]
+    fn accept_ra_one_with_forwarding_is_reported() {
+        let text = "version = 2\n[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv6]\nnat = \"masquerade\"\n[[uplink]]\nid = 2\nname = \"b\"\ninterface = \"wanb\"\n[uplink.ipv6]\nnat = \"masquerade\"\ngateway = \"fe80::1\"\n";
+        let cfg = crate::config::parse(text).unwrap();
+        let values = |accept_ra: &'static str, forwarding: &'static str| {
+            move |k: &str| -> std::io::Result<String> {
+                match k {
+                    k if k.ends_with("/accept_ra") => Ok(accept_ra.to_owned()),
+                    k if k.ends_with("/forwarding") => Ok(forwarding.to_owned()),
+                    _ => Err(std::io::ErrorKind::NotFound.into()),
+                }
+            }
+        };
+        // Only the automatic gateway is concerned; FTR enables forwarding.
+        let f = accept_ra(&cfg, values("1", "0"));
+        assert_eq!(f.warnings.len(), 1, "{f:?}");
+        assert!(f.warnings[0].contains("wana has accept_ra = 1") && f.warnings[0].contains("which FTR enables"));
+        assert!(accept_ra(&cfg, values("2", "1")).warnings.is_empty());
+        assert!(accept_ra(&cfg, values("0", "1")).warnings.is_empty());
+        let mut unmanaged = cfg.clone();
+        unmanaged.routing.manage_sysctls = false;
+        assert!(accept_ra(&unmanaged, values("1", "0")).warnings.is_empty());
+        assert_eq!(accept_ra(&unmanaged, values("1", "1")).warnings.len(), 1);
     }
 }

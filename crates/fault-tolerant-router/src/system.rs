@@ -11,6 +11,7 @@ use netlink_packet_route::RouteNetlinkMessage;
 
 use crate::model::Family;
 use crate::netlink::msg::{ObservedAddress, ObservedLink, ObservedRoute, ObservedRule, TABLE_MAIN};
+use crate::netlink::{Message, NexthopMessage};
 
 /// A route's identity in the kernel: (family, table, destination, metric,
 /// next hop). Outside FTR's tables, routes with the same destination and
@@ -55,6 +56,8 @@ pub struct System {
     pub addresses: BTreeMap<(u32, IpAddr), ObservedAddress>,
     pub routes: BTreeMap<RouteKey, ObservedRoute>,
     pub rules: Vec<ObservedRule>,
+    /// Nexthop objects by id (FR-DISC-3).
+    pub nexthops: BTreeMap<u32, NexthopMessage>,
 }
 
 /// What a notification changed, for the consumers that react to events.
@@ -64,6 +67,7 @@ pub enum Change {
     Address(u32),
     Route { family: Family, table: u32, removed: bool },
     Rule { family: Family, removed: bool },
+    Nexthop { removed: bool },
     None,
 }
 
@@ -85,7 +89,23 @@ impl System {
         self.links.values().find(|l| l.name == name)
     }
 
-    /// Applies a dumped or notified message.
+    /// Applies a dumped or notified message, nexthop objects included.
+    pub fn apply_message(&mut self, scope: &Scope, m: &Message) -> Change {
+        match m {
+            Message::Route(r) => self.apply(scope, r),
+            Message::NewNexthop(n) => {
+                self.nexthops.insert(n.id, n.clone());
+                Change::Nexthop { removed: false }
+            }
+            Message::DelNexthop(n) => {
+                self.nexthops.remove(&n.id);
+                Change::Nexthop { removed: true }
+            }
+            Message::GetNexthops => Change::None,
+        }
+    }
+
+    /// Applies a dumped or notified route netlink message.
     pub fn apply(&mut self, scope: &Scope, m: &RouteNetlinkMessage) -> Change {
         match m {
             RouteNetlinkMessage::NewLink(l) => match ObservedLink::parse(l) {
