@@ -178,7 +178,7 @@ pub async fn reread<D: Dumper>(
 ) -> Result<(), KernelError> {
     for &(f, t) in tables {
         let mut messages: Vec<RouteNetlinkMessage> =
-            dump(c, msg::route_dump(f, Some(t))).await?.routing().cloned().collect();
+            dump(c, msg::route_dump(f, Some(t))).await?.into_routing().collect();
         // Identities, not counts: a dump can repeat one entry and omit
         // another (S3).
         let mut seen = System::default();
@@ -188,7 +188,7 @@ pub async fn reread<D: Dumper>(
             .keys()
             .any(|k| k.0 == f && k.1 == t && !seen.routes.contains_key(k));
         if missing {
-            messages.extend(dump(c, msg::route_dump(f, Some(t))).await?.routing().cloned());
+            messages.extend(dump(c, msg::route_dump(f, Some(t))).await?.into_routing());
         }
         system.replace_table(scope, f, t, &messages);
     }

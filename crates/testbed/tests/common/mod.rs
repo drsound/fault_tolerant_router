@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use testbed::ftr::{self, UplinkSpec};
+use testbed::ftr::{self, HealthSpec, UplinkSpec};
 use testbed::plan::{Family, Node, Uplink};
 use testbed::traffic::tally;
 use testbed::{Options, Outcome, Topology};
@@ -30,10 +30,7 @@ pub fn build_with(opts: Options) -> Topology {
 /// the IPv4 variant; both families for the IPv6 variant, so that IPv6's
 /// artifacts coexist with IPv4's (the dual-stack variants of M2).
 pub fn stack(fam: Family, uplinks: &[UplinkSpec]) -> String {
-    match fam {
-        Family::V4 => ftr::ipv4(uplinks),
-        Family::V6 => ftr::dual(uplinks),
-    }
+    ftr::config(uplinks, stack_families(fam), &HealthSpec::fast(), "", "")
 }
 
 /// The families a [`stack`] configuration manages.
@@ -154,15 +151,17 @@ pub fn start_flows(t: &Topology, f: Family, first: u8, count: u8) -> Result<Vec<
         .collect()
 }
 
-/// Stops `flows` and checks that at least one ran on `u` and that every flow
-/// on `u` was uninterrupted (no stall longer than a second): a check that
-/// cannot pass because no flow happened to use `u`.
-pub fn flows_on_continuous(flows: Vec<testbed::traffic::Flow>, u: Uplink) -> Result<()> {
+/// Stops `flows` and checks, for each of `uplinks`, that at least one ran on
+/// it and that every flow on it was uninterrupted (no stall longer than a
+/// second): a check that cannot pass because no flow happened to use it.
+pub fn flows_on_continuous(flows: Vec<testbed::traffic::Flow>, uplinks: &[Uplink]) -> Result<()> {
     let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    let on_u: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(u)).collect();
-    assert!(!on_u.is_empty(), "no flow ran on {u}: {reports:?}");
-    for r in on_u {
-        assert!(r.continuous(Duration::from_secs(1)), "flow on {u} interrupted: {r:?}");
+    for &u in uplinks {
+        let on_u: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(u)).collect();
+        assert!(!on_u.is_empty(), "no flow ran on {u}: {reports:?}");
+        for r in on_u {
+            assert!(r.continuous(Duration::from_secs(1)), "flow on {u} interrupted: {r:?}");
+        }
     }
     Ok(())
 }
@@ -208,11 +207,11 @@ pub fn address(t: &Topology, f: Family, u: Uplink) -> Result<String> {
     Ok(t.uplink_address(u, f)?.map(|a| a.to_string()).unwrap_or_default())
 }
 
-/// TCP destinations `ip:port` (`[ip]:port` for IPv6) on test servers
-/// `first..first+count`.
-pub fn servers(f: Family, first: u8, count: u8) -> Vec<String> {
+/// Destinations `ip:port` (`[ip]:port` for IPv6) on test servers
+/// `first..first+count`, for example on [`testbed::plan::TCP_PORT`].
+pub fn servers(f: Family, first: u8, count: u8, port: u16) -> Vec<String> {
     (first..first + count)
-        .map(|n| SocketAddr::new(testbed::plan::server(f, n), testbed::plan::TCP_PORT).to_string())
+        .map(|n| SocketAddr::new(testbed::plan::server(f, n), port).to_string())
         .collect()
 }
 
@@ -226,4 +225,60 @@ pub fn counter(t: &Topology, name: &str, selector: &str) -> Result<()> {
 
 pub fn counter_value(t: &Topology, name: &str) -> Result<u64> {
     t.router().counter("inet", &format!("t_{name}"), "c")
+}
+
+/// A named counter of table `<family> <table>` in a node's namespace (the
+/// providers' counters of DHCP messages, AS-44).
+pub fn provider_counter(t: &Topology, node: Node, family: &str, table: &str, name: &str) -> Result<u64> {
+    t.ns(node).counter(family, table, name)
+}
+
+/// The IPv6 settings that FTR changes on uplinks A and B and gives back when
+/// it no longer manages IPv6 (AS-45, FR-REC-9), as paths under
+/// `/proc/sys`.
+pub const IPV6_SETTINGS: [&str; 4] = [
+    "net/ipv6/conf/all/forwarding",
+    "net/ipv6/fib_multipath_hash_policy",
+    "net/ipv6/conf/wana/ignore_routes_with_linkdown",
+    "net/ipv6/conf/wanb/ignore_routes_with_linkdown",
+];
+
+/// The values of sysctls in the router.
+pub fn sysctl_values(t: &Topology, keys: &[&str]) -> Result<Vec<String>> {
+    keys.iter().map(|k| t.router().sysctl_get(k)).collect()
+}
+
+/// FTR's IPv6 artifacts in the router, one line each: its IPv6 rules and
+/// routes (protocol 249, in any table) and the IPv6 rules of its nftables
+/// table. Empty when FTR manages no IPv6 (AS-45).
+pub fn ipv6_artifacts(t: &Topology) -> Result<Vec<String>> {
+    let mut left = ftr_rules(t, Family::V6)?;
+    let routes = t
+        .router()
+        .run("ip", ["-6", "route", "show", "table", "all", "proto", "249"])?;
+    let table = t
+        .router()
+        .run("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
+    left.extend(
+        routes
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .chain(table.lines().filter(|l| l.contains("meta nfproto ipv6 ")))
+            .map(str::to_owned),
+    );
+    Ok(left)
+}
+
+/// Starts FTR with `config` while the router holds a foreign object that
+/// collides with it: online `check-config` fails and startup is refused,
+/// both naming `needle` (AS-33).
+pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
+    let mut f = t.prepare_ftr(config)?;
+    let check = f.cli_config(&["check-config"])?;
+    let text = ftr::output_text(&check);
+    assert!(!check.status.success() && text.contains(needle), "check-config: {text}");
+    f.start(t)?;
+    f.wait_exit(t, Duration::from_secs(10))?;
+    assert!(f.log().contains(needle), "expected {needle:?} in:\n{}", f.log());
+    Ok(())
 }

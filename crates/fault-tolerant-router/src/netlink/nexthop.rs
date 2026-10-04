@@ -55,14 +55,8 @@ impl NexthopMessage {
             linkdown: flags & RTNH_F_LINKDOWN != 0,
             ..NexthopMessage::default()
         };
-        let mut off = 8;
-        while off + 4 <= payload.len() {
-            let len = usize::from(u16::from_ne_bytes([payload[off], payload[off + 1]]));
-            let kind = u16::from_ne_bytes([payload[off + 2], payload[off + 3]]) & 0x3fff;
-            if len < 4 || off + len > payload.len() {
-                return Err(format!("nexthop attribute {kind} of length {len} at {off}").into());
-            }
-            let value = &payload[off + 4..off + len];
+        for a in super::attributes(payload, 8) {
+            let (kind, value) = a.map_err(|e| DecodeError::from(format!("nexthop {e}")))?;
             match (kind, value.len()) {
                 (NHA_ID, 4) => m.id = u32::from_ne_bytes(value.try_into().expect("four bytes")),
                 (NHA_OIF, 4) => m.ifindex = Some(u32::from_ne_bytes(value.try_into().expect("four bytes"))),
@@ -89,7 +83,6 @@ impl NexthopMessage {
                 (NHA_FDB, _) => m.fdb = true,
                 _ => {}
             }
-            off += (len + 3) & !3;
         }
         Ok(m)
     }

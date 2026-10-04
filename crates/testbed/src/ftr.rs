@@ -28,21 +28,31 @@ pub fn daemon_bin() -> Result<PathBuf> {
 }
 
 /// One configured uplink of a test configuration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UplinkSpec {
     pub uplink: Uplink,
     pub id: u8,
     pub priority: Option<u16>,
     pub weight: u16,
+    /// The `nat` of the IPv6 section; `None` leaves it out.
+    pub ipv6_nat: Option<&'static str>,
+    /// Settings appended to the IPv4 section and to the IPv6 section.
+    ipv4_settings: String,
+    ipv6_settings: String,
 }
 
 impl UplinkSpec {
+    /// Priority 1, weight 1, and IPv6 paths that masquerade: IPv6 has no
+    /// NAT default (FR-NAT-1) and the LAN prefix is routed by no provider.
     pub fn new(uplink: Uplink, id: u8) -> UplinkSpec {
         UplinkSpec {
             uplink,
             id,
             priority: Some(1),
             weight: 1,
+            ipv6_nat: Some("masquerade"),
+            ipv4_settings: String::new(),
+            ipv6_settings: String::new(),
         }
     }
 
@@ -53,6 +63,26 @@ impl UplinkSpec {
 
     pub fn weight(mut self, w: u16) -> UplinkSpec {
         self.weight = w;
+        self
+    }
+
+    /// The `nat` of the IPv6 path (`None`: no `nat`, an invalid section).
+    pub fn ipv6_nat(mut self, nat: Option<&'static str>) -> UplinkSpec {
+        self.ipv6_nat = nat;
+        self
+    }
+
+    /// Appends settings (TOML lines, for example `gateway = "10.99.0.1"`)
+    /// to the section of the path of `family`.
+    pub fn path(mut self, family: Family, settings: &str) -> UplinkSpec {
+        let text = match family {
+            Family::V4 => &mut self.ipv4_settings,
+            Family::V6 => &mut self.ipv6_settings,
+        };
+        text.push_str(settings);
+        if !settings.ends_with('\n') {
+            text.push('\n');
+        }
         self
     }
 }
@@ -100,20 +130,9 @@ pub fn foreign_bit(n: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// [`ipv4_config`] with fast health settings and nothing else.
+/// [`config`] for IPv4 with fast health settings and nothing else.
 pub fn ipv4(uplinks: &[UplinkSpec]) -> String {
-    ipv4_config(uplinks, &HealthSpec::fast(), "", "")
-}
-
-/// An IPv4 configuration over the given uplinks, with `lan` as downlink.
-/// `extra` is appended verbatim (other tables, routing settings).
-pub fn ipv4_config(uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
-    config(uplinks, &[Family::V4], health, routing, extra)
-}
-
-/// [`config`] for one family.
-pub fn config_for(family: Family, uplinks: &[UplinkSpec], health: &HealthSpec, routing: &str, extra: &str) -> String {
-    config(uplinks, &[family], health, routing, extra)
+    family(uplinks, Family::V4)
 }
 
 /// [`config`] for one family with fast health settings and nothing else.
@@ -127,9 +146,9 @@ pub fn dual(uplinks: &[UplinkSpec]) -> String {
 }
 
 /// A configuration of `families` over the given uplinks, with `lan` as
-/// downlink. IPv6 paths masquerade, since IPv6 has no NAT default (FR-NAT-1)
-/// and the LAN prefix is routed by no provider. `extra` is appended verbatim
-/// (other tables, routing settings).
+/// downlink, and the per-path settings of each [`UplinkSpec`]. `routing`
+/// goes into the `[routing]` table; `extra` is appended verbatim (other
+/// tables).
 pub fn config(uplinks: &[UplinkSpec], families: &[Family], health: &HealthSpec, routing: &str, extra: &str) -> String {
     let mut s = String::from("version = 2\n");
     let mut routing = routing.to_owned();
@@ -153,10 +172,19 @@ pub fn config(uplinks: &[UplinkSpec], families: &[Family], health: &HealthSpec, 
         }
         let _ = writeln!(s, "weight = {}", u.weight);
         for f in families {
-            s += match f {
-                Family::V4 => "[uplink.ipv4]\n",
-                Family::V6 => "[uplink.ipv6]\nnat = \"masquerade\"\n",
-            };
+            match f {
+                Family::V4 => {
+                    s += "[uplink.ipv4]\n";
+                    s += &u.ipv4_settings;
+                }
+                Family::V6 => {
+                    s += "[uplink.ipv6]\n";
+                    if let Some(nat) = u.ipv6_nat {
+                        let _ = writeln!(s, "nat = \"{nat}\"");
+                    }
+                    s += &u.ipv6_settings;
+                }
+            }
         }
     }
     let _ = writeln!(s, "[health]\n{}", health.text);

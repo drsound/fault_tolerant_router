@@ -3,8 +3,9 @@
 //! Only what FTR needs is kept: every route of FTR's tables, default routes
 //! of the discovery tables, connected routes of `main` and every rule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::time::Instant;
 
 use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE};
 use netlink_packet_route::RouteNetlinkMessage;
@@ -150,31 +151,12 @@ impl System {
                 }
                 None => Change::None,
             },
-            RouteNetlinkMessage::NewRoute(r) => match ObservedRoute::parse(r) {
-                Some(mut r) if scope.keeps(&r) => {
-                    let (family, table) = (r.family, r.table);
-                    let key = route_key(scope, &r);
-                    keep_expiry(self.routes.get(&key), &mut r);
-                    self.routes.insert(key, r);
-                    Change::Route {
-                        family,
-                        table,
-                        removed: false,
-                    }
-                }
-                _ => Change::None,
-            },
-            RouteNetlinkMessage::DelRoute(r) => match ObservedRoute::parse(r) {
-                Some(r) if scope.keeps(&r) => {
-                    self.routes.remove(&route_key(scope, &r));
-                    Change::Route {
-                        family: r.family,
-                        table: r.table,
-                        removed: true,
-                    }
-                }
-                _ => Change::None,
-            },
+            RouteNetlinkMessage::NewRoute(r) => {
+                ObservedRoute::parse(r).map_or(Change::None, |r| self.apply_route(scope, r, false))
+            }
+            RouteNetlinkMessage::DelRoute(r) => {
+                ObservedRoute::parse(r).map_or(Change::None, |r| self.apply_route(scope, r, true))
+            }
             RouteNetlinkMessage::NewRule(r) => match ObservedRule::parse(r) {
                 Some(r) => {
                     // The same rule arrives from a dump, from FTR's own
@@ -202,14 +184,35 @@ impl System {
         }
     }
 
+    /// Applies a parsed route, dumped or notified: an addition, or a
+    /// deletion when `deleted`.
+    pub fn apply_route(&mut self, scope: &Scope, mut r: ObservedRoute, deleted: bool) -> Change {
+        if !scope.keeps(&r) {
+            return Change::None;
+        }
+        let (family, table) = (r.family, r.table);
+        let key = route_key(scope, &r);
+        if deleted {
+            self.routes.remove(&key);
+        } else {
+            keep_expiry(self.routes.get(&key).and_then(|o| o.expires_at), &mut r);
+            self.routes.insert(key, r);
+        }
+        Change::Route {
+            family,
+            table,
+            removed: deleted,
+        }
+    }
+
     /// Replaces every route of a family and table with a fresh dump (the
     /// re-reads of §12.2).
     pub fn replace_table(&mut self, scope: &Scope, family: Family, table: u32, dump: &[RouteNetlinkMessage]) {
-        let mut old = BTreeMap::new();
+        let mut expiries: BTreeMap<RouteKey, Instant> = BTreeMap::new();
         self.routes.retain(|k, r| {
             let keep = !(k.0 == family && k.1 == table);
-            if !keep {
-                old.insert(*k, r.clone());
+            if !keep && let Some(t) = r.expires_at {
+                expiries.insert(*k, t);
             }
             keep
         });
@@ -221,37 +224,61 @@ impl System {
                 && scope.keeps(&r)
             {
                 let key = route_key(scope, &r);
-                keep_expiry(old.get(&key), &mut r);
+                keep_expiry(expiries.get(&key).copied(), &mut r);
                 self.routes.insert(key, r);
             }
         }
     }
 
     /// Adds a route as a dump would.
+    #[cfg(test)]
     pub fn insert_route(&mut self, scope: &Scope, r: ObservedRoute) {
         self.routes.insert(route_key(scope, &r), r);
     }
 
     /// The table to re-read after a route notification that can leave a
-    /// stale entry in the view: a replacement or an append outside FTR's
-    /// tables (the kernel drops or merges the old route without a deletion
-    /// notification, in both families), or a deletion that matches no
-    /// entry (one member of a multipath route).
-    pub fn stale_after(&self, scope: &Scope, m: &RouteNetlinkMessage, flags: u16) -> Option<(Family, u32)> {
-        let (r, deleted) = match m {
-            RouteNetlinkMessage::NewRoute(r) => (ObservedRoute::parse(r)?, false),
-            RouteNetlinkMessage::DelRoute(r) => (ObservedRoute::parse(r)?, true),
-            _ => return None,
-        };
-        if !scope.keeps(&r) || scope.ftr_tables.contains(&r.table) {
+    /// stale entry in the view, outside FTR's tables (which hold one route
+    /// each): a replacement when the view holds another route with the same
+    /// destination and metric, which the kernel may have dropped without a
+    /// deletion notification (in both families; replacing the route of the
+    /// same identity is captured exactly by applying the notification); an
+    /// append, which merges into an existing route; a deletion that matches
+    /// no entry (one member of a multipath route). It must be evaluated
+    /// against the view before the notification is applied.
+    pub fn stale_after(&self, scope: &Scope, r: &ObservedRoute, deleted: bool, flags: u16) -> Option<(Family, u32)> {
+        if scope.ftr_tables.contains(&r.table) {
             return None;
         }
+        let key = route_key(scope, r);
         let stale = if deleted {
-            !self.routes.contains_key(&route_key(scope, &r))
+            scope.keeps(r) && !self.routes.contains_key(&key)
+        } else if flags & NLM_F_APPEND != 0 {
+            scope.keeps(r)
+        } else if flags & NLM_F_REPLACE != 0 {
+            // The replaced route has the same destination and metric; only
+            // an entry of the new route's identity is replaced exactly, and
+            // only when the new route is kept.
+            let kept = scope.keeps(r);
+            self.routes
+                .keys()
+                .any(|k| (k.0, k.1, k.2, k.3) == (key.0, key.1, key.2, key.3) && (*k != key || !kept))
         } else {
-            flags & (NLM_F_REPLACE | NLM_F_APPEND) != 0
+            false
         };
         stale.then_some((r.family, r.table))
+    }
+
+    /// The family and table of every route of the view that uses a nexthop
+    /// object, directly or through a group that the view knows contains it.
+    pub fn nexthop_users(&self, id: u32) -> BTreeSet<(Family, u32)> {
+        self.routes
+            .values()
+            .filter(|r| {
+                r.nexthop_id
+                    .is_some_and(|n| n == id || self.nexthops.get(&n).is_some_and(|g| g.group.contains(&id)))
+            })
+            .map(|r| (r.family, r.table))
+            .collect()
     }
 
     pub fn routes_in(&self, family: Family, table: u32) -> impl Iterator<Item = &ObservedRoute> {
@@ -264,10 +291,10 @@ impl System {
 /// `rta_expires` is 0 both for a route without expiry and within a clock
 /// tick of its expiry: a route read again at that moment keeps the expiry
 /// already known when it is due within a second (FR-DISC-5).
-fn keep_expiry(old: Option<&ObservedRoute>, new: &mut ObservedRoute) {
+fn keep_expiry(old: Option<Instant>, new: &mut ObservedRoute) {
     if new.expires_at.is_none()
-        && let Some(t) = old.and_then(|o| o.expires_at)
-        && t <= std::time::Instant::now() + std::time::Duration::from_secs(1)
+        && let Some(t) = old
+        && t <= Instant::now() + std::time::Duration::from_secs(1)
     {
         new.expires_at = Some(t);
     }
@@ -386,23 +413,57 @@ mod tests {
     fn replacements_appends_and_unmatched_deletions_call_for_a_reread() {
         let scope = scope();
         let mut s = System::default();
-        let a = RouteNetlinkMessage::NewRoute(route(254, 5, "fe80::1", 1024));
-        assert_eq!(s.stale_after(&scope, &a, 0x600), None, "a plain addition");
-        s.apply(&scope, &a);
+        let stale = |s: &System, m: RouteMessage, deleted: bool, flags: u16| {
+            s.stale_after(&scope, &ObservedRoute::parse(&m).unwrap(), deleted, flags)
+        };
+        let a = route(254, 5, "fe80::1", 1024);
+        assert_eq!(stale(&s, a.clone(), false, 0x600), None, "a plain addition");
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(a.clone()));
         // The kernel replaced the first route with that metric, whatever
         // its interface, without notifying its removal.
-        let replaced = RouteNetlinkMessage::NewRoute(route(254, 6, "fe80::5", 1024));
-        assert_eq!(s.stale_after(&scope, &replaced, 0x100), Some((Family::V6, 254)));
-        let appended = RouteNetlinkMessage::NewRoute(route(254, 6, "fe80::5", 1024));
-        assert_eq!(s.stale_after(&scope, &appended, 0x800), Some((Family::V6, 254)));
-        let known = RouteNetlinkMessage::DelRoute(route(254, 5, "fe80::1", 1024));
-        assert_eq!(s.stale_after(&scope, &known, 0), None);
-        let unknown = RouteNetlinkMessage::DelRoute(route(254, 7, "fe80::1", 1024));
-        assert_eq!(s.stale_after(&scope, &unknown, 0), Some((Family::V6, 254)));
+        let replaced = route(254, 6, "fe80::5", 1024);
+        assert_eq!(stale(&s, replaced.clone(), false, 0x100), Some((Family::V6, 254)));
+        // The only route with that metric is the one replaced.
+        assert_eq!(stale(&s, a.clone(), false, 0x100), None, "the same route replaced");
+        assert_eq!(
+            stale(&s, route(254, 6, "fe80::5", 512), false, 0x100),
+            None,
+            "another metric"
+        );
+        assert_eq!(stale(&s, replaced, false, 0x800), Some((Family::V6, 254)));
+        assert_eq!(stale(&s, a, true, 0), None, "a known deletion");
+        let unknown = route(254, 7, "fe80::1", 1024);
+        assert_eq!(stale(&s, unknown, true, 0), Some((Family::V6, 254)));
         // FTR's own tables and tables outside the scope never need it.
-        let ftr = RouteNetlinkMessage::NewRoute(route(1000, 6, "fe80::5", 100));
-        assert_eq!(s.stale_after(&scope, &ftr, 0x100), None);
-        let other = RouteNetlinkMessage::NewRoute(route(300, 6, "fe80::5", 1024));
-        assert_eq!(s.stale_after(&scope, &other, 0x100), None);
+        assert_eq!(stale(&s, route(1000, 6, "fe80::5", 100), false, 0x100), None);
+        assert_eq!(stale(&s, route(300, 6, "fe80::5", 1024), false, 0x100), None);
+    }
+
+    #[test]
+    fn the_users_of_a_nexthop_object_include_its_groups_routes() {
+        let scope = scope();
+        let mut s = System::default();
+        let mut direct = route(254, 5, "fe80::1", 1024);
+        direct.attributes.push(RouteAttribute::NhId(10));
+        let mut grouped = route(254, 6, "fe80::2", 1024);
+        grouped.attributes.push(RouteAttribute::NhId(20));
+        grouped.header.address_family = AddressFamily::Inet;
+        grouped.attributes.retain(|a| !matches!(a, RouteAttribute::Gateway(_)));
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(direct));
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(grouped));
+        s.nexthops.insert(
+            20,
+            NexthopMessage {
+                id: 20,
+                group: vec![10, 11],
+                ..NexthopMessage::default()
+            },
+        );
+        assert_eq!(
+            s.nexthop_users(10).into_iter().collect::<Vec<_>>(),
+            [(Family::V4, 254), (Family::V6, 254)]
+        );
+        assert_eq!(s.nexthop_users(11).into_iter().collect::<Vec<_>>(), [(Family::V4, 254)]);
+        assert!(s.nexthop_users(12).is_empty());
     }
 }

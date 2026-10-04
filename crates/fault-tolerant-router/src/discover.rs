@@ -94,8 +94,13 @@ fn discover_path(
     let mut local: BTreeSet<IpAddr> = on_link.iter().map(|a| a.address).collect();
     local.extend(static_source_elsewhere(system, p, Some(ifindex)));
     let automatic = p.gateway == AutoOr::Auto && !(family == Family::V4 && link.point_to_point);
-    let gateway_missing =
-        automatic && link.usable() && auto_gateway(config, system, own_protocol, family, ifindex).is_none();
+    // Evaluated once, so that readiness and the FR-SYS-3 warning agree.
+    let auto_hop = if automatic && link.usable() {
+        auto_gateway(config, system, own_protocol, family, ifindex)
+    } else {
+        None
+    };
+    let gateway_missing = automatic && link.usable() && auto_hop.is_none();
     let group_only = gateway_missing && group_routes(config, system, own_protocol, family, ifindex);
     let discovered = |ready| Discovered {
         ifindex: Some(ifindex),
@@ -127,7 +132,7 @@ fn discover_path(
             reachable.then_some((Some(gw), p.gateway_onlink))
         }
         AutoOr::Auto if family == Family::V4 && link.point_to_point => Some((None, false)),
-        AutoOr::Auto => auto_gateway(config, system, own_protocol, family, ifindex),
+        AutoOr::Auto => auto_hop,
     };
     match hop {
         Some((gateway, onlink)) => discovered(Ok(ReadyPath {

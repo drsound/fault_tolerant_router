@@ -14,8 +14,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::netns;
-use crate::plan::{Node, Uplink};
-use crate::topology::{Topology, chmod_x};
+use crate::plan::{Family, Node, Uplink};
+use crate::topology::{Address, Topology, chmod_x};
 
 /// The address at which provider B's DHCPv6 server takes messages sent by
 /// unicast, announced in the server-unicast option: inside B's prefix and
@@ -124,12 +124,7 @@ impl Topology {
         self.wait_for(
             &format!("a link-local address on {ifc}"),
             Duration::from_secs(10),
-            || {
-                Ok(!r
-                    .ip(&format!("-6 addr show dev {ifc} scope link -tentative"))?
-                    .trim()
-                    .is_empty())
-            },
+            || Ok(self.addresses(ifc, Family::V6, "link")?.iter().any(Address::usable)),
         )?;
         let d = self.dir();
         let log = d.join(format!("dhcpv6-{ifc}.log"));

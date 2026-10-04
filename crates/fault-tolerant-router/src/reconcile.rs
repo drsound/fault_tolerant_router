@@ -245,8 +245,8 @@ where
             },
         };
         if let Err(e) = crate::test_hooks::step(&op) {
-            if let Op::ReplaceRoute(r) = &op
-                && crate::test_hooks::empties(&op)
+            if e.removes_route
+                && let Op::ReplaceRoute(r) = &op
             {
                 // The outcome of FR-ROUTE-2's IPv6 failure after the first
                 // insertion, which needs an allocation failure in the
@@ -256,7 +256,7 @@ where
                     .mutate(RouteNetlinkMessage::DelRoute(key), Mutation::Delete)
                     .await;
             }
-            return Err(fail(e));
+            return Err(fail(e.message));
         }
         match &op {
             Op::ApplyNft => nft().await.map_err(fail)?,

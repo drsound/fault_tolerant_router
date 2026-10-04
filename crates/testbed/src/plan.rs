@@ -141,10 +141,6 @@ impl Uplink {
         }
     }
 
-    pub fn families(self) -> &'static [Family] {
-        &Family::ALL
-    }
-
     /// Metric of the operating-system default route on this uplink.
     pub fn os_metric(self) -> u32 {
         match self {

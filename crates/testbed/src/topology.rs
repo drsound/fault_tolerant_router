@@ -235,11 +235,9 @@ impl Topology {
     }
 
     /// Families configured on an uplink by this run.
-    pub fn families(&self, uplink: Uplink) -> Vec<Family> {
-        uplink
-            .families()
-            .iter()
-            .copied()
+    pub fn families(&self, _uplink: Uplink) -> Vec<Family> {
+        Family::ALL
+            .into_iter()
             .filter(|f| *f == Family::V4 || self.opts.ipv6)
             .collect()
     }
@@ -421,24 +419,21 @@ impl Topology {
         Ok(())
     }
 
+    /// A file of the dnsmasq instance `name` in the run directory:
+    /// `dnsmasq-<name>.<ext>`.
+    fn dnsmasq_file(&self, name: &str, ext: &str) -> PathBuf {
+        self.dir.join(format!("dnsmasq-{name}.{ext}"))
+    }
+
     fn dnsmasq(&self, node: Node, name: &str, extra: &[&str]) -> Result<()> {
-        let d = &self.dir;
-        let mut args: Vec<String> = vec![
-            "--conf-file=/dev/null".into(),
-            "--no-resolv".into(),
-            "--no-hosts".into(),
-            "--port=0".into(),
-            "--user=root".into(),
+        let mut args: Vec<String> = DNSMASQ_ARGS.iter().map(|s| s.to_string()).collect();
+        args.extend([
             "--interface=wan".into(),
-            "--bind-interfaces".into(),
             "--log-dhcp".into(),
-            format!("--pid-file={}", d.join(format!("dnsmasq-{name}.pid")).display()),
-            format!(
-                "--dhcp-leasefile={}",
-                d.join(format!("dnsmasq-{name}.leases")).display()
-            ),
-            format!("--log-facility={}", d.join(format!("dnsmasq-{name}.log")).display()),
-        ];
+            format!("--pid-file={}", self.dnsmasq_file(name, "pid").display()),
+            format!("--dhcp-leasefile={}", self.dnsmasq_file(name, "leases").display()),
+            format!("--log-facility={}", self.dnsmasq_file(name, "log").display()),
+        ]);
         args.extend(extra.iter().map(|s| s.to_string()));
         self.ns(node).run("dnsmasq", &args)?;
         Ok(())
@@ -477,22 +472,17 @@ impl Topology {
     /// the given router lifetime in seconds.
     fn provider_dnsmasq(&self, uplink: Uplink, router_lifetime: u32) -> Result<()> {
         let ra = format!("--ra-param=wan,4,{router_lifetime}");
-        let (name, mut extra) = match uplink {
-            Uplink::A => (
-                "a",
-                vec![
-                    "--dhcp-range=192.0.2.100,192.0.2.199,255.255.255.0,2m",
-                    "--dhcp-option=option:router,192.0.2.1",
-                ],
-            ),
-            Uplink::B => (
-                "b",
-                vec![
-                    "--dhcp-range=100.64.0.100,100.64.0.199,255.255.255.0,2m",
-                    "--dhcp-option=option:router,100.64.0.1",
-                ],
-            ),
-            Uplink::C => bail!("provider C runs a dnsmasq per PPP session"),
+        let name = dnsmasq_name(uplink)?;
+        let mut extra = if uplink == Uplink::A {
+            vec![
+                "--dhcp-range=192.0.2.100,192.0.2.199,255.255.255.0,2m",
+                "--dhcp-option=option:router,192.0.2.1",
+            ]
+        } else {
+            vec![
+                "--dhcp-range=100.64.0.100,100.64.0.199,255.255.255.0,2m",
+                "--dhcp-option=option:router,100.64.0.1",
+            ]
         };
         if self.opts.ipv6 {
             extra.push("--enable-ra");
@@ -510,18 +500,15 @@ impl Topology {
     /// with another router lifetime (AS-28: expiry of the default router).
     /// Leases survive in the lease file.
     pub fn set_router_lifetime(&self, uplink: Uplink, seconds: u32) -> Result<()> {
-        let name = match uplink {
-            Uplink::A => "a",
-            Uplink::B => "b",
-            Uplink::C => bail!("provider C runs a dnsmasq per PPP session"),
-        };
-        let pid_file = self.dir.join(format!("dnsmasq-{name}.pid"));
+        let pid_file = self.dnsmasq_file(dnsmasq_name(uplink)?, "pid");
         let pid = fs::read_to_string(&pid_file)?.trim().to_owned();
         netns::host("kill", ["-TERM", &pid])?;
-        let gone = Instant::now() + Duration::from_secs(5);
-        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < gone {
-            sleep(Duration::from_millis(50));
-        }
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        self.wait_for(
+            &format!("dnsmasq of provider {uplink} to exit"),
+            Duration::from_secs(5),
+            || Ok(!process.exists()),
+        )?;
         self.provider_dnsmasq(uplink, seconds)
     }
 
@@ -562,12 +549,13 @@ impl Topology {
         let dir = self.netns_etc(Node::IspC).join("ppp");
         fs::create_dir_all(&dir)?;
         let d = self.dir.display();
+        let common = DNSMASQ_ARGS.join(" ");
         let up = format!(
             r#"#!/bin/sh
 # ftr-testbed provider C, pppd ipv6-up: $1 is the interface.
 ip -6 addr add 2001:db8:c:ffff::1/64 dev "$1" nodad
-exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
-  --interface="$1" --bind-interfaces --enable-ra --dhcp-range=::,constructor:"$1",ra-only,64 \
+exec dnsmasq {common} \
+  --interface="$1" --enable-ra --dhcp-range=::,constructor:"$1",ra-only,64 \
   --ra-param="$1",4,1800 --pid-file={d}/dnsmasq-c-"$1".pid \
   --dhcp-leasefile={d}/dnsmasq-c.leases --log-facility={d}/dnsmasq-c.log
 "#
@@ -765,8 +753,8 @@ exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
         ));
         rules.push_str("table inet tb_egress {\n  counter leak6 {}\n");
         for u in Uplink::ALL {
-            for f in u.families() {
-                rules.push_str(&format!("  counter {} {{}}\n", counter_name(u, *f)));
+            for f in Family::ALL {
+                rules.push_str(&format!("  counter {} {{}}\n", counter_name(u, f)));
             }
         }
         rules.push_str("  chain post {\n    type filter hook postrouting priority 400; policy accept;\n");
@@ -774,12 +762,12 @@ exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
         // device's own control traffic (DAD, MLD) is not a leak.
         rules.push_str("    oifname \"leak6\" meta nfproto ipv6 ip6 daddr != ff00::/8 counter name \"leak6\"\n");
         for u in Uplink::ALL {
-            for f in u.families() {
-                let proto = if *f == Family::V4 { "ipv4" } else { "ipv6" };
+            for f in Family::ALL {
+                let proto = if f == Family::V4 { "ipv4" } else { "ipv6" };
                 rules.push_str(&format!(
                     "    oifname \"{}\" meta nfproto {proto} counter name \"{}\"\n",
                     u.l3_iface(),
-                    counter_name(u, *f)
+                    counter_name(u, f)
                 ));
             }
         }
@@ -817,14 +805,32 @@ exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
         }
     }
 
+    /// What [`Topology::uplink_address`] and [`Topology::os_default_route`]
+    /// do not find yet, from one listing of the router's addresses and one
+    /// of its default routes per family.
     fn missing(&self) -> Result<Vec<String>> {
+        let r = self.router();
+        let addresses = parse_addresses(&r.ip_json("addr show scope global -tentative")?);
+        let mut routes = Vec::new();
+        for f in Family::ALL {
+            let v = r.ip_json(&format!("{} route show table main default", f.flag()))?;
+            for route in v.as_array().into_iter().flatten() {
+                if let Some(dev) = route["dev"].as_str() {
+                    routes.push((f, dev.to_owned()));
+                }
+            }
+        }
         let mut missing = Vec::new();
         for u in self.uplinks() {
+            let ifc = u.l3_iface();
             for f in self.families(u) {
-                if self.uplink_address(u, f)?.is_none() {
+                if !addresses
+                    .iter()
+                    .any(|(i, a)| i == ifc && Family::of(a.local) == f && a.usable())
+                {
                     missing.push(format!("{u} {f} address"));
                 }
-                if self.os_default_route(u, f)?.is_none() {
+                if !routes.iter().any(|(rf, dev)| *rf == f && dev == ifc) {
                     missing.push(format!("{u} {f} default route"));
                 }
             }
@@ -832,23 +838,25 @@ exec dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --port=0 --user=root \
         Ok(missing)
     }
 
+    /// The router's addresses of a family on an interface, of scope
+    /// `global` or `link`, in the order `ip addr` lists them; none when the
+    /// interface does not exist.
+    pub fn addresses(&self, iface: &str, family: Family, scope: &str) -> Result<Vec<Address>> {
+        let r = self.router();
+        if !iface_exists(&r, iface)? {
+            return Ok(Vec::new());
+        }
+        let v = r.ip_json(&format!("{} addr show dev {iface} scope {scope}", family.flag()))?;
+        Ok(parse_addresses(&v).into_iter().map(|(_, a)| a).collect())
+    }
+
     /// First global, non-tentative address of an uplink, if any.
     pub fn uplink_address(&self, uplink: Uplink, family: Family) -> Result<Option<IpAddr>> {
-        let ifc = uplink.l3_iface();
-        let r = self.router();
-        if !iface_exists(&r, ifc)? {
-            return Ok(None);
-        }
-        let v = r.ip_json(&format!(
-            "{} addr show dev {ifc} scope global -tentative",
-            family.flag()
-        ))?;
-        Ok(v.as_array()
+        Ok(self
+            .addresses(uplink.l3_iface(), family, "global")?
             .into_iter()
-            .flatten()
-            .flat_map(|l| l["addr_info"].as_array().cloned().unwrap_or_default())
-            .filter(|a| a["dadfailed"].as_bool() != Some(true))
-            .find_map(|a| a["local"].as_str().and_then(|s| s.parse().ok())))
+            .find(Address::usable)
+            .map(|a| a.local))
     }
 
     /// The operating-system default route of an uplink in the router's main
@@ -923,6 +931,74 @@ impl Drop for Topology {
         if let Err(e) = self.teardown() {
             eprintln!("ftr-testbed: teardown of run {} failed: {e:#}", self.run_id);
         }
+    }
+}
+
+/// An address of a router interface, as `ip -j addr` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Address {
+    pub local: IpAddr,
+    pub prefixlen: u8,
+    /// Valid lifetime in seconds (4294967295: forever).
+    pub valid_lft: Option<u64>,
+    /// Duplicate address detection has not completed (or failed).
+    pub tentative: bool,
+    pub dadfailed: bool,
+}
+
+impl Address {
+    /// Past duplicate address detection, and not a duplicate.
+    pub fn usable(&self) -> bool {
+        !self.tentative && !self.dadfailed
+    }
+}
+
+/// The addresses of an `ip -j addr show` listing with their interfaces.
+/// iproute2 lists addresses that its filters exclude as empty entries:
+/// they are skipped.
+fn parse_addresses(v: &serde_json::Value) -> Vec<(String, Address)> {
+    let mut out = Vec::new();
+    for link in v.as_array().into_iter().flatten() {
+        let ifname = link["ifname"].as_str().unwrap_or_default();
+        for a in link["addr_info"].as_array().into_iter().flatten() {
+            let (Some(local), Some(prefixlen)) = (
+                a["local"].as_str().and_then(|s| s.parse::<IpAddr>().ok()),
+                a["prefixlen"].as_u64(),
+            ) else {
+                continue;
+            };
+            out.push((
+                ifname.to_owned(),
+                Address {
+                    local,
+                    prefixlen: prefixlen as u8,
+                    valid_lft: a["valid_life_time"].as_u64(),
+                    tentative: a["tentative"].as_bool() == Some(true),
+                    dadfailed: a["dadfailed"].as_bool() == Some(true),
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// The fixed arguments of the providers' dnsmasq instances: no
+/// configuration file, no DNS, bound to the interface they serve.
+const DNSMASQ_ARGS: [&str; 6] = [
+    "--conf-file=/dev/null",
+    "--no-resolv",
+    "--no-hosts",
+    "--port=0",
+    "--user=root",
+    "--bind-interfaces",
+];
+
+/// The name of the dnsmasq instance of provider A or B.
+fn dnsmasq_name(uplink: Uplink) -> Result<&'static str> {
+    match uplink {
+        Uplink::A => Ok("a"),
+        Uplink::B => Ok("b"),
+        Uplink::C => bail!("provider C runs a dnsmasq per PPP session"),
     }
 }
 

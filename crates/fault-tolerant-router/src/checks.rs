@@ -252,6 +252,19 @@ pub fn routing(system: &System, layout: Layout, protocol: u8, families: &[crate:
     f
 }
 
+/// FR-SYS-3: the diagnosis of `accept_ra = 1` on an interface, shared by
+/// the startup check and the warning about a missing gateway.
+fn accept_ra_one(interface: &str, ftr_enables_forwarding: bool) -> String {
+    format!(
+        "{interface} has accept_ra = 1, and the kernel ignores Router Advertisements there while IPv6 forwarding is enabled{}; set accept_ra = 2, or let a user-space client (systemd-networkd, NetworkManager) handle Router Advertisements with accept_ra = 0",
+        if ftr_enables_forwarding {
+            ", which FTR enables"
+        } else {
+            ""
+        }
+    )
+}
+
 /// FR-SYS-3: with IPv6 forwarding, the kernel ignores Router Advertisements
 /// on interfaces with `accept_ra = 1`, so an IPv6 path with `gateway =
 /// "auto"` there would never get its default route. `read` reads a key
@@ -272,14 +285,25 @@ pub fn accept_ra(config: &Config, read: impl Fn(&str) -> std::io::Result<String>
         let enabled = read(&format!("net/ipv6/conf/{}/forwarding", u.interface)).is_ok_and(|v| v == "1");
         if config.routing.manage_sysctls || enabled {
             f.warnings.push(format!(
-                "uplink {}: {} has accept_ra = 1, and the kernel ignores Router Advertisements there while IPv6 forwarding is enabled{}: the IPv6 path with gateway = \"auto\" would get no default route. Set accept_ra = 2, or let a user-space client (systemd-networkd, NetworkManager) handle Router Advertisements with accept_ra = 0 (FR-SYS-3)",
+                "uplink {}: the IPv6 path with gateway = \"auto\" would get no default route: {} (FR-SYS-3)",
                 u.name,
-                u.interface,
-                if enabled { "" } else { ", which FTR enables" }
+                accept_ra_one(&u.interface, !enabled)
             ));
         }
     }
     f
+}
+
+/// FR-SYS-3: the likely causes of a missing IPv6 gateway on an interface,
+/// from its Router Advertisement settings. `read` reads a key below
+/// `/proc/sys`.
+pub fn gateway_causes(interface: &str, read: impl Fn(&str) -> std::io::Result<String>) -> String {
+    let setting = |name: &str| read(&format!("net/ipv6/conf/{interface}/{name}")).unwrap_or_default();
+    match (setting("accept_ra").as_str(), setting("forwarding").as_str()) {
+        ("1", "1") => accept_ra_one(interface, false),
+        ("0", _) => "accept_ra = 0: the kernel does not process Router Advertisements, so a user-space client (systemd-networkd, NetworkManager) must install the default route; check that it runs and accepts them".into(),
+        _ => "no Router Advertisement with a non-zero router lifetime arrived: the provider may send none, or they are filtered on the link".into(),
+    }
 }
 
 /// FR-DISC-8: connected prefixes of the downlinks must be in main.
@@ -628,5 +652,31 @@ mod tests {
         unmanaged.routing.manage_sysctls = false;
         assert!(accept_ra(&unmanaged, values("1", "0")).warnings.is_empty());
         assert_eq!(accept_ra(&unmanaged, values("1", "1")).warnings.len(), 1);
+    }
+
+    #[test]
+    fn gateway_causes_follow_the_router_advertisement_settings() {
+        let values = |accept_ra: &'static str, forwarding: &'static str| {
+            move |k: &str| -> std::io::Result<String> {
+                match k {
+                    "net/ipv6/conf/wana/accept_ra" => Ok(accept_ra.to_owned()),
+                    "net/ipv6/conf/wana/forwarding" => Ok(forwarding.to_owned()),
+                    _ => Err(std::io::ErrorKind::NotFound.into()),
+                }
+            }
+        };
+        let one = gateway_causes("wana", values("1", "1"));
+        assert!(
+            one.starts_with("wana has accept_ra = 1") && !one.contains("which FTR enables"),
+            "{one}"
+        );
+        assert!(gateway_causes("wana", values("0", "1")).starts_with("accept_ra = 0: the kernel does not process"));
+        let none = "no Router Advertisement with a non-zero router lifetime arrived";
+        assert!(gateway_causes("wana", values("2", "1")).starts_with(none));
+        assert!(gateway_causes("wana", values("1", "0")).starts_with(none));
+        assert!(
+            gateway_causes("wanb", values("1", "1")).starts_with(none),
+            "unreadable settings"
+        );
     }
 }

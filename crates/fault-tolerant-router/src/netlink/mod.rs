@@ -59,25 +59,37 @@ pub const ENOENT: i32 = 2;
 pub const ESRCH: i32 = 3;
 pub const EEXIST: i32 = 17;
 
+/// The netlink attributes (TLVs) of `payload` from `offset`: the type of
+/// each, without the nested and byte-order flags, and its value. A
+/// malformed attribute yields an error and ends the iteration.
+pub fn attributes(payload: &[u8], offset: usize) -> impl Iterator<Item = Result<(u16, &[u8]), String>> {
+    let mut off = offset;
+    let mut malformed = false;
+    std::iter::from_fn(move || {
+        if malformed || off + 4 > payload.len() {
+            return None;
+        }
+        let len = usize::from(u16::from_ne_bytes([payload[off], payload[off + 1]]));
+        let kind = u16::from_ne_bytes([payload[off + 2], payload[off + 3]]) & 0x3fff;
+        if len < 4 || off + len > payload.len() {
+            malformed = true;
+            return Some(Err(format!("attribute {kind} of length {len} at {off}")));
+        }
+        let value = &payload[off + 4..off + len];
+        off += (len + 3) & !3;
+        Some(Ok((kind, value)))
+    })
+}
+
 /// Extracts `NLMSGERR_ATTR_MSG` from the payload of an error message. With
 /// `NETLINK_CAP_ACK` the kernel echoes only the 16-byte header of the
 /// request, followed by the TLVs. No crate parses them (S3).
 pub fn parse_extack(payload: &[u8]) -> Option<String> {
-    let mut off = 16;
-    while off + 4 <= payload.len() {
-        let len = usize::from(u16::from_ne_bytes([payload[off], payload[off + 1]]));
-        let kind = u16::from_ne_bytes([payload[off + 2], payload[off + 3]]) & 0x3fff;
-        if len < 4 || off + len > payload.len() {
-            return None;
-        }
-        if kind == 1 {
-            let s = &payload[off + 4..off + len];
-            let s = s.split(|b| *b == 0).next().unwrap_or(&[]);
-            return Some(String::from_utf8_lossy(s).into_owned());
-        }
-        off += (len + 3) & !3;
-    }
-    None
+    let (_, s) = attributes(payload, 16)
+        .map_while(Result::ok)
+        .find(|(kind, _)| *kind == 1)?;
+    let s = s.split(|b| *b == 0).next().unwrap_or(&[]);
+    Some(String::from_utf8_lossy(s).into_owned())
 }
 
 /// Kind of mutation, mapped to netlink flags.
@@ -115,6 +127,14 @@ impl Dump {
     /// The route netlink messages of the dump (all but nexthop objects).
     pub fn routing(&self) -> impl Iterator<Item = &RouteNetlinkMessage> {
         self.messages.iter().filter_map(|m| match m {
+            Message::Route(r) => Some(r),
+            _ => None,
+        })
+    }
+
+    /// The route netlink messages of the dump, moved out of it.
+    pub fn into_routing(self) -> impl Iterator<Item = RouteNetlinkMessage> {
+        self.messages.into_iter().filter_map(|m| match m {
             Message::Route(r) => Some(r),
             _ => None,
         })

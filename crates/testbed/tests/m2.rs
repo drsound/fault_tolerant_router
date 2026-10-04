@@ -66,50 +66,31 @@ fn as12_ipv6_fails_on_a_while_ipv4_stays_healthy() -> Result<()> {
 #[ignore = "needs root and network namespaces"]
 fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
     let t = build();
-    let keys = [
-        "net/ipv6/conf/all/forwarding",
-        "net/ipv6/fib_multipath_hash_policy",
-        "net/ipv6/conf/wana/ignore_routes_with_linkdown",
-        "net/ipv6/conf/wanb/ignore_routes_with_linkdown",
-    ];
-    let read = |k: &str| t.router().sysctl_get(k);
-    let before: Vec<String> = keys.iter().map(|k| read(k)).collect::<Result<_>>()?;
+    let before = sysctl_values(&t, &IPV6_SETTINGS)?;
     let f = t.start_ftr(&ftr::dual(&ab()))?;
     f.wait_installed(&t)?;
     for fam in Family::ALL {
         wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     }
-    assert_eq!(read("net/ipv6/fib_multipath_hash_policy")?, "1", "FR-ROUTE-5");
+    assert_eq!(
+        t.router().sysctl_get("net/ipv6/fib_multipath_hash_policy")?,
+        "1",
+        "FR-ROUTE-5"
+    );
     let flows = start_flows(&t, Family::V4, 1, 16)?;
     std::thread::sleep(Duration::from_secs(1));
     f.write_config(&ftr::ipv4(&ab()))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     t.wait_for("IPv6 handed back", Duration::from_secs(10), || {
-        let rules = t.router().run("ip", ["-6", "rule", "show"])?;
-        let routes = t
-            .router()
-            .run("ip", ["-6", "route", "show", "table", "all", "proto", "249"])?;
-        let restored: Vec<String> = keys.iter().map(|k| read(k)).collect::<Result<_>>()?;
-        Ok(!rules.contains("proto 249") && routes.trim().is_empty() && restored == before)
+        Ok(ipv6_artifacts(&t)?.is_empty() && sysctl_values(&t, &IPV6_SETTINGS)? == before)
     })?;
     let table = t
         .router()
         .run("nft", ["list", "table", "inet", "fault_tolerant_router"])?;
-    assert!(!table.contains("meta nfproto ipv6 "), "{table}");
     assert!(table.contains("meta nfproto != ipv4 return"), "{table}");
     std::thread::sleep(Duration::from_secs(1));
-    let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for u in [Uplink::A, Uplink::B] {
-        let on_u: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(u)).collect();
-        assert!(!on_u.is_empty(), "no flow ran on {u}: {reports:?}");
-        for r in on_u {
-            assert!(
-                r.continuous(Duration::from_secs(1)),
-                "IPv4 flow on {u} interrupted: {r:?}"
-            );
-        }
-    }
+    flows_on_continuous(flows, &[Uplink::A, Uplink::B])?;
     // IPv6 follows the operating system again: here, the harness's leak6
     // default route of the main table.
     t.reset_counters()?;
@@ -151,19 +132,8 @@ fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
     assert_eq!(t.ipv6_leaks()?, 0, "INV-3");
     let flows6 = start_flows(&t, Family::V6, 20, 12)?;
     std::thread::sleep(Duration::from_secs(2));
-    flows_on_continuous(flows6, Uplink::A)?;
-    let reports: Vec<_> = flows4.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
-    for u in [Uplink::A, Uplink::B] {
-        let on_u: Vec<_> = reports.iter().filter(|r| r.uplink() == Some(u)).collect();
-        assert!(!on_u.is_empty(), "no IPv4 flow ran on {u}: {reports:?}");
-        for r in on_u {
-            assert!(
-                r.continuous(Duration::from_secs(1)),
-                "IPv4 flow on {u} interrupted: {r:?}"
-            );
-        }
-    }
-    Ok(())
+    flows_on_continuous(flows6, &[Uplink::A])?;
+    flows_on_continuous(flows4, &[Uplink::A, Uplink::B])
 }
 
 /// Removes the Router Advertisement default routes of an interface of the
@@ -407,7 +377,8 @@ fn as49_nexthop_objects_and_groups() -> Result<()> {
 /// FR-SYS-3: startup and online `check-config` warn about `accept_ra = 1`
 /// on an uplink with an automatic IPv6 gateway while forwarding is enabled;
 /// an IPv6 path without a discovered gateway 30 s after startup gets a
-/// warning that names the likely causes.
+/// warning that names the likely causes. The daemon's test hook
+/// `FTR_TEST_GATEWAY_WARNING_MS` shortens the 30 s to 3 s.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn fr_sys_3_router_advertisement_warnings() -> Result<()> {
@@ -422,16 +393,28 @@ fn fr_sys_3_router_advertisement_warnings() -> Result<()> {
     let text = ftr::output_text(&out);
     assert!(text.contains("wana has accept_ra = 1"), "{text}");
     let mut f = f;
+    let delay = Duration::from_secs(3);
+    f.set_env("FTR_TEST_GATEWAY_WARNING_MS", &delay.as_millis().to_string());
+    let started = std::time::Instant::now();
     f.start(&t)?;
     f.wait_installed(&t)?;
-    assert!(f.log().contains("wana has accept_ra = 1"), "{}", f.log());
-    assert!(!f.log().contains("no IPv6 default route discovered"), "not before 30 s");
+    let log = f.log();
+    assert!(log.contains("wana has accept_ra = 1"), "{log}");
+    // Read before the delay has passed since the start, the log cannot
+    // hold the warning yet.
+    if started.elapsed() < delay {
+        assert!(
+            !log.contains("no IPv6 default route discovered"),
+            "not before {delay:?}"
+        );
+    }
     f.wait_log(
         &t,
-        "no IPv6 default route discovered on wanb 30 s after startup",
+        "no IPv6 default route discovered on wanb",
         1,
-        Duration::from_secs(40),
+        delay + Duration::from_secs(10),
     )?;
+    assert!(started.elapsed() >= delay, "not before {delay:?}: {}", f.log());
     assert!(
         f.log().contains("accept_ra = 0: the kernel does not process"),
         "{}",
@@ -462,15 +445,10 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     // The router's link-local address on an uplink, the next hop of the
     // provider's route to the LAN prefix.
     let ll = |iface: &str| -> Result<String> {
-        let v = t.router().ip_json(&format!("-6 addr show dev {iface} scope link"))?;
-        // iproute2 lists an empty entry first.
-        Ok(v[0]["addr_info"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find_map(|a| a["local"].as_str())
-            .unwrap_or_default()
-            .to_owned())
+        Ok(t.addresses(iface, Family::V6, "link")?
+            .first()
+            .map(|a| a.local.to_string())
+            .unwrap_or_default())
     };
     let route_lan_via = |u: Uplink, core: &str| -> Result<()> {
         t.inet().ip(&format!("-6 route replace {lan_prefix} via {core}"))?;
@@ -485,9 +463,11 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     let b = address(&t, Family::V6, Uplink::B)?;
     r.ip(&format!("addr del {b}/64 dev wanb"))?;
     route_lan_via(Uplink::B, "2001:db8:fff0:b::2")?;
-    let snat = ftr::family(&[ftr::UplinkSpec::new(Uplink::B, 2)], Family::V6).replace(
-        "nat = \"masquerade\"",
-        &format!("source = \"{}\"\nnat = \"snat\"", plan::LAN_ROUTER_V6),
+    let snat = ftr::family(
+        &[ftr::UplinkSpec::new(Uplink::B, 2)
+            .ipv6_nat(Some("snat"))
+            .path(Family::V6, &format!("source = \"{}\"", plan::LAN_ROUTER_V6))],
+        Family::V6,
     );
     let mut f = t.start_ftr(&snat)?;
     f.wait_installed(&t)?;
@@ -507,7 +487,7 @@ fn fr_disc_6_static_source_and_ipv6_nat_choices() -> Result<()> {
     f.stop()?;
     // `nat = "none"` on A, whose provider now routes the LAN prefix.
     route_lan_via(Uplink::A, "2001:db8:fff0:a::2")?;
-    let none = ftr::family(&[ftr::UplinkSpec::new(Uplink::A, 1)], Family::V6).replace("masquerade", "none");
+    let none = ftr::family(&[ftr::UplinkSpec::new(Uplink::A, 1).ipv6_nat(Some("none"))], Family::V6);
     f.write_config(&none)?;
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -543,15 +523,7 @@ fn as33_colliding_ipv6_rule_and_route() -> Result<()> {
         ),
     ] {
         t.router().ip(setup)?;
-        let f = t.prepare_ftr(&ftr::dual(&ab()))?;
-        let out = f.cli_config(&["check-config"])?;
-        let text = ftr::output_text(&out);
-        assert!(!out.status.success() && text.contains(needle), "check-config: {text}");
-        let mut f = f;
-        f.start(&t)?;
-        f.wait_exit(&t, Duration::from_secs(10))?;
-        assert!(f.log().contains(needle), "{}", f.log());
-        drop(f);
+        assert_refused(&t, &ftr::dual(&ab()), needle)?;
         t.router().ip(undo)?;
     }
     let f = t.start_ftr(&ftr::dual(&ab()))?;
@@ -651,44 +623,22 @@ fn dhcpv6_counters(t: &testbed::Topology) -> Result<()> {
     ))
 }
 
-fn dhcpv6_counter(t: &testbed::Topology, name: &str) -> Result<u64> {
-    t.ns(Node::IspB).counter("inet", "t44", name)
-}
-
-/// Global IPv6 addresses of a router interface with their prefix lengths
-/// and valid lifetimes in seconds.
-fn global_ipv6(t: &testbed::Topology, iface: &str) -> Result<Vec<(IpAddr, u64, u64)>> {
-    let v = t.router().ip_json(&format!("-6 addr show dev {iface} scope global"))?;
-    Ok(v.as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|l| l["addr_info"].as_array().cloned().unwrap_or_default())
-        .filter_map(|a| {
-            Some((
-                a["local"].as_str()?.parse().ok()?,
-                a["prefixlen"].as_u64()?,
-                a["valid_life_time"].as_u64()?,
-            ))
-        })
-        .collect())
-}
-
 /// The router's DHCPv6 address on B (from the server's pool,
 /// 2001:db8:b:ffff::1000-1fff) and its valid lifetime.
 fn dhcpv6_lease(t: &testbed::Topology) -> Result<Option<(IpAddr, u64)>> {
     let pool: plan::Prefix = "2001:db8:b:ffff::1000/116".parse()?;
-    Ok(global_ipv6(t, "wanb")?
+    Ok(t.addresses("wanb", Family::V6, "global")?
         .into_iter()
-        .find(|(a, len, _)| *len == 128 && pool.contains(*a))
-        .map(|(a, _, valid)| (a, valid)))
+        .filter(|a| a.prefixlen == 128 && pool.contains(a.local))
+        .find_map(|a| Some((a.local, a.valid_lft?))))
 }
 
 /// The router's LAN address from the prefix that B delegated.
 fn delegated_lan_address(t: &testbed::Topology) -> Result<Option<IpAddr>> {
     let pool: plan::Prefix = DELEGATED_POOL.parse()?;
-    Ok(global_ipv6(t, "lan")?
+    Ok(t.addresses("lan", Family::V6, "global")?
         .into_iter()
-        .map(|(a, _, _)| a)
+        .map(|a| a.local)
         .find(|a| pool.contains(*a)))
 }
 
@@ -745,27 +695,31 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
     t.wait_for(
         "a Renew by unicast on B's link",
         Duration::from_secs(DHCPV6_T1 + 10),
-        || Ok(dhcpv6_counter(&t, "renew")? > 0),
+        || Ok(provider_counter(&t, Node::IspB, "inet", "t44", "renew")? > 0),
     )?;
     t.wait_for("the renewed lease", Duration::from_secs(5), &renewed)?;
-    assert_eq!(dhcpv6_counter(&t, "elsewhere")?, 0, "every message went through B");
+    assert_eq!(
+        provider_counter(&t, Node::IspB, "inet", "t44", "elsewhere")?,
+        0,
+        "every message went through B"
+    );
 
     // B fails its probes and A comes up, before the next T1.
     t.drop_probe_echoes(Uplink::B, 1)?;
     configure_ipv6(&t, Uplink::A)?;
     wait_members(&t, Family::V6, &["wana"], Duration::from_secs(20))?;
-    let renew = dhcpv6_counter(&t, "renew")?;
-    let rebind = dhcpv6_counter(&t, "rebind")?;
+    let renew = provider_counter(&t, Node::IspB, "inet", "t44", "renew")?;
+    let rebind = provider_counter(&t, Node::IspB, "inet", "t44", "rebind")?;
     t.wait_for("a Rebind by multicast", Duration::from_secs(DHCPV6_T2 + 10), || {
-        Ok(dhcpv6_counter(&t, "rebind")? > rebind)
+        Ok(provider_counter(&t, Node::IspB, "inet", "t44", "rebind")? > rebind)
     })?;
     t.wait_for("the rebound lease", Duration::from_secs(5), &renewed)?;
     assert_eq!(
-        dhcpv6_counter(&t, "renew")?,
+        provider_counter(&t, Node::IspB, "inet", "t44", "renew")?,
         renew,
         "no Renew by unicast reached B's link while B was out of the active set"
     );
-    let elsewhere = dhcpv6_counter(&t, "elsewhere")?;
+    let elsewhere = provider_counter(&t, Node::IspB, "inet", "t44", "elsewhere")?;
     match client {
         Dhcpv6Client::Dhcpcd => assert!(elsewhere > 0, "dhcpcd's unbound renewals were balanced through A"),
         Dhcpv6Client::Dhclient => assert_eq!(elsewhere, 0, "dhclient's renewals never left through A"),

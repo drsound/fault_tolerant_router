@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::netns;
-use crate::plan::{self, Family, Node, Uplink};
+use crate::plan::{self, Node, Uplink};
 use crate::topology::Topology;
 
 impl Topology {
@@ -46,14 +46,12 @@ impl Topology {
         ns.ip("link set core up")?;
         // The kernel deleted the default routes when the link went down.
         let (v4, v6) = match uplink {
-            Uplink::A => ("198.18.0.1", Some("2001:db8:fff0:a::1")),
-            Uplink::B => ("198.18.0.5", Some("2001:db8:fff0:b::1")),
-            Uplink::C => ("198.18.0.9", Some("2001:db8:fff0:c::1")),
+            Uplink::A => ("198.18.0.1", "2001:db8:fff0:a::1"),
+            Uplink::B => ("198.18.0.5", "2001:db8:fff0:b::1"),
+            Uplink::C => ("198.18.0.9", "2001:db8:fff0:c::1"),
         };
         ns.ip(&format!("route replace default via {v4}"))?;
-        if let Some(v6) = v6 {
-            ns.ip(&format!("-6 route replace default via {v6}"))?;
-        }
+        ns.ip(&format!("-6 route replace default via {v6}"))?;
         Ok(())
     }
 
@@ -85,16 +83,16 @@ impl Topology {
         } else {
             format!("numgen inc mod {every} 0 ")
         };
-        let mut rules = vec![format!(
-            "iifname != \"core\" ip daddr {{ {} }} icmp type echo-request {pick}counter drop",
-            v4.join(", ")
-        )];
-        if uplink.families().contains(&Family::V6) {
-            rules.push(format!(
+        let rules = [
+            format!(
+                "iifname != \"core\" ip daddr {{ {} }} icmp type echo-request {pick}counter drop",
+                v4.join(", ")
+            ),
+            format!(
                 "iifname != \"core\" ip6 daddr {{ {} }} icmpv6 type echo-request {pick}counter drop",
                 v6.join(", ")
-            ));
-        }
+            ),
+        ];
         self.provider_rules(uplink, &rules)
     }
 

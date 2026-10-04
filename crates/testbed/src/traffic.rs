@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, ChildStdin, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::plan::{self, Family, Node, Uplink};
@@ -300,9 +300,6 @@ impl Topology {
 
     /// Packets of `family` that left the router through `uplink` since the last reset.
     pub fn egress_packets(&self, uplink: Uplink, family: Family) -> Result<u64> {
-        if !uplink.families().contains(&family) {
-            bail!("uplink {uplink} has no {family}");
-        }
         self.router()
             .counter("inet", "tb_egress", &counter_name(uplink, family))
     }

@@ -66,6 +66,11 @@ impl PathRuntime {
 /// startup or after its link comes up, before the warning.
 const GATEWAY_WARNING: Duration = Duration::from_secs(30);
 
+/// [`GATEWAY_WARNING`], or the delay a scenario sets (test hooks).
+fn gateway_warning() -> Duration {
+    crate::test_hooks::gateway_warning(GATEWAY_WARNING)
+}
+
 /// Retry state after a failed application (FR-REC-5).
 struct Retry {
     at: Instant,
@@ -385,17 +390,6 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     Ok(f)
 }
 
-/// The likely causes of a missing IPv6 gateway on an interface, from its
-/// Router Advertisement settings (FR-SYS-3).
-fn gateway_causes(interface: &str) -> String {
-    let read = |name: &str| sysctl::read(&format!("net/ipv6/conf/{interface}/{name}")).unwrap_or_default();
-    match (read("accept_ra").as_str(), read("forwarding").as_str()) {
-        ("1", "1") => "accept_ra = 1 makes the kernel ignore Router Advertisements while IPv6 forwarding is enabled; set accept_ra = 2, or let a user-space client handle them".into(),
-        ("0", _) => "accept_ra = 0: the kernel does not process Router Advertisements, so a user-space client (systemd-networkd, NetworkManager) must install the default route; check that it runs and accepts them".into(),
-        _ => "no Router Advertisement with a non-zero router lifetime arrived: the provider may send none, or they are filtered on the link".into(),
-    }
-}
-
 fn report(f: &checks::Findings) -> Result<()> {
     for w in &f.warnings {
         warn!("{w}");
@@ -644,34 +638,37 @@ impl Daemon {
         let message = match message {
             Message::Route(m) => m,
             other => {
-                // A deleted nexthop object takes the IPv4 routes that use
-                // it without a notification (FR-COEX-3): re-read them.
-                if let Change::Nexthop { removed: true } = self.system.apply_message(&self.scope, &other) {
-                    for f in Family::ALL {
-                        for t in &self.cfg.routing.discovery_tables {
-                            self.reread.insert((f, *t));
-                        }
-                    }
-                }
-                self.dirty = true;
+                self.nexthop_notification(&other);
                 return;
             }
         };
-        if let Some(table) = self.system.stale_after(&self.scope, &message, flags) {
-            self.reread.insert(table);
-        }
         let removed_rule = match &message {
             RouteNetlinkMessage::DelRule(r) => crate::netlink::msg::ObservedRule::parse(r)
                 .filter(|o| o.protocol == self.protocol && self.layout.priorities().contains(&o.priority)),
             _ => None,
         };
-        let removed_route = match &message {
-            RouteNetlinkMessage::DelRoute(r) => crate::netlink::msg::ObservedRoute::parse(r)
-                .filter(|o| o.protocol == self.protocol && self.layout.tables().contains(&o.table))
-                .map(|o| (o.family, o.table)),
-            _ => None,
+        let mut removed_route = None;
+        let change = match &message {
+            RouteNetlinkMessage::NewRoute(r) | RouteNetlinkMessage::DelRoute(r) => {
+                let deleted = matches!(message, RouteNetlinkMessage::DelRoute(_));
+                match crate::netlink::msg::ObservedRoute::parse(r) {
+                    Some(r) => {
+                        // Against the view before the notification is
+                        // applied: which entries a replacement may have
+                        // dropped, whether a deletion matches an entry.
+                        if let Some(table) = self.system.stale_after(&self.scope, &r, deleted, flags) {
+                            self.reread.insert(table);
+                        }
+                        if deleted && r.protocol == self.protocol && self.layout.tables().contains(&r.table) {
+                            removed_route = Some((r.family, r.table));
+                        }
+                        self.system.apply_route(&self.scope, r, deleted)
+                    }
+                    None => Change::None,
+                }
+            }
+            _ => self.system.apply(&self.scope, &message),
         };
-        let change = self.system.apply(&self.scope, &message);
         let third_party = port != 0 && port != self.client.port();
         if third_party && let Some(r) = removed_rule {
             warn!(
@@ -720,19 +717,66 @@ impl Daemon {
                 self.dirty = true;
             }
             Change::RouterAdvertisement(i) => {
-                // FR-DISC-5: the advertised router lifetime, refreshed or
-                // shortened without a route notification.
+                // FR-DISC-5: the advertisement may have refreshed or
+                // shortened the lifetime of the default routes it installed
+                // on the interface, without a route notification; their
+                // creation and their deletion by a zero lifetime are
+                // notified. A route of the kernel's Router Advertisement
+                // protocol counts even without a known expiry: a read
+                // within a clock tick of the expiry shows none.
                 if self.uplink_on(i).is_some() {
-                    debug!(ifindex = i, "router advertisement: re-reading the discovery tables");
-                    for t in &self.cfg.routing.discovery_tables {
-                        self.reread.insert((Family::V6, *t));
+                    let ra = u8::from(netlink_packet_route::route::RouteProtocol::Ra);
+                    let tables: BTreeSet<(Family, u32)> = self
+                        .discovery_defaults()
+                        .filter(|r| {
+                            r.family == Family::V6
+                                && (r.expires_at.is_some() || r.protocol == ra)
+                                && r.nexthops.iter().any(|h| h.ifindex == i)
+                        })
+                        .map(|r| (r.family, r.table))
+                        .collect();
+                    if !tables.is_empty() {
+                        debug!(
+                            ifindex = i,
+                            ?tables,
+                            "router advertisement: re-reading the tables of its routes"
+                        );
+                        self.reread.extend(tables);
+                        self.dirty = true;
                     }
-                    self.dirty = true;
                 }
             }
             Change::Route { .. } | Change::Rule { .. } | Change::Nexthop { .. } => self.dirty = true,
             Change::None => {}
         }
+    }
+
+    /// A nexthop object notification. Only the routes that use the object,
+    /// directly or through a group, depend on it: an object that no route
+    /// of the view uses cannot change discovery (a route that comes to use
+    /// it arrives as its own notification), and replacing the gateway of
+    /// one that routes use notifies them (FR-DISC-3).
+    fn nexthop_notification(&mut self, m: &Message) {
+        let (id, deleted) = match m {
+            Message::NewNexthop(n) => (n.id, false),
+            Message::DelNexthop(n) => (n.id, true),
+            Message::Route(_) | Message::GetNexthops => return,
+        };
+        // Before applying: a deletion drops the object, and with it the
+        // group membership by which its users are found.
+        let users = self.system.nexthop_users(id);
+        self.system.apply_message(&self.scope, m);
+        if users.is_empty() {
+            return;
+        }
+        if deleted {
+            // Deleting an object deletes the IPv4 routes that use it
+            // without a notification, and with nexthop_compat_mode = 0
+            // possibly the IPv6 ones too (FR-COEX-3): their tables are
+            // re-read.
+            self.reread.extend(users);
+        }
+        self.dirty = true;
     }
 
     /// The default routes of the discovery tables, which make paths ready.
@@ -906,15 +950,20 @@ impl Daemon {
                 .or_insert_with(|| PathRuntime::new(None, Machine::new(false, Reason::Startup, None)));
             if key.family == Family::V6 && raw.gateway_missing {
                 let (since, warned) = p.gateway_wait.get_or_insert((Instant::now(), false));
-                if !*warned && since.elapsed() >= GATEWAY_WARNING {
+                let delay = gateway_warning();
+                if !*warned && since.elapsed() >= delay {
                     *warned = true;
                     let u = self.cfg.uplink(key.uplink).expect("configured");
+                    let delay = if delay.subsec_millis() == 0 {
+                        format!("{} s", delay.as_secs())
+                    } else {
+                        format!("{} ms", delay.as_millis())
+                    };
                     warn!(
                         uplink = %u.name,
-                        "no IPv6 default route discovered on {} {} s after startup or after its link came up: {}; a static gateway avoids depending on Router Advertisements (FR-SYS-3)",
+                        "no IPv6 default route discovered on {} {delay} after startup or after its link came up: {}; a static gateway avoids depending on Router Advertisements (FR-SYS-3)",
                         u.interface,
-                        GATEWAY_WARNING.as_secs(),
-                        gateway_causes(&u.interface)
+                        checks::gateway_causes(&u.interface, sysctl::read)
                     );
                 }
             } else {
@@ -1131,7 +1180,7 @@ impl Daemon {
             _ => BTreeSet::new(),
         };
         let desired = plan::plan(&self.cfg, &input);
-        let before = plan::plan(&self.cfg, &plan::without(&input, &new_paths));
+        let before = (!new_paths.is_empty()).then(|| plan::plan(&self.cfg, &plan::without(&input, &new_paths)));
         let families: Vec<Family> = Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)).collect();
         let ops = reconcile::diff(
             &self.system,
@@ -1139,7 +1188,7 @@ impl Daemon {
                 layout: self.layout,
                 protocol: self.protocol,
                 families: &families,
-                before_nft: &before,
+                before_nft: before.as_ref().unwrap_or(&desired),
                 desired: &desired,
                 nft_pending,
                 teardown: false,
@@ -1255,20 +1304,21 @@ impl Daemon {
     fn failed(&mut self, f: Failure, attempt: String) {
         error!(operation = %f.op, "apply_failed: {}", f.error);
         self.degrade("apply_failed");
-        // FR-ROUTE-2: a failed IPv6 replacement may have left the table
-        // empty (the kernel removes the members it inserted, and the old
-        // route is gone): the view is corrected by a re-read.
-        if let Some((Family::V6, table)) = f.route {
-            self.reread.insert((Family::V6, table));
-        }
-        if let Some((family, table)) = f.route
-            && let Some(key) = self
+        if let Some((family, table)) = f.route {
+            // The view follows a route mutation only when it succeeds, but
+            // a failed one may still have changed the table: it is re-read
+            // before the next pass. FR-ROUTE-2's case: a failed IPv6
+            // replacement can leave the table empty (the kernel removes the
+            // members it inserted, and the old route is gone).
+            self.reread.insert((family, table));
+            if let Some(key) = self
                 .paths
                 .keys()
                 .find(|k| k.family == family && self.layout.path_table(k.uplink) == table)
-        {
-            // FR-DISC-7: the path is not ready until discovery changes.
-            self.route_failed.insert(*key, f.error.clone());
+            {
+                // FR-DISC-7: the path is not ready until discovery changes.
+                self.route_failed.insert(*key, f.error.clone());
+            }
         }
         // The backoff grows while the same attempt keeps failing.
         let backoff = match &self.retry {
@@ -1432,7 +1482,7 @@ impl Daemon {
                 .map(|r| r.at)
                 .chain(self.next_expiry())
                 .chain(self.paths.values().filter_map(|p| match p.gateway_wait {
-                    Some((since, false)) => Some(since + GATEWAY_WARNING),
+                    Some((since, false)) => Some(since + gateway_warning()),
                     _ => None,
                 }))
                 .fold(next_full, Instant::min);
