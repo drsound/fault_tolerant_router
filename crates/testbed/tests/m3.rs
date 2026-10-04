@@ -5,7 +5,7 @@
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use testbed::Outcome;
@@ -411,5 +411,110 @@ fn as48_policy_marked_traffic_from_a_router_address_is_balanced(fam: Family) -> 
     connect()?;
     assert!(counter_value(&t, "a")? > 0, "the source rule takes unmarked packets");
     t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+/// Fast health settings with the quality gates `gates` (TOML keys of
+/// `[health.quality]`).
+fn with_gates(gates: &str) -> HealthSpec {
+    HealthSpec {
+        text: format!("{}[health.quality]\n{gates}", HealthSpec::fast().text),
+    }
+}
+
+per_family!(as06_deterministic_loss_violates_the_loss_gate);
+
+/// AS-06: every third probe echo on A is lost, with `max_loss = 0.2`: A goes
+/// down with reason `degraded` although its rounds pass reachability, and
+/// comes back once the pattern stops, within `rise` rounds plus the
+/// clearing of the window (FR-PROBE-5).
+fn as06_deterministic_loss_violates_the_loss_gate(fam: Family) -> Result<()> {
+    let t = build();
+    let health = with_gates("max_loss = 0.2\n");
+    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &health, "", ""))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    t.drop_probe_echoes(Uplink::A, 3)?;
+    f.wait_log(
+        &t,
+        &format!("uplink=1 family={fam} from=Up to=Down reason=degraded"),
+        1,
+        Duration::from_secs(20),
+    )?;
+    wait_members(&t, fam, &["wanb"], Duration::from_secs(2))?;
+    let log = f.log();
+    assert!(log.contains(&format!("uplink=1 family={fam} violations=loss")), "{log}");
+    assert!(!log.contains("reason=probe_failed"), "reachability kept passing: {log}");
+    t.clear_provider_rules(Uplink::A)?;
+    let cleared = Instant::now();
+    f.wait_log(
+        &t,
+        &format!("uplink=1 family={fam} from=Down to=Up reason=probes_recovered"),
+        1,
+        Duration::from_secs(15),
+    )?;
+    // rise (3) plus the window (6 rounds of 1 s), and a round of margin.
+    let took = cleared.elapsed();
+    assert!(took <= Duration::from_secs(10), "recovered after {took:?}");
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(2))?;
+    Ok(())
+}
+
+per_family!(as39_quality_gates_with_unequal_target_rtts);
+
+/// AS-39: probe targets with unequal RTTs (one 20 ms, one 150 ms away) and
+/// no loss: with `max_loss = 0` no round loses a sample, since rounds run to
+/// completion; the RTT gate is evaluated on the median (a 5 ms limit takes
+/// A down, 100 ms brings it back at the next rounds). The IPv6 variant uses
+/// the three default targets.
+fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
+    let t = build();
+    let targets = testbed::plan::probe_targets(fam);
+    t.target_delays(
+        Uplink::A,
+        &[
+            (targets[1], Duration::from_millis(20)),
+            (targets[2], Duration::from_millis(150)),
+        ],
+    )?;
+    let config = |max_rtt: &str| {
+        let health = with_gates(&format!(
+            "max_loss = 0.0\nmax_rtt = \"{max_rtt}\"\nmax_jitter = \"50ms\"\n"
+        ));
+        polywan::config(&ab(), &[fam], &health, "", "")
+    };
+    let mut f = t.start_polywan(&config("100ms"))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    // More than quality_min_samples samples and five RTTs and differences.
+    std::thread::sleep(Duration::from_secs(10));
+    let log = f.log();
+    assert!(
+        !log.contains("quality gate violated") && !log.contains("reason=degraded"),
+        "{log}"
+    );
+    f.write_config(&config("5ms"))?;
+    f.reload()?;
+    f.wait_log(
+        &t,
+        &format!("uplink=1 family={fam} from=Up to=Down reason=degraded"),
+        1,
+        Duration::from_secs(10),
+    )?;
+    assert!(
+        f.log().contains(&format!("uplink=1 family={fam} violations=rtt")),
+        "{}",
+        f.log()
+    );
+    f.write_config(&config("100ms"))?;
+    f.reload()?;
+    f.wait_log(
+        &t,
+        &format!("uplink=1 family={fam} from=Down to=Up reason=probes_recovered"),
+        1,
+        Duration::from_secs(8),
+    )?;
+    t.clear_target_delays(Uplink::A)?;
+    f.stop()?;
     Ok(())
 }

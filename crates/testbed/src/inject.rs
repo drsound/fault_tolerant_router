@@ -2,6 +2,7 @@
 //! patterns in the providers, `tc netem`, PPPoE session resets, and the
 //! daemon under test.
 
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::Child;
 use std::time::Duration;
@@ -124,6 +125,54 @@ impl Topology {
                 .into_iter()
                 .chain(params.split_whitespace()),
         )?;
+        Ok(())
+    }
+
+    /// Delays the traffic of the provider towards each given address (its
+    /// `core` link, towards the internet), one `netem` band per address:
+    /// probe targets with unequal RTTs (AS-39).
+    pub fn target_delays(&self, uplink: Uplink, delays: &[(IpAddr, Duration)]) -> Result<()> {
+        let ns = self.ns(uplink.provider());
+        let bands = (delays.len() + 1).to_string();
+        ns.run(
+            "tc",
+            [
+                "qdisc", "replace", "dev", "core", "root", "handle", "1:", "prio", "bands", &bands, "priomap",
+            ]
+            .into_iter()
+            .chain(["0"; 16]),
+        )?;
+        for (i, (addr, delay)) in delays.iter().enumerate() {
+            let band = format!("1:{}", i + 2);
+            let handle = format!("{}:", i + 10);
+            let ms = format!("{}ms", delay.as_millis());
+            // One priority per filter: a priority holds one protocol.
+            let prio = (i + 1).to_string();
+            ns.run(
+                "tc",
+                [
+                    "qdisc", "add", "dev", "core", "parent", &band, "handle", &handle, "netem", "delay", &ms,
+                ],
+            )?;
+            let (protocol, matcher, prefix) = match addr {
+                IpAddr::V4(_) => ("ip", "ip", format!("{addr}/32")),
+                IpAddr::V6(_) => ("ipv6", "ip6", format!("{addr}/128")),
+            };
+            ns.run(
+                "tc",
+                [
+                    "filter", "add", "dev", "core", "parent", "1:", "protocol", protocol, "prio", &prio, "u32",
+                    "match", matcher, "dst", &prefix, "flowid", &band,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_target_delays(&self, uplink: Uplink) -> Result<()> {
+        let _ = self
+            .ns(uplink.provider())
+            .output("tc", ["qdisc", "del", "dev", "core", "root"])?;
         Ok(())
     }
 

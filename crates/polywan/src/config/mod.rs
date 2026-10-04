@@ -256,9 +256,6 @@ impl Config {
         if self.metrics_listen.is_some() {
             v.push("metrics (metrics.listen)");
         }
-        if self.uplinks.iter().any(|u| u.health.quality.enabled()) {
-            v.push("quality gates (health.quality)");
-        }
         v
     }
 }

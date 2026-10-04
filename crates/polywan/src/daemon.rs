@@ -24,6 +24,7 @@ use crate::nftctl;
 use crate::observer;
 use crate::plan::{self, Input, Layout, PathInput};
 use crate::probe;
+use crate::quality;
 use crate::reconcile::{self, DiffInput, Failure, Op};
 use crate::select::{self, Candidate};
 use crate::state::{self, Checkpoint, InstanceLock, Manifest, PathCheckpoint, StateDir};
@@ -44,6 +45,11 @@ struct PathRuntime {
     since_ms: u64,
     generation: u64,
     prober: Option<(probe::Spec, tokio::task::JoinHandle<()>)>,
+    /// Samples of the last rounds of the current probing generation, their
+    /// statistics, and whether a quality gate is violated (FR-PROBE-5).
+    window: quality::Window,
+    stats: quality::Stats,
+    violating: bool,
     /// Since when an automatic IPv6 gateway is awaited on a usable link,
     /// and whether the FR-SYS-3 warning was given.
     gateway_wait: Option<(Instant, bool)>,
@@ -57,6 +63,9 @@ impl PathRuntime {
             since_ms: now_ms(),
             generation: 0,
             prober: None,
+            window: quality::Window::default(),
+            stats: quality::Stats::default(),
+            violating: false,
             gateway_wait: None,
         }
     }
@@ -897,9 +906,37 @@ impl Daemon {
                     return;
                 }
                 let h = self.hysteresis(r.path.uplink);
+                let Some(health) = self.cfg.uplink(r.path.uplink).map(|u| &u.health) else {
+                    return;
+                };
+                let (quality, capacity, min_samples) = (
+                    health.quality.clone(),
+                    usize::from(health.quality_window),
+                    health.quality_min_samples,
+                );
                 let p = self.paths.get_mut(&r.path).expect("checked above");
-                let round = if r.passed { Round::Passed } else { Round::Failed };
-                debug!(uplink = r.path.uplink.get(), family = %r.path.family, passed = r.passed, reachable = r.reachable, "probe round");
+                p.window.push(r.samples, capacity);
+                p.stats = p.window.stats();
+                let violations = if quality.enabled() {
+                    quality::violations(&p.stats, &quality, min_samples)
+                } else {
+                    Vec::new()
+                };
+                if violations.is_empty() == p.violating {
+                    p.violating = !violations.is_empty();
+                    let list: Vec<String> = violations.iter().map(ToString::to_string).collect();
+                    if p.violating {
+                        info!(uplink = r.path.uplink.get(), family = %r.path.family, violations = %list.join(", "), "quality gate violated");
+                    } else {
+                        info!(uplink = r.path.uplink.get(), family = %r.path.family, "quality gates met");
+                    }
+                }
+                let round = match (r.passed, violations.is_empty()) {
+                    (false, _) => Round::Failed,
+                    (true, true) => Round::Passed,
+                    (true, false) => Round::Degraded,
+                };
+                debug!(uplink = r.path.uplink.get(), family = %r.path.family, passed = r.passed, reachable = r.reachable, loss = ?p.stats.loss, rtt = ?p.stats.rtt, jitter = ?p.stats.jitter, "probe round");
                 if let Some(t) = p.machine.round(round, h) {
                     p.since_ms = now_ms();
                     info!(uplink = r.path.uplink.get(), family = %r.path.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
@@ -1108,6 +1145,11 @@ impl Daemon {
             }
             self.probe_generation += 1;
             p.generation = self.probe_generation;
+            // FR-PROBE-5: a new probing generation, or a path no longer
+            // ready, starts an empty window.
+            p.window.clear();
+            p.stats = quality::Stats::default();
+            p.violating = false;
             if let Some(mut spec) = wanted {
                 spec.generation = p.generation;
                 let handle = probe::spawn(spec.clone(), self.probe_tx.clone());

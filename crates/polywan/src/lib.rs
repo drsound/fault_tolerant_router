@@ -19,6 +19,7 @@ pub mod nftctl;
 pub mod observer;
 pub mod plan;
 pub mod probe;
+pub mod quality;
 pub mod ra;
 pub mod reconcile;
 pub mod select;
