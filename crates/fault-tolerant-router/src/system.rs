@@ -66,22 +66,9 @@ pub struct System {
 pub enum Change {
     Link(u32),
     Address(u32),
-    Route {
-        family: Family,
-        table: u32,
-        removed: bool,
-    },
-    Rule {
-        family: Family,
-        removed: bool,
-    },
-    Nexthop {
-        removed: bool,
-    },
-    /// A Router Advertisement with prefix information arrived on the
-    /// interface: it may have refreshed or shortened the lifetime of the
-    /// default route it installed, which the kernel does not notify.
-    RouterAdvertisement(u32),
+    Route { family: Family, table: u32, removed: bool },
+    Rule { family: Family, removed: bool },
+    Nexthop { removed: bool },
     None,
 }
 
@@ -137,6 +124,10 @@ impl System {
                 Change::Link(i)
             }
             RouteNetlinkMessage::NewAddress(a) => match ObservedAddress::parse(a) {
+                // The same address again: every Router Advertisement with
+                // prefix information renews its lifetimes, and nothing that
+                // FTR observes changed.
+                Some(a) if self.addresses.get(&(a.index, a.address)) == Some(&a) => Change::None,
                 Some(a) => {
                     let i = a.index;
                     self.addresses.insert((i, a.address), a);
@@ -179,7 +170,6 @@ impl System {
                 }
                 None => Change::None,
             },
-            RouteNetlinkMessage::NewPrefix(p) => Change::RouterAdvertisement(p.header.ifindex as u32),
             _ => Change::None,
         }
     }

@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -114,6 +114,15 @@ enum AgentCommand {
         /// The flags byte (managed 0x80, other configuration 0x40).
         #[arg(long, default_value_t = 0)]
         flags: u8,
+        /// A /64 announced for SLAAC (prefix information, on-link and
+        /// autonomous, 120 s lifetimes).
+        #[arg(long)]
+        prefix: Option<Ipv6Addr>,
+        /// Advertisements to send (a flood), `interval_us` apart.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        #[arg(long, default_value_t = 0)]
+        interval_us: u64,
     },
     UdpSend {
         #[arg(long)]
@@ -228,7 +237,19 @@ fn run(cli: Cli) -> Result<()> {
                 device,
                 lifetime,
                 flags,
-            } => agent::send_ra(&device, lifetime, flags)?,
+                prefix,
+                count,
+                interval_us,
+            } => agent::send_ra(
+                &device,
+                &agent::Advertisement {
+                    lifetime,
+                    flags,
+                    prefix,
+                },
+                count,
+                Duration::from_micros(interval_us),
+            )?,
             AgentCommand::UdpSend {
                 src_port,
                 count,

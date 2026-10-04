@@ -411,3 +411,11 @@ async fn a_reread_confirms_by_identity_and_merges_both_reads() {
     assert_eq!(s.routes_in(Family::V4, 254).count(), 3);
     assert_eq!(gateway(&s, 2), Some("100.64.0.1".parse().unwrap()));
 }
+
+#[test]
+fn a_renewed_address_is_not_a_change() {
+    let mut s = System::default();
+    let a = address(5, "2001:db8::2");
+    assert!(matches!(s.apply(&scope(), &a), crate::system::Change::Address(5)));
+    assert!(matches!(s.apply(&scope(), &a), crate::system::Change::None));
+}

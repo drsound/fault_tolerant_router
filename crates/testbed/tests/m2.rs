@@ -321,6 +321,61 @@ fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
     Ok(())
 }
 
+/// FR-DISC-5 under a flood of advertisements with prefix information on
+/// A, 5,000 a second for three seconds, each renewing the lifetimes of A's
+/// SLAAC address: the daemon gathers them, re-reading its tables a bounded
+/// number of times, and still withdraws B within a second of its carrier
+/// loss (AS-04's bound).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn fr_disc_5_advertisement_flood() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::family(&ab(), Family::V6))?;
+    f.set_env("FTR_LOG", "debug");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
+    let rereads = || f.log().matches("re-reading tables").count();
+    let before = rereads();
+    let started = std::time::Instant::now();
+    let mut flood = t.ns(Node::IspA).spawn(
+        &t.agent_bin().to_string_lossy(),
+        [
+            "agent",
+            "send-ra",
+            "--device",
+            "wan",
+            "--lifetime",
+            "1800",
+            "--flags",
+            "192",
+            "--prefix",
+            "2001:db8:a:ffff::",
+            "--count",
+            "15000",
+            "--interval-us",
+            "200",
+        ],
+        &t.dir().join("flood.log"),
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, Family::V6, &["wana"], Duration::from_secs(1))?;
+    assert!(flood.wait()?.success(), "the flood was sent");
+    let lasted = started.elapsed();
+    let n = rereads() - before;
+    eprintln!("{n} table re-reads during a flood of {lasted:?}");
+    // About ten a second, one per window of the advertisements, plus B's
+    // carrier loss; without gathering them, a thousand and more.
+    assert!(
+        n as f64 <= 15.0 * lasted.as_secs_f64() + 10.0,
+        "{n} re-reads in {lasted:?}"
+    );
+    t.carrier_up(Uplink::B)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(15))?;
+    Ok(())
+}
+
 /// AS-35: IPv6 over PPP with the peer's link-local gateway: C's path joins
 /// and leaves a multi-member active set (single → multiple → single) and
 /// every route installation succeeds. Then C reconnects with a new

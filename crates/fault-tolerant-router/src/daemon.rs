@@ -71,6 +71,9 @@ fn gateway_warning() -> Duration {
     crate::test_hooks::gateway_warning(GATEWAY_WARNING)
 }
 
+/// Queued netlink notifications handled before the pass they lead to.
+const NOTIFICATION_BATCH: usize = 1000;
+
 /// A path's mark assignment in the nftables table: the path and the
 /// interface its rules match.
 type Assignment = (PathKey, String);
@@ -731,15 +734,14 @@ impl Daemon {
                 }
                 self.dirty = true;
             }
-            Change::RouterAdvertisement(i) => self.router_advertisement(i),
             Change::Route { .. } | Change::Rule { .. } | Change::Nexthop { .. } => self.dirty = true,
             Change::None => {}
         }
     }
 
-    /// A Router Advertisement arrived on an interface (seen by the
-    /// listener of `ra.rs`, or announced by `RTM_NEWPREFIX` when it carries
-    /// prefix information). FR-DISC-5: it may have refreshed or shortened
+    /// Router Advertisements arrived on an interface (the listener of
+    /// `ra.rs`, which sees every one; `RTM_NEWPREFIX` would cover only those
+    /// with prefix information). FR-DISC-5: they may have refreshed or shortened
     /// the lifetime of the default routes it installed on the interface
     /// without a route notification; their creation and their deletion by a
     /// zero lifetime are notified. A route of the kernel's Router
@@ -1497,17 +1499,8 @@ impl Daemon {
         let mut hup = signal(SignalKind::hangup())?;
         let mut next_full = Instant::now() + self.cfg.routing.reconcile_interval;
         let (ra_tx, mut ra_rx) = mpsc::unbounded_channel();
-        let listener = match crate::ra::spawn(ra_tx) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                // RTM_NEWPREFIX still covers advertisements with prefix
-                // information.
-                warn!(
-                    "cannot listen to Router Advertisements: {e}; a lifetime shortened without prefix information is seen at its previous expiry"
-                );
-                None
-            }
-        };
+        // A raw socket, as the ICMP probes need anyway.
+        let listener = crate::ra::spawn(ra_tx).context("listening to Router Advertisements")?;
         loop {
             if self.dirty {
                 self.dirty = false;
@@ -1530,14 +1523,27 @@ impl Daemon {
                 .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
-                n = subscription.next() => match n {
-                    Some(Notification::Message { message, port, flags }) => self.notification(message, port, flags),
-                    Some(Notification::Overrun) => {
-                        warn!("netlink notifications were lost (ENOBUFS): full resynchronisation");
-                        self.full_reconciliation().await;
+                n = subscription.next() => {
+                    // A burst is handled in one pass: the notifications
+                    // already queued first, up to a bound that keeps the
+                    // other events of the loop served.
+                    let mut n = n;
+                    for _ in 0..NOTIFICATION_BATCH {
+                        match n {
+                            Some(Notification::Message { message, port, flags }) => self.notification(message, port, flags),
+                            Some(Notification::Overrun) => {
+                                warn!("netlink notifications were lost (ENOBUFS): full resynchronisation");
+                                self.full_reconciliation().await;
+                                break;
+                            }
+                            None => bail!("the netlink subscription closed"),
+                        }
+                        n = subscription.queued();
+                        if n.is_none() {
+                            break;
+                        }
                     }
-                    None => bail!("the netlink subscription closed"),
-                },
+                }
                 r = probe_rx.recv() => if let Some(r) = r { self.probe_report(r) },
                 Some(i) = ra_rx.recv() => self.router_advertisement(i),
                 _ = sleep_until(wake) => {
@@ -1557,9 +1563,7 @@ impl Daemon {
             }
         }
         info!("daemon_stopping");
-        if let Some(h) = listener {
-            h.abort();
-        }
+        listener.abort();
         for p in self.paths.values_mut() {
             if let Some((_, h)) = p.prober.take() {
                 h.abort();

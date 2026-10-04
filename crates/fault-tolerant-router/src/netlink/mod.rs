@@ -14,7 +14,7 @@ use std::fmt;
 use std::io;
 
 use futures_channel::mpsc::UnboundedReceiver;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
     NetlinkPayload,
@@ -234,18 +234,15 @@ pub mod groups {
     pub const IPV4_RULE: u32 = 8;
     pub const IPV6_IFADDR: u32 = 9;
     pub const IPV6_ROUTE: u32 = 11;
-    /// Prefix information of every received Router Advertisement.
-    pub const IPV6_PREFIX: u32 = 18;
     pub const IPV6_RULE: u32 = 19;
     pub const NEXTHOP: u32 = 32;
-    pub const ALL: [u32; 9] = [
+    pub const ALL: [u32; 8] = [
         LINK,
         IPV4_IFADDR,
         IPV4_ROUTE,
         IPV4_RULE,
         IPV6_IFADDR,
         IPV6_ROUTE,
-        IPV6_PREFIX,
         IPV6_RULE,
         NEXTHOP,
     ];
@@ -300,6 +297,11 @@ impl Subscription {
                 _ => continue,
             }
         }
+    }
+
+    /// A notification already queued, without waiting.
+    pub fn queued(&mut self) -> Option<Notification> {
+        self.next().now_or_never().flatten()
     }
 }
 
