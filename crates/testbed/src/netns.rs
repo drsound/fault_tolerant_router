@@ -150,6 +150,13 @@ impl Ns {
     }
 }
 
+/// Whether a process has ended. A zombie counts as ended: a daemon that
+/// detached itself is reaped by PID 1, which some minimal inits (virtme-ng's)
+/// never do.
+pub fn exited(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| s.contains(") Z "))
+}
+
 /// Runs a command in the host namespace and returns its standard output.
 pub fn host<I, S>(program: &str, args: I) -> Result<String>
 where

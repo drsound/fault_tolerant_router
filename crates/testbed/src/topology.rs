@@ -501,13 +501,12 @@ impl Topology {
     /// Leases survive in the lease file.
     pub fn set_router_lifetime(&self, uplink: Uplink, seconds: u32) -> Result<()> {
         let pid_file = self.dnsmasq_file(dnsmasq_name(uplink)?, "pid");
-        let pid = fs::read_to_string(&pid_file)?.trim().to_owned();
-        netns::host("kill", ["-TERM", &pid])?;
-        let process = PathBuf::from(format!("/proc/{pid}"));
+        let pid: u32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+        netns::host("kill", ["-TERM", &pid.to_string()])?;
         self.wait_for(
             &format!("dnsmasq of provider {uplink} to exit"),
             Duration::from_secs(5),
-            || Ok(!process.exists()),
+            || Ok(netns::exited(pid)),
         )?;
         self.provider_dnsmasq(uplink, seconds)
     }
