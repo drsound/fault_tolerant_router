@@ -439,6 +439,10 @@ fn hooks_are_checked() {
     ));
     assert!(has(&d, "notify.hook[0].command", "absolute"));
     assert!(has(&d, "notify.hook[0].events", "unknown event type"));
+    let d = errors(&format!(
+        "{MINIMAL}[[notify.hook]]\ncommand = [\"/bin/true\"]\nevents = []\n"
+    ));
+    assert!(has(&d, "notify.hook[0].events", "must not be empty"));
 }
 
 #[test]
@@ -458,6 +462,17 @@ fn email_settings_follow_the_sendmail_interface() {
     let e = c.notify.email.unwrap();
     assert_eq!((e.from.as_str(), e.to.len()), ("router@example.com", 1));
     assert_eq!(e.sendmail, PathBuf::from("/usr/sbin/sendmail"));
+    assert_eq!(e.events.len(), 10);
+    assert!(!e.events.iter().any(|e| e == "path_address_changed"));
+    let c = parse(&format!(
+        "{MINIMAL}{EMAIL}events = [\"path_state_changed\", \"apply_failed\", \"path_state_changed\"]\n"
+    ))
+    .unwrap();
+    assert_eq!(c.notify.email.unwrap().events, ["path_state_changed", "apply_failed"]);
+    let d = errors(&format!("{MINIMAL}{EMAIL}events = []\n"));
+    assert!(has(&d, "notify.email.events", "must not be empty"));
+    let d = errors(&format!("{MINIMAL}{EMAIL}events = [\"notify_test\"]\n"));
+    assert!(has(&d, "notify.email.events", "unknown event type"));
     // The SMTP keys of earlier drafts are unknown keys (AS-20).
     for key in [
         "host = \"smtp.example.com\"",

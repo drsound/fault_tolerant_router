@@ -206,6 +206,7 @@ pub struct Email {
     pub to: Vec<String>,
     pub sendmail: Option<PathBuf>,
     pub max_per_hour: Option<i64>,
+    pub events: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

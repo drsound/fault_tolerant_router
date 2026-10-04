@@ -374,10 +374,25 @@ impl Manifest {
 }
 
 /// Persisted drain intent (FR-SEL-3), by uplink name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrainState {
     pub version: u32,
     pub drained: Vec<String>,
+}
+
+impl DrainState {
+    pub fn of(drained: impl IntoIterator<Item = String>) -> DrainState {
+        DrainState {
+            version: VERSION,
+            drained: drained.into_iter().collect(),
+        }
+    }
+}
+
+impl Default for DrainState {
+    fn default() -> DrainState {
+        DrainState::of([])
+    }
 }
 
 /// Health checkpoint (IMPL-5).
@@ -514,14 +529,14 @@ interface = "wanb"
             "the first baseline is kept"
         );
         assert_eq!(back.families, ["ipv4"]);
-        let drain = DrainState {
-            version: VERSION,
-            drained: vec!["b".into()],
-        };
+        let drain = DrainState::of(["b".to_owned()]);
         dir.write_drain(&drain).unwrap();
         assert_eq!(dir.drain().unwrap(), drain);
         assert!(!dir.path.join("drain.tmp").exists());
         dir.reset().unwrap();
+        assert_eq!(dir.drain().unwrap(), DrainState::default());
+        // What a default writes, the reader accepts.
+        dir.write_drain(&DrainState::default()).unwrap();
         assert_eq!(dir.drain().unwrap(), DrainState::default());
         assert!(dir.manifest().unwrap().is_some(), "reset never discards the manifest");
         fs::remove_dir_all(&dir.path).unwrap();

@@ -277,8 +277,15 @@ impl Polywan {
 
     /// Starts `run --config` (again, after a stop).
     pub fn start(&mut self, t: &Topology) -> Result<()> {
+        self.start_with(t, &[])
+    }
+
+    /// Starts `run --config` with more `run` options (`--reset-state`).
+    pub fn start_with(&mut self, t: &Topology, options: &[&str]) -> Result<()> {
         let config = self.config.display().to_string();
-        let args = self.args(&["run", "--config", &config]);
+        let mut run = vec!["run", "--config", &config];
+        run.extend_from_slice(options);
+        let args = self.args(&run);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.log_start = fs::metadata(&self.log).map(|m| m.len() as usize).unwrap_or(0);
         self.daemon = Some(t.start_daemon(&self.bin, &args, &self.env)?);

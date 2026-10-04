@@ -136,3 +136,57 @@ fn as20_an_untrusted_sendmail_never_runs() -> Result<()> {
     f.stop()?;
     Ok(())
 }
+
+/// IMPL-6 and FR-SEL-3: unreadable drain state refuses startup until
+/// `--reset-state`; an unreadable health checkpoint is ignored (cold
+/// start); the drain intent of an uplink that is no longer configured is
+/// pruned at startup and on reload, and a re-added uplink is not drained.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn impl6_unreadable_state_and_drain_pruning() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    std::fs::create_dir_all(&f.state)?;
+    std::fs::set_permissions(&f.state, std::fs::Permissions::from_mode(0o700))?;
+    let drain = f.state.join("drain.json");
+    let checkpoint = f.state.join("health.json");
+    std::fs::write(&drain, "{")?;
+    std::fs::write(&checkpoint, "{")?;
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(5))?;
+    assert!(
+        f.log().contains("drain state:") && f.log().contains("--reset-state"),
+        "{}",
+        f.log()
+    );
+    // A drained, plus a name no longer configured.
+    std::fs::write(&drain, "{\"version\": 1, \"drained\": [\"a\", \"gone\"]}\n")?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    assert!(f.log().contains("health checkpoint ignored"), "{}", f.log());
+    wait_members(&t, Family::V4, &["wanb"], Duration::from_secs(10))?;
+    let names = |p: &std::path::Path| -> Result<Vec<String>> {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p)?)?;
+        Ok(v["drained"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default())
+    };
+    assert_eq!(names(&drain)?, ["a"], "pruned at startup");
+    // Removing A clears its intent; re-added, it is not drained.
+    f.write_config(&polywan::ipv4(&ab()[1..]))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    assert!(names(&drain)?.is_empty(), "pruned on reload");
+    f.write_config(&polywan::ipv4(&ab()))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 2, Duration::from_secs(5))?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(15))?;
+    f.stop()?;
+    std::fs::write(&drain, "{\"version\": 7, \"drained\": []}\n")?;
+    f.start_with(&t, &["--reset-state"])?;
+    f.wait_installed(&t)?;
+    assert!(!drain.exists() || names(&drain)?.is_empty());
+    f.stop()?;
+    Ok(())
+}

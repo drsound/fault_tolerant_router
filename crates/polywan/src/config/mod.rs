@@ -200,6 +200,8 @@ pub struct Email {
     /// Absolute path of the sendmail interface, trusted (FR-CFG-5).
     pub sendmail: PathBuf,
     pub max_per_hour: u32,
+    /// Event types that produce email (FR-MAIL-2).
+    pub events: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

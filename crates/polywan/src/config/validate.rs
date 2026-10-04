@@ -32,6 +32,21 @@ pub const EVENT_TYPES: &[&str] = &[
     "status_recovered",
 ];
 
+/// Event types that produce email when `notify.email.events` is absent
+/// (FR-MAIL-2).
+pub const DEFAULT_EMAIL_EVENTS: &[&str] = &[
+    "daemon_started",
+    "daemon_stopping",
+    "config_reloaded",
+    "reload_failed",
+    "path_state_changed",
+    "active_set_changed",
+    "uplink_drained",
+    "uplink_undrained",
+    "status_degraded",
+    "status_recovered",
+];
+
 pub const DEFAULT_SENDMAIL: &str = "/usr/sbin/sendmail";
 pub const DEFAULT_API_SOCKET: &str = "/run/polywan/api.sock";
 pub const DEFAULT_STATUS_SOCKET: &str = "/run/polywan/status.sock";
@@ -871,11 +886,25 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
                 "must be an absolute path, without arguments",
             );
         }
+        let events = match e.events {
+            Some(list) => {
+                check_events(cx, &list, Some(&span), "notify.email.events");
+                let mut unique: Vec<String> = Vec::new();
+                for ev in list {
+                    if !unique.contains(&ev) {
+                        unique.push(ev);
+                    }
+                }
+                unique
+            }
+            None => DEFAULT_EMAIL_EVENTS.iter().map(|e| (*e).to_owned()).collect(),
+        };
         Email {
             from: e.from,
             to: e.to,
             sendmail,
             max_per_hour,
+            events,
         }
     });
     let hooks = n
@@ -894,14 +923,8 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
                     "the first element must be an absolute executable path",
                 ),
             }
-            for ev in h.events.iter().flatten() {
-                if !EVENT_TYPES.contains(&ev.as_str()) {
-                    cx.err(
-                        Some(&span),
-                        format!("{key}.events"),
-                        format!("unknown event type {ev:?}"),
-                    );
-                }
+            if let Some(list) = &h.events {
+                check_events(cx, list, Some(&span), &format!("{key}.events"));
             }
             let timeout = cx.duration(
                 h.timeout.as_deref(),
@@ -928,6 +951,18 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
         email,
         hooks,
         hook_user,
+    }
+}
+
+/// An explicit event filter: non-empty, FR-EV-1 types only.
+fn check_events(cx: &mut Ctx, list: &[String], span: Option<&Range<usize>>, key: &str) {
+    if list.is_empty() {
+        cx.err(span, key, "must not be empty (omit it for the default selection)");
+    }
+    for ev in list {
+        if !EVENT_TYPES.contains(&ev.as_str()) {
+            cx.err(span, key, format!("unknown event type {ev:?}"));
+        }
     }
 }
 

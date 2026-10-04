@@ -256,6 +256,23 @@ pub async fn run(opts: Options) -> Result<()> {
         }
         None => (Manifest::new(&cfg), true),
     };
+    // IMPL-6: unreadable drain intent refuses startup before any mutation;
+    // FR-SEL-3: the intent of uplinks no longer configured is dropped
+    // durably before routing changes.
+    let mut drain = state_dir
+        .drain()
+        .map_err(|e| anyhow::anyhow!("drain state: {e} (`run --reset-state` discards it)"))?;
+    let recorded = drain.drained.len();
+    drain.drained.retain(|n| cfg.uplinks.iter().any(|u| u.name == *n));
+    if drain.drained.len() != recorded && !opts.dry_run {
+        state_dir.write_drain(&drain).context("writing the drain state")?;
+    }
+    let drained = cfg
+        .uplinks
+        .iter()
+        .filter(|u| drain.drained.contains(&u.name))
+        .map(|u| u.id)
+        .collect();
 
     // Subscribe before the first dump; notifications received meanwhile
     // stay queued and are applied after it (§12.2).
@@ -302,7 +319,7 @@ pub async fn run(opts: Options) -> Result<()> {
         manifest,
         paths: BTreeMap::new(),
         active: BTreeMap::new(),
-        drained: BTreeSet::new(),
+        drained,
         route_failed: BTreeMap::new(),
         nft_applied: None,
         nft_listing: None,
@@ -336,7 +353,7 @@ pub async fn run(opts: Options) -> Result<()> {
     // Applied by the first pass, with the failure handling of any other
     // (FR-REC-3, FR-REC-5).
     d.sysctls_pending.extend(d.sysctl_scopes());
-    d.load_drain_and_checkpoint();
+    d.load_checkpoint();
     if d.cfg.firewall.mode == FirewallMode::Managed
         && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
     {
@@ -457,19 +474,9 @@ impl Daemon {
         });
     }
 
-    fn load_drain_and_checkpoint(&mut self) {
-        match self.state_dir.drain() {
-            Ok(d) => {
-                self.drained = self
-                    .cfg
-                    .uplinks
-                    .iter()
-                    .filter(|u| d.drained.contains(&u.name))
-                    .map(|u| u.id)
-                    .collect();
-            }
-            Err(e) => warn!("drain state ignored: {e}"),
-        }
+    /// IMPL-6: an unreadable checkpoint is ignored and every path starts
+    /// cold (FR-HEALTH-1).
+    fn load_checkpoint(&mut self) {
         let structure: state::RecordedStructure = self.cfg.structural().into();
         let checkpoint = match self.state_dir.checkpoint() {
             Ok(Some(c)) if c.valid(&self.boot_id, now_ms(), &structure) => Some(c),
@@ -1482,6 +1489,22 @@ impl Daemon {
             error!("reload_failed: {e}");
             return;
         }
+        // FR-SEL-3: removing an uplink removes its drain intent, durably,
+        // before the configuration is committed.
+        let drained: BTreeSet<UplinkId> = self
+            .drained
+            .iter()
+            .copied()
+            .filter(|id| new.uplink(*id).is_some())
+            .collect();
+        if drained != self.drained {
+            let names = drained.iter().filter_map(|id| new.uplink(*id)).map(|u| u.name.clone());
+            if let Err(e) = self.state_dir.write_drain(&state::DrainState::of(names)) {
+                error!("reload_failed: {e}");
+                return;
+            }
+        }
+        self.drained = drained;
         self.manifest = manifest;
         self.cfg = new;
         // Paths exist only for configured uplinks: those of removed uplinks
@@ -1613,7 +1636,7 @@ impl Daemon {
                     ready: d.ready.as_ref().ok().copied(),
                     local_addresses: d.local_addresses.clone(),
                     healthy: p.machine.is_up(),
-                    drained: false,
+                    drained: self.drained.contains(&key.uplink),
                 },
             );
         }
@@ -1624,7 +1647,7 @@ impl Daemon {
                 .iter()
                 .filter_map(|u| {
                     let p = input.paths.get(&PathKey { uplink: u.id, family })?;
-                    (p.ready.is_some()).then_some(Candidate {
+                    (p.ready.is_some() && !p.drained).then_some(Candidate {
                         uplink: u.id,
                         priority: u.priority?,
                         healthy: p.healthy,

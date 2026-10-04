@@ -101,13 +101,13 @@ pub fn executable(path: &Path, what: &str) -> Findings {
 }
 
 /// §11.2: the groups of the API sockets and, with hooks, the hook user
-/// exist in the local account databases.
+/// exist in the account databases.
 pub fn identities(config: &Config) -> Findings {
     let mut f = Findings::default();
     let mut group = |name: &str, key: &str| match crate::identity::group(name) {
         Ok(Some(_)) => {}
         Ok(None) => f.errors.push(format!("{key}: group {name:?} does not exist")),
-        Err(e) => f.errors.push(format!("{key}: cannot read /etc/group: {e}")),
+        Err(e) => f.errors.push(format!("{key}: cannot look up group {name:?}: {e}")),
     };
     group(&config.api.group, "api.group");
     if config.api.status_socket.is_some()
@@ -122,7 +122,7 @@ pub fn identities(config: &Config) -> Findings {
                 "notify.hook_user: user {:?} does not exist",
                 config.notify.hook_user
             )),
-            Err(e) => f.errors.push(format!("notify.hook_user: cannot read /etc/passwd: {e}")),
+            Err(e) => f.errors.push(format!("notify.hook_user: cannot look up the user: {e}")),
         }
     }
     f
