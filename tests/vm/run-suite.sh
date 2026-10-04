@@ -140,9 +140,14 @@ case $mode in
     # keep their configurations there, so the guest's /run is made 0755. PATH is
     # passed through sudo because vng runs its helpers (virtme-run) from it,
     # and a pipx installation lives in ~/.local/bin.
+    # virtme-ng passes the --exec command on the kernel command line
+    # (base64, within its 2048 bytes): the suite's commands go to a script
+    # in the shared directory.
+    printf '%s\n' "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm" \
+      > "$bindir/vm-suite.sh"
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \
       --rodir "/mnt=$bindir" \
-      --exec "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm FTR_TESTBED_BIN=/mnt/ftr-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm"
+      --exec "sh /mnt/vm-suite.sh"
     ;;
 esac
