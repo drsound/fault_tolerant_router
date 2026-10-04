@@ -68,11 +68,63 @@ pub fn nftables(version_output: &str) -> Findings {
     f
 }
 
-/// FR-CFG-5 for the configuration file and `firewall.nft_path`, which PolyWAN
-/// runs as root: checked before anything configured runs.
+/// FR-CFG-5 for the configuration file and the binaries PolyWAN runs as
+/// root, `firewall.nft_path` and, with email, `notify.email.sendmail`:
+/// checked before anything configured runs.
 pub fn trusted(config_path: &Path, config: &Config) -> Findings {
     let mut f = ownership(config_path, "configuration");
-    f.extend(ownership(&config.firewall.nft_path, "firewall.nft_path"));
+    f.extend(executable(&config.firewall.nft_path, "firewall.nft_path"));
+    if let Some(e) = &config.notify.email {
+        f.extend(executable(&e.sendmail, "notify.email.sendmail"));
+    }
+    f
+}
+
+/// FR-CFG-5 for a binary PolyWAN runs: trusted like the configuration, and
+/// resolving to an executable regular file. Checked again right before
+/// every execution.
+pub fn executable(path: &Path, what: &str) -> Findings {
+    let mut f = ownership(path, what);
+    if f.errors.is_empty() {
+        match fs::metadata(path) {
+            Ok(m) if !m.is_file() => f
+                .errors
+                .push(format!("{what}: {} is not a regular file (FR-CFG-5)", path.display())),
+            Ok(m) if m.mode() & 0o111 == 0 => f
+                .errors
+                .push(format!("{what}: {} is not executable (FR-CFG-5)", path.display())),
+            Ok(_) => {}
+            Err(e) => f.errors.push(format!("{what}: {}: {e}", path.display())),
+        }
+    }
+    f
+}
+
+/// §11.2: the groups of the API sockets and, with hooks, the hook user
+/// exist in the local account databases.
+pub fn identities(config: &Config) -> Findings {
+    let mut f = Findings::default();
+    let mut group = |name: &str, key: &str| match crate::identity::group(name) {
+        Ok(Some(_)) => {}
+        Ok(None) => f.errors.push(format!("{key}: group {name:?} does not exist")),
+        Err(e) => f.errors.push(format!("{key}: cannot read /etc/group: {e}")),
+    };
+    group(&config.api.group, "api.group");
+    if config.api.status_socket.is_some()
+        && let Some(g) = &config.api.status_group
+    {
+        group(g, "api.status_group");
+    }
+    if !config.notify.hooks.is_empty() {
+        match crate::identity::user(&config.notify.hook_user) {
+            Ok(Some(_)) => {}
+            Ok(None) => f.errors.push(format!(
+                "notify.hook_user: user {:?} does not exist",
+                config.notify.hook_user
+            )),
+            Err(e) => f.errors.push(format!("notify.hook_user: cannot read /etc/passwd: {e}")),
+        }
+    }
     f
 }
 

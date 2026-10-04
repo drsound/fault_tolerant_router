@@ -90,11 +90,9 @@ targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:
 # [notify.email]
 # from = "router@example.com"
 # to = ["admin@example.com"]
-# host = "smtp.example.com"
-# port = 587
-# security = "starttls"
-# username = "router@example.com"
-# password_file = "/etc/polywan/smtp-password"
+# # The mail system (for example msmtp) is configured separately; test it
+# # through the running daemon with `polywan notify-test`.
+# sendmail = "/usr/sbin/sendmail"
 #
 # [[notify.hook]]
 # command = ["/usr/local/bin/polywan-to-ntfy"]
@@ -102,3 +100,8 @@ targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:
 #
 # [metrics]
 # listen = "127.0.0.1:9750"
+
+[api]
+# Status and event history are readable by every local user by default.
+# status_group = "monitoring"   # restrict them to an existing group
+# status_socket = ""            # or disable the status socket

@@ -32,6 +32,10 @@ pub const EVENT_TYPES: &[&str] = &[
     "status_recovered",
 ];
 
+pub const DEFAULT_SENDMAIL: &str = "/usr/sbin/sendmail";
+pub const DEFAULT_API_SOCKET: &str = "/run/polywan/api.sock";
+pub const DEFAULT_STATUS_SOCKET: &str = "/run/polywan/status.sock";
+
 /// Built-in probe targets: anycast resolvers of different operators
 /// (FR-PROBE-6).
 pub const DEFAULT_TARGETS_V4: &[&str] = &["icmp:1.1.1.1", "icmp:8.8.8.8", "icmp:9.9.9.9", "icmp:208.67.222.222"];
@@ -278,24 +282,7 @@ pub fn validate(text: &str, raw: raw::Config) -> Result<Config, Vec<Diagnostic>>
     }
 
     let notify = notify(&mut cx, raw.notify);
-    let api = match raw.api {
-        Some(a) => {
-            let span = a.span();
-            let a = a.into_inner();
-            let socket = a.socket.unwrap_or_else(|| PathBuf::from("/run/polywan/api.sock"));
-            if !socket.is_absolute() {
-                cx.err(Some(&span), "api.socket", "must be an absolute path");
-            }
-            Api {
-                socket,
-                group: a.group.unwrap_or_else(|| "polywan".into()),
-            }
-        }
-        None => Api {
-            socket: PathBuf::from("/run/polywan/api.sock"),
-            group: "polywan".into(),
-        },
-    };
+    let api = api(&mut cx, raw.api);
     let metrics_listen = raw.metrics.and_then(|m| {
         let span = m.span();
         m.into_inner().listen.and_then(|l| match l.parse::<SocketAddr>() {
@@ -864,29 +851,30 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
     let email = n.email.map(|e| {
         let span = e.span();
         let e = e.into_inner();
-        let default_port = match e.security {
-            Security::Tls => 465,
-            Security::Starttls => 587,
-            Security::Plain => 25,
-        };
-        let port = cx.int::<u16>(e.port, default_port, 1..=65535, Some(&span), "notify.email.port");
         let max_per_hour = cx.int::<u32>(e.max_per_hour, 20, 1..=10_000, Some(&span), "notify.email.max_per_hour");
+        if let Err(m) = check_mailbox(&e.from) {
+            cx.err(Some(&span), "notify.email.from", m);
+        }
         if e.to.is_empty() {
             cx.err(Some(&span), "notify.email.to", "at least one recipient is required");
         }
-        if let Some(p) = &e.password_file
-            && !p.is_absolute()
-        {
-            cx.err(Some(&span), "notify.email.password_file", "must be an absolute path");
+        for (i, to) in e.to.iter().enumerate() {
+            if let Err(m) = check_mailbox(to) {
+                cx.err(Some(&span), format!("notify.email.to[{i}]"), m);
+            }
+        }
+        let sendmail = e.sendmail.unwrap_or_else(|| PathBuf::from(DEFAULT_SENDMAIL));
+        if !sendmail.is_absolute() {
+            cx.err(
+                Some(&span),
+                "notify.email.sendmail",
+                "must be an absolute path, without arguments",
+            );
         }
         Email {
             from: e.from,
             to: e.to,
-            host: e.host,
-            port,
-            security: e.security,
-            username: e.username,
-            password_file: e.password_file,
+            sendmail,
             max_per_hour,
         }
     });
@@ -921,6 +909,9 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
                 Some(&span),
                 &format!("{key}.timeout"),
             );
+            if timeout.is_zero() {
+                cx.err(Some(&span), format!("{key}.timeout"), "must be greater than zero");
+            }
             Hook {
                 command: h.command,
                 events: h.events,
@@ -928,12 +919,142 @@ fn notify(cx: &mut Ctx, raw: Option<Spanned<raw::Notify>>) -> Notify {
             }
         })
         .collect();
+    let hook_user = n.hook_user.unwrap_or_else(|| "nobody".into());
+    if let Err(m) = check_account_name(&hook_user) {
+        cx.err(Some(&span), "notify.hook_user", m);
+    }
     Notify {
         coalesce,
         email,
         hooks,
-        hook_user: n.hook_user.unwrap_or_else(|| "nobody".into()),
+        hook_user,
     }
+}
+
+fn api(cx: &mut Ctx, raw: Option<Spanned<raw::Api>>) -> Api {
+    let span = span_of(&raw);
+    let span = span.as_ref();
+    let a = raw.map(Spanned::into_inner).unwrap_or(raw::Api {
+        socket: None,
+        group: None,
+        status_socket: None,
+        status_group: None,
+    });
+    let socket = a.socket.unwrap_or_else(|| PathBuf::from(DEFAULT_API_SOCKET));
+    if let Err(m) = check_socket_path(&socket) {
+        cx.err(span, "api.socket", m);
+    }
+    let status_socket = match a.status_socket {
+        None => Some(PathBuf::from(DEFAULT_STATUS_SOCKET)),
+        Some(p) if p.as_os_str().is_empty() => None,
+        Some(p) => Some(p),
+    };
+    if let Some(p) = &status_socket {
+        if let Err(m) = check_socket_path(p) {
+            cx.err(span, "api.status_socket", m);
+        } else if *p == socket {
+            cx.err(span, "api.status_socket", "must be distinct from api.socket (FR-API-1)");
+        }
+    }
+    let group = a.group.unwrap_or_else(|| "polywan".into());
+    if let Err(m) = check_account_name(&group) {
+        cx.err(span, "api.group", m);
+    }
+    if let Some(g) = &a.status_group
+        && let Err(m) = check_account_name(g)
+    {
+        cx.err(span, "api.status_group", m);
+    }
+    Api {
+        socket,
+        group,
+        status_socket,
+        status_group: a.status_group,
+    }
+}
+
+/// Longest Unix socket path: `sun_path` holds 108 bytes with the
+/// terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// What the listener setup adds to a socket's directory while it prepares
+/// the socket (FR-API-1: no transiently permissive socket).
+pub const SOCKET_STAGING: &str = "/.polywan-staging-4294967295/s";
+
+/// FR-API-1: an absolute socket path within the `sun_path` limit, also
+/// while it is being set up, without `.` or `..` components, so that two
+/// paths are distinct exactly when their components differ.
+fn check_socket_path(path: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err("must be an absolute path".into());
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        || path.as_os_str().as_encoded_bytes().ends_with(b"/")
+    {
+        return Err("must name a file, without \".\" or \"..\" components".into());
+    }
+    let len = path.as_os_str().len();
+    let parent = path.parent().map_or(0, |p| p.as_os_str().len());
+    if len > SUN_PATH_MAX || parent + SOCKET_STAGING.len() > SUN_PATH_MAX {
+        return Err(format!(
+            "is too long for a Unix socket (at most {SUN_PATH_MAX} bytes, and its directory at most {} bytes)",
+            SUN_PATH_MAX - SOCKET_STAGING.len()
+        ));
+    }
+    Ok(())
+}
+
+/// A user or group name as the account databases write it.
+fn check_account_name(name: &str) -> Result<(), String> {
+    let body = name.strip_suffix('$').unwrap_or(name);
+    let ok = (1..=32).contains(&name.len())
+        && !body.is_empty()
+        && !body.starts_with('-')
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{name:?} is not a valid user or group name"))
+    }
+}
+
+/// FR-MAIL-1: one ASCII mailbox `local-part@domain`, with an unquoted
+/// dot-atom local part and a DNS domain. Everything a mail system could
+/// read as several addresses, a display name, an option, a file or a
+/// program is refused.
+pub fn check_mailbox(text: &str) -> Result<(), String> {
+    let fail = |why: &str| Err(format!("{text:?} is not a single address local-part@domain: {why}"));
+    if !text.is_ascii() || text.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return fail("only printable ASCII without spaces is allowed");
+    }
+    if text.len() > 254 {
+        return fail("longer than 254 characters");
+    }
+    let Some((local, domain)) = text.rsplit_once('@') else {
+        return fail("no @");
+    };
+    let atext = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b);
+    if local.is_empty() || local.len() > 64 || !local.split('.').all(|a| !a.is_empty() && a.bytes().all(atext)) {
+        return fail("the local part must be a dot-atom (no quotes, comments or display names)");
+    }
+    if let Some(c) = local.chars().next().filter(|c| matches!(c, '-' | '/' | '|')) {
+        return fail(&format!("the local part must not start with {c:?}"));
+    }
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if domain.len() > 253 || !domain.split('.').all(label) {
+        return fail("the domain must be a DNS name");
+    }
+    Ok(())
 }
 
 fn valid_uplink_name(name: &str) -> bool {

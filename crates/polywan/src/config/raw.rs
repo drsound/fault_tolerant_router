@@ -204,20 +204,8 @@ pub struct Notify {
 pub struct Email {
     pub from: String,
     pub to: Vec<String>,
-    pub host: String,
-    pub port: Option<i64>,
-    pub security: Security,
-    pub username: Option<String>,
-    pub password_file: Option<PathBuf>,
+    pub sendmail: Option<PathBuf>,
     pub max_per_hour: Option<i64>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Security {
-    Tls,
-    Starttls,
-    Plain,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +221,8 @@ pub struct Hook {
 pub struct Api {
     pub socket: Option<PathBuf>,
     pub group: Option<String>,
+    pub status_socket: Option<PathBuf>,
+    pub status_group: Option<String>,
 }
 
 #[derive(Deserialize)]

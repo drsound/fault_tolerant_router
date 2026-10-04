@@ -76,15 +76,18 @@ fallback = "block"
 [notify.email]
 from = "router@example.com"
 to = ["admin@example.com"]
-host = "smtp.example.com"
-port = 587
-security = "starttls"
-username = "router@example.com"
-password_file = "/etc/polywan/smtp-password"
+# The mail system (for example msmtp) is configured separately; test it
+# through the running daemon with `polywan notify-test`.
+sendmail = "/usr/sbin/sendmail"
 
 [[notify.hook]]
 command = ["/usr/local/bin/polywan-to-ntfy"]
 events = ["path_state_changed", "active_set_changed"]
+
+[api]
+# Status and event history are readable by every local user by default.
+# status_group = "monitoring"   # restrict them to an existing group
+# status_socket = ""            # or disable the status socket
 
 [metrics]
 listen = "127.0.0.1:9750"
@@ -121,7 +124,9 @@ fn spec_example_is_valid() {
     assert!(c.uplinks[2].ipv6.is_none());
     assert_eq!(c.policies[0].destination_port, Some((25, 25)));
     assert_eq!(c.policies[0].source.unwrap().to_string(), "192.168.1.25/32");
-    assert_eq!(c.notify.email.as_ref().unwrap().max_per_hour, 20);
+    let email = c.notify.email.as_ref().unwrap();
+    assert_eq!(email.max_per_hour, 20);
+    assert_eq!(email.sendmail, PathBuf::from("/usr/sbin/sendmail"));
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
     assert!(c.manages(Family::V6));
     assert_eq!(c.unsupported_features().len(), 4, "policies, email, hooks, metrics");
@@ -179,6 +184,10 @@ fn defaults_follow_the_schema() {
     assert_eq!((h.quality_window, h.quality_min_samples), (6, 10));
     assert_eq!(c.state_dir, PathBuf::from("/var/lib/polywan"));
     assert_eq!(c.api.socket, PathBuf::from("/run/polywan/api.sock"));
+    assert_eq!(c.api.group, "polywan");
+    assert_eq!(c.api.status_socket, Some(PathBuf::from("/run/polywan/status.sock")));
+    assert_eq!(c.api.status_group, None);
+    assert_eq!(c.notify.hook_user, "nobody");
 }
 
 #[test]
@@ -430,4 +439,114 @@ fn hooks_are_checked() {
     ));
     assert!(has(&d, "notify.hook[0].command", "absolute"));
     assert!(has(&d, "notify.hook[0].events", "unknown event type"));
+}
+
+#[test]
+fn hook_settings_are_checked() {
+    let d = errors(&format!(
+        "{MINIMAL}[notify]\nhook_user = \"-x\"\n[[notify.hook]]\ncommand = [\"/bin/true\"]\ntimeout = \"0s\"\n"
+    ));
+    assert!(has(&d, "notify.hook[0].timeout", "greater than zero"));
+    assert!(has(&d, "notify.hook_user", "not a valid user"));
+}
+
+const EMAIL: &str = "[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\n";
+
+#[test]
+fn email_settings_follow_the_sendmail_interface() {
+    let c = parse(&format!("{MINIMAL}{EMAIL}")).unwrap();
+    let e = c.notify.email.unwrap();
+    assert_eq!((e.from.as_str(), e.to.len()), ("router@example.com", 1));
+    assert_eq!(e.sendmail, PathBuf::from("/usr/sbin/sendmail"));
+    // The SMTP keys of earlier drafts are unknown keys (AS-20).
+    for key in [
+        "host = \"smtp.example.com\"",
+        "port = 587",
+        "security = \"starttls\"",
+        "username = \"u\"",
+        "password_file = \"/etc/p\"",
+    ] {
+        let d = errors(&format!("{MINIMAL}{EMAIL}{key}\n"));
+        assert!(d[0].message.contains("unknown field"), "{key}: {d:?}");
+    }
+    let d = errors(&format!("{MINIMAL}{EMAIL}sendmail = \"sendmail -t\"\n"));
+    assert!(has(&d, "notify.email.sendmail", "absolute path"));
+    let d = errors(&format!(
+        "{MINIMAL}[notify.email]\nfrom = \"Router <r@example.com>\"\nto = []\n"
+    ));
+    assert!(has(&d, "notify.email.from", "not a single address"));
+    assert!(has(&d, "notify.email.to", "at least one"));
+}
+
+#[test]
+fn mailboxes_are_single_ascii_addresses() {
+    for ok in [
+        "admin@example.com",
+        "root@localhost",
+        "first.last+tag@mail.example.org",
+        "x_y-z@a-b.example",
+        "o'brien@example.ie",
+    ] {
+        assert!(validate::check_mailbox(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "",
+        "admin",
+        "Admin <admin@example.com>",
+        "\"quoted\"@example.com",
+        "a@example.com, b@example.com",
+        "a@example.com\r\nBcc: x@example.com",
+        "a@example.com\n",
+        "a b@example.com",
+        "-oQ/tmp@example.com",
+        "/var/mail/x@example.com",
+        "|/bin/sh@example.com",
+        "a..b@example.com",
+        ".a@example.com",
+        "a.@example.com",
+        "a@-example.com",
+        "a@example-.com",
+        "a@example..com",
+        "a@example.com.",
+        "a@[192.0.2.1]",
+        "a(comment)@example.com",
+        "ü@example.com",
+        "a@exämple.com",
+        "a@b@example.com",
+    ] {
+        assert!(validate::check_mailbox(bad).is_err(), "{bad:?}");
+    }
+    let long = format!("{}@example.com", "a".repeat(65));
+    assert!(validate::check_mailbox(&long).is_err());
+}
+
+#[test]
+fn api_sockets_are_checked() {
+    let api = |body: &str| parse(&format!("{MINIMAL}[api]\n{body}\n"));
+    let c = api("status_socket = \"\"\nstatus_group = \"monitoring\"").unwrap();
+    assert_eq!(c.api.status_socket, None);
+    let c = api("socket = \"/run/x/c.sock\"\nstatus_socket = \"/run/x/s.sock\"\ngroup = \"adm\"").unwrap();
+    assert_eq!(
+        (
+            c.api.socket.to_str(),
+            c.api.status_socket.unwrap().to_str(),
+            c.api.group.as_str()
+        ),
+        (Some("/run/x/c.sock"), Some("/run/x/s.sock"), "adm")
+    );
+    let d = api("socket = \"/run/x/a.sock\"\nstatus_socket = \"/run//x/a.sock\"").unwrap_err();
+    assert!(has(&d, "api.status_socket", "distinct"));
+    let d = api("socket = \"run/a.sock\"\nstatus_socket = \"/run/x/../s.sock\"").unwrap_err();
+    assert!(has(&d, "api.socket", "absolute"));
+    assert!(has(&d, "api.status_socket", "components"));
+    let d = api("socket = \"/run/x/\"").unwrap_err();
+    assert!(has(&d, "api.socket", "must name a file"));
+    let long = format!("/run/{}/a.sock", "d".repeat(80));
+    let d = api(&format!("socket = \"{long}\"")).unwrap_err();
+    assert!(has(&d, "api.socket", "too long"));
+    let d = api("group = \"a:b\"\nstatus_group = \"\"").unwrap_err();
+    assert!(has(&d, "api.group", "not a valid"));
+    assert!(has(&d, "api.status_group", "not a valid"));
+    let d = api("sockets = \"/run/a\"").unwrap_err();
+    assert!(d[0].message.contains("unknown field"));
 }

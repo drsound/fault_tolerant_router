@@ -1,4 +1,4 @@
-//! Helpers shared by the acceptance scenarios of `m1.rs` and `m2.rs`.
+//! Helpers shared by the acceptance scenarios of `m1.rs`, `m2.rs` and `m3.rs`.
 
 // Each scenario file uses part of them.
 #![allow(dead_code)]

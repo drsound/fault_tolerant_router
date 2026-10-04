@@ -247,12 +247,23 @@ impl Topology {
 
 impl Polywan {
     /// Replaces the configuration file (a reload needs [`Polywan::reload`]).
+    /// The run's sockets and an existing group replace the API defaults
+    /// (`/run/polywan`, group `polywan`) unless the configuration has its own
+    /// `[api]` table: parallel runs must not share sockets.
     pub fn write_config(&self, config: &str) -> Result<()> {
-        let text = config.replacen(
+        let mut text = config.replacen(
             "version = 2\n",
             &format!("version = 2\nstate_dir = \"{}\"\n", self.state.display()),
             1,
         );
+        if !text.contains("\n[api]") {
+            let _ = write!(
+                text,
+                "\n[api]\nsocket = \"{}\"\nstatus_socket = \"{}\"\ngroup = \"root\"\n",
+                self.dir.join("api.sock").display(),
+                self.dir.join("status.sock").display()
+            );
+        }
         fs::write(&self.config, text)?;
         fs::set_permissions(&self.config, fs::Permissions::from_mode(0o644))?;
         Ok(())

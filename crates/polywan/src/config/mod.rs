@@ -14,8 +14,8 @@ use ipnet::IpNet;
 
 use crate::model::{Family, FwMask, UplinkId};
 
-pub use raw::{AllDownPolicy, Fallback, FirewallMode, Nat, OnShutdown, Protocol, Security};
-pub use validate::parse_target;
+pub use raw::{AllDownPolicy, Fallback, FirewallMode, Nat, OnShutdown, Protocol};
+pub use validate::{check_mailbox, parse_target};
 
 /// Default location of the configuration file (FR-CFG-1).
 pub const DEFAULT_PATH: &str = "/etc/polywan/config.toml";
@@ -194,13 +194,11 @@ pub struct Notify {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Email {
+    /// Validated ASCII mailboxes (FR-MAIL-1).
     pub from: String,
     pub to: Vec<String>,
-    pub host: String,
-    pub port: u16,
-    pub security: Security,
-    pub username: Option<String>,
-    pub password_file: Option<PathBuf>,
+    /// Absolute path of the sendmail interface, trusted (FR-CFG-5).
+    pub sendmail: PathBuf,
     pub max_per_hour: u32,
 }
 
@@ -214,8 +212,13 @@ pub struct Hook {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Api {
+    /// Control socket (FR-API-1).
     pub socket: PathBuf,
     pub group: String,
+    /// Status socket; `None` when disabled (`""`).
+    pub status_socket: Option<PathBuf>,
+    /// `None`: the status socket is open to every local user (mode 0666).
+    pub status_group: Option<String>,
 }
 
 impl Config {

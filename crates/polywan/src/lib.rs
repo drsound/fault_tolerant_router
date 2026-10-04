@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod discover;
 pub mod duration;
 pub mod health;
+pub mod identity;
 pub mod model;
 pub mod netlink;
 pub mod nft;

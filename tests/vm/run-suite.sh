@@ -57,10 +57,10 @@ else
   # Copied before the test builds: the daemon's integration tests rebuild
   # its executable without the hooks.
   cp "$target_dir/$target/debug/polywan-testbed" "$target_dir/$target/debug/polywan" "$bindir/"
-  # netns: the harness's own checks; m1, m2: the acceptance scenarios.
-  { test_exes testbed netns m1 m2; test_exes polywan $kernel_tests; } \
+  # netns: the harness's own checks; m1, m2, m3: the acceptance scenarios.
+  { test_exes testbed netns m1 m2 m3; test_exes polywan $kernel_tests; } \
     | while read -r name exe; do cp "$exe" "$bindir/$name"; done
-  for t in netns m1 m2 $kernel_tests; do
+  for t in netns m1 m2 m3 $kernel_tests; do
     [ -x "$bindir/$t" ] || { echo "test executable $t was not built" >&2; exit 1; }
   done
 fi
@@ -68,14 +68,14 @@ if [ "$mode" = build ]; then
   echo "$bindir"
   exit 0
 fi
-# The M1 and M2 scenarios run once per fwmark_mask (AS-43: offsets 16, 0
+# The M1, M2 and M3 scenarios run once per fwmark_mask (AS-43: offsets 16, 0
 # and 24); POLYWAN_TEST_MASKS narrows the list; on the host,
 # POLYWAN_PARALLEL_MASKS=1 runs them at the same time.
 masks=${POLYWAN_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
-scenarios="m1 m2"
+scenarios="m1 m2 m3"
 m1_in_vm=
 for mask in $masks; do
-  m1_in_vm="$m1_in_vm && echo '== M1 and M2 scenarios with fwmark_mask $mask'"
+  m1_in_vm="$m1_in_vm && echo '== M1, M2 and M3 scenarios with fwmark_mask $mask'"
   for s in $scenarios; do
     m1_in_vm="$m1_in_vm && POLYWAN_TESTBED_BIN=/mnt/polywan-testbed POLYWAN_DAEMON_BIN=/mnt/polywan POLYWAN_TEST_FWMARK_MASK=$mask /mnt/$s --ignored --test-threads=${VM_TEST_THREADS:-2} $*"
   done
@@ -117,14 +117,14 @@ case $mode in
       failed=0
       for mask in $masks; do
         wait "$(cat "$out/$mask.pid")" || failed=1
-        echo "== M1 and M2 scenarios with fwmark_mask $mask"
+        echo "== M1, M2 and M3 scenarios with fwmark_mask $mask"
         cat "$out/$mask"
       done
       rm -rf "$out"
       [ $failed = 0 ]
     else
       for mask in $masks; do
-        echo "== M1 and M2 scenarios with fwmark_mask $mask"
+        echo "== M1, M2 and M3 scenarios with fwmark_mask $mask"
         m1 "$mask" "$@"
       done
     fi

@@ -15,7 +15,12 @@ pub const DEADLINE: Duration = Duration::from_secs(10);
 const CAPTURE: usize = 64 * 1024;
 
 /// Runs `nft` with arguments and optional standard input; returns stdout.
+/// The binary's trust is verified right before each execution (FR-CFG-5).
 pub async fn run(nft: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
+    let trust = crate::checks::executable(nft, "firewall.nft_path");
+    if !trust.errors.is_empty() {
+        return Err(trust.errors.join("; "));
+    }
     let mut child = Command::new(nft)
         .args(args)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })

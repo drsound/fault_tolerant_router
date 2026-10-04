@@ -212,12 +212,13 @@ fn now_ms() -> u64 {
 /// `run`: startup (FR-REC-1, FR-REC-8, IMPL-6) and the event loop.
 pub async fn run(opts: Options) -> Result<()> {
     let cfg = config::load(&opts.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // FR-CFG-5: nothing configured runs before its ownership is verified.
+    report(&checks::trusted(&opts.config, &cfg))?;
+    report(&checks::identities(&cfg))?;
     let unsupported = cfg.unsupported_features();
     if !unsupported.is_empty() {
         bail!("not supported by this development build: {}", unsupported.join(", "));
     }
-    // FR-CFG-5: nothing configured runs before its ownership is verified.
-    report(&checks::trusted(&opts.config, &cfg))?;
     let mut findings = checks::kernel(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     if cfg.firewall.mode == FirewallMode::Managed {
         let v = nftctl::run(&cfg.firewall.nft_path, &["--version"], None)
@@ -375,6 +376,7 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     if !f.errors.is_empty() {
         return Ok(f);
     }
+    f.extend(checks::identities(cfg));
     f.extend(checks::kernel(
         &std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default(),
     ));
@@ -1417,14 +1419,6 @@ impl Daemon {
                 return;
             }
         };
-        let unsupported = new.unsupported_features();
-        if !unsupported.is_empty() {
-            error!(
-                "reload_failed: not supported by this development build: {}",
-                unsupported.join(", ")
-            );
-            return;
-        }
         if new.structural() != self.cfg.structural() {
             error!("reload_failed: structural settings cannot change on reload (FR-CFG-4)");
             return;
@@ -1435,11 +1429,20 @@ impl Daemon {
             return;
         }
         // FR-CFG-5: nothing configured runs before its ownership is verified.
-        let trust = checks::trusted(path, &new);
+        let mut trust = checks::trusted(path, &new);
+        trust.extend(checks::identities(&new));
         if !trust.errors.is_empty() {
             for e in trust.errors {
                 error!("reload_failed: {e}");
             }
+            return;
+        }
+        let unsupported = new.unsupported_features();
+        if !unsupported.is_empty() {
+            error!(
+                "reload_failed: not supported by this development build: {}",
+                unsupported.join(", ")
+            );
             return;
         }
         // FR-CT-2: inspect against the running configuration, and refuse a

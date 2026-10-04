@@ -141,14 +141,6 @@ fn load(path: &Path) -> anyhow::Result<config::Config> {
 
 async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
     let cfg = load(path)?;
-    let unsupported = cfg.unsupported_features();
-    if !unsupported.is_empty() {
-        anyhow::bail!(
-            "{}: not supported by this development build: {}",
-            path.display(),
-            unsupported.join(", ")
-        );
-    }
     if !offline {
         let f = daemon::check_system(path, &cfg).await?;
         for w in &f.warnings {
@@ -157,6 +149,14 @@ async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
         if !f.errors.is_empty() {
             anyhow::bail!("{}", f.errors.join("\n"));
         }
+    }
+    let unsupported = cfg.unsupported_features();
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "{}: not supported by this development build: {}",
+            path.display(),
+            unsupported.join(", ")
+        );
     }
     println!("{}: valid", path.display());
     Ok(())
