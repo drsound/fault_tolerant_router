@@ -998,7 +998,7 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
     }
 }
 
-fn chmod_x(p: &Path) -> Result<()> {
+pub(crate) fn chmod_x(p: &Path) -> Result<()> {
     fs::set_permissions(p, fs::Permissions::from_mode(0o755))?;
     Ok(())
 }

@@ -12,7 +12,8 @@ mirror=${DEBIAN_MIRROR:-http://deb.debian.org/debian}
 security=${DEBIAN_SECURITY_MIRROR:-http://security.debian.org/debian-security}
 
 # Test tools of the harness, plus "mount" which virtme-ng's guest init needs.
-packages="linux-image-amd64,mount,kmod,procps,iproute2,nftables,dnsmasq-base,ppp,pppoe,udhcpc,iputils-ping,conntrack,tcpdump"
+# The DHCPv6 client of AS-44 is ISC dhclient here, dhcpcd elsewhere.
+packages="linux-image-amd64,mount,kmod,procps,iproute2,nftables,dnsmasq-base,ppp,pppoe,udhcpc,iputils-ping,conntrack,tcpdump,kea-dhcp6-server,isc-dhcp-client"
 
 # Hosts that are not Debian (for example Ubuntu CI runners) need the Debian
 # archive keyring to verify the suite.

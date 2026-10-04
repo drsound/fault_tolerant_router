@@ -20,7 +20,7 @@ Each node is a namespace named `tb-<run>-<node>` (`inet`, `ispa`, `ispb`, `ispc`
 
 - the internet node hosts the default probe targets (1.1.1.1, 8.8.8.8, 9.9.9.9, 208.67.222.222, 2606:4700:4700::1111, 2001:4860:4860::8888, 2620:fe::fe) on a dummy interface, and answers on every address of 198.18.100.0/24 and 2001:db8:ff00::/64 (local routes), so tests can use hundreds of distinct destinations;
 - provider A serves 192.0.2.0/24 by DHCPv4 and 2001:db8:a:ffff::/64 by SLAAC (dnsmasq); its stateful DHCPv6 service is available to scenarios that run a DHCPv6 client, the default router configuration uses SLAAC only;
-- provider B serves 100.64.0.0/24 by DHCPv4, translated to 198.18.0.6 (CGNAT), and 2001:db8:b:ffff::/64 by SLAAC;
+- provider B serves 100.64.0.0/24 by DHCPv4, translated to 198.18.0.6 (CGNAT), and 2001:db8:b:ffff::/64 by SLAAC; scenarios that need DHCPv6 with prefix delegation start a kea server there (`Topology::start_dhcpv6_server`, `src/dhcpv6.rs`) that leases addresses of 2001:db8:b:ffff::1000–1fff and /60 prefixes of 2001:db8:b:100::/56, and announces the server-unicast option at 2001:db8:b:fffe::1, outside the uplink's on-link prefix;
 - provider C runs a PPPoE server (IPv4 only, MTU 1492) giving 203.0.113.10–19;
 - the LAN is 198.51.100.0/24 and 2001:db8:1::/64.
 
@@ -34,12 +34,13 @@ The router gets its uplink configuration the way an operating system would: `udh
 - Leak detection: every operating-system default route of the router carries realm 99, and the harness table `ip tb_observe` counts IPv4 packets routed by such a route (`ipv4_leaks`); any non-zero count while FTR is installed violates INV-3. IPv6 routes have no realm, so for IPv6 the harness offers per-uplink egress counters (`egress_packets`, table `inet tb_egress`) for scenarios where no packet may leave, plus route lookups with `ip -6 route get`.
 - The daemon under test runs in the router namespace with `start_daemon(binary, args, env)`; the binary path is a parameter.
 - `testbed::ftr` runs the daemon under test (`FTR_DAEMON_BIN`) for the acceptance scenarios (`tests/m1.rs`): configuration and state under `/run/ftr-tests/<run>`, start, reload, stop, kill, CLI commands, its log. `Ftr::set_env` passes environment variables to the daemon's test hooks, compiled with the `test-hooks` feature that `run-suite.sh` enables: `FTR_TEST_BOOTTIME_SHIFT_MS` (boot-time clock moved forward) and `FTR_TEST_FAULTS` (a control file holding n lets the next n reconciler or cleanup steps succeed and fails the following ones until it is removed).
+- `Topology::start_dhcpv6_client` runs the router's DHCPv6 client on B (dhcpcd in manager mode, which alone honours the server-unicast option, or ISC dhclient where dhcpcd is not installed; `FTR_TEST_DHCPV6_CLIENT` chooses), asking for an address and a prefix whose first /64 goes to the LAN. dhcpcd gets private `/run/dhcpcd` and `/var/lib/dhcpcd` in the mount namespace of `ip netns exec`; kea-dhcp6 and dhclient run as copies outside their AppArmor profiles.
 - `Options::uplink_clients = false` builds the topology without starting `udhcpc` and `pppd`; `Topology::start_uplink_clients` starts them later. `Topology::netns_etc(node)` is the node's `/etc/netns/<namespace>` directory, whose entries `ip netns exec` mounts over `/etc`.
 - The harness's own checks (`tests/netns.rs`) run without the daemon: they steer LAN traffic through one uplink with a rule and a table outside FTR's default ranges (priority 90, table 90) and masquerade it.
 
 ## Running
 
-Requirements: Linux, root, iproute2, nftables, dnsmasq (`dnsmasq-base`), `udhcpc`, `ppp`, `pppoe` (rp-pppoe), iputils `ping`, `tc`, the `veth`, `dummy`, `pppoe`, `sch_netem` and nftables NAT kernel modules; `jq` and `musl-tools` for `tests/vm/run-suite.sh`.
+Requirements: Linux, root, iproute2, nftables, dnsmasq (`dnsmasq-base`), `udhcpc`, `ppp`, `pppoe` (rp-pppoe), `kea-dhcp6` (`kea-dhcp6-server`, its service disabled), dhcpcd or ISC dhclient, iputils `ping`, `tc`, the `veth`, `dummy`, `pppoe`, `sch_netem` and nftables NAT kernel modules; `jq` and `musl-tools` for `tests/vm/run-suite.sh`.
 
 Unit tests need nothing special: `cargo test`. The namespace tests are marked `#[ignore]` and need root:
 

@@ -5,9 +5,11 @@
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::Result;
+use testbed::dhcpv6::{DELEGATED_POOL, DHCPV6_T1, DHCPV6_T2, DHCPV6_UNICAST, DHCPV6_VALID, Dhcpv6Client};
 use testbed::ftr;
 use testbed::plan::{self, Family, Node, Uplink};
 use testbed::traffic::tally;
@@ -557,6 +559,32 @@ fn as33_colliding_ipv6_rule_and_route() -> Result<()> {
     Ok(())
 }
 
+/// Undoes what the kernel did with the providers' advertisements on an
+/// uplink while the topology came up, as on a router that has not
+/// configured it yet: no global address, no default route.
+fn unconfigure_ipv6(t: &testbed::Topology, u: Uplink) -> Result<()> {
+    let iface = u.carrier_iface();
+    let r = t.router();
+    r.sysctl(&[
+        &format!("net.ipv6.conf.{iface}.accept_ra=0"),
+        &format!("net.ipv6.conf.{iface}.autoconf=0"),
+    ])?;
+    r.ip(&format!("-6 addr flush dev {iface} scope global"))?;
+    drop_ra_default_routes(t, iface)
+}
+
+/// Brings an uplink up again with advertisements accepted, as a network
+/// manager would: its router solicitations get the gateway and SLAAC.
+fn configure_ipv6(t: &testbed::Topology, u: Uplink) -> Result<()> {
+    let iface = u.carrier_iface();
+    t.router().sysctl(&[
+        &format!("net.ipv6.conf.{iface}.accept_ra=2"),
+        &format!("net.ipv6.conf.{iface}.autoconf=1"),
+    ])?;
+    t.router_link(u, false)?;
+    t.router_link(u, true)
+}
+
 /// AS-44 (IPv6 parts without prefix delegation): the router starts FTR,
 /// for both families, before any uplink is configured: no lease, no global
 /// address, no default route, an empty active set. Then router
@@ -571,17 +599,8 @@ fn as44_ipv6_boot_before_any_uplink_is_configured() -> Result<()> {
         uplink_clients: false,
         ..testbed::Options::default()
     });
-    // The kernel processed the providers' advertisements while the
-    // topology came up: undo it, as on a router that has not configured
-    // its uplinks yet.
-    let r = t.router();
-    for iface in ["wana", "wanb"] {
-        r.sysctl(&[
-            &format!("net.ipv6.conf.{iface}.accept_ra=0"),
-            &format!("net.ipv6.conf.{iface}.autoconf=0"),
-        ])?;
-        r.ip(&format!("-6 addr flush dev {iface} scope global"))?;
-        drop_ra_default_routes(&t, iface)?;
+    for u in [Uplink::A, Uplink::B] {
+        unconfigure_ipv6(&t, u)?;
     }
     for u in Uplink::ALL {
         for fam in Family::ALL {
@@ -595,15 +614,8 @@ fn as44_ipv6_boot_before_any_uplink_is_configured() -> Result<()> {
         assert!(balancing_members(&t, fam)?.is_empty(), "empty {fam} active set");
         assert!(!ftr_rules(&t, fam)?.is_empty(), "FTR's {fam} rules are installed");
     }
-    // Router solicitations: the links come up again with advertisements
-    // accepted, as a network manager would bring them up.
-    for (u, iface) in [(Uplink::A, "wana"), (Uplink::B, "wanb")] {
-        r.sysctl(&[
-            &format!("net.ipv6.conf.{iface}.accept_ra=2"),
-            &format!("net.ipv6.conf.{iface}.autoconf=1"),
-        ])?;
-        t.router_link(u, false)?;
-        t.router_link(u, true)?;
+    for u in [Uplink::A, Uplink::B] {
+        configure_ipv6(&t, u)?;
     }
     t.start_uplink_clients()?;
     t.wait_ready()?;
@@ -621,5 +633,144 @@ fn as44_ipv6_boot_before_any_uplink_is_configured() -> Result<()> {
         );
         assert_eq!(t.leaks(fam)?, 0, "INV-3 for {fam}");
     }
+    Ok(())
+}
+
+/// DHCPv6 message types (RFC 8415), the first byte of the UDP payload.
+const DHCPV6_RENEW: u8 = 5;
+const DHCPV6_REBIND: u8 = 6;
+
+/// Counters of the DHCPv6 messages that reach provider B's server (table
+/// `inet t44`, input hook): `uni` and `renew` (Renew messages) at its
+/// unicast address from the uplink's link, `rebind` by multicast; messages
+/// to the server from the internet are counted in `elsewhere` and dropped,
+/// as by a provider whose DHCPv6 service only its access network reaches.
+fn dhcpv6_counters(t: &testbed::Topology) -> Result<()> {
+    t.ns(Node::IspB).nft(&format!(
+        "table inet t44 {{\n  counter uni {{}}\n  counter renew {{}}\n  counter rebind {{}}\n  counter elsewhere {{}}\n  chain in {{\n    type filter hook input priority -10; policy accept;\n    iifname != \"wan\" udp dport 547 counter name elsewhere drop\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 counter name uni\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 @th,64,8 {DHCPV6_RENEW} counter name renew\n    ip6 daddr ff02::1:2 udp dport 547 @th,64,8 {DHCPV6_REBIND} counter name rebind\n  }}\n}}\n"
+    ))
+}
+
+fn dhcpv6_counter(t: &testbed::Topology, name: &str) -> Result<u64> {
+    t.ns(Node::IspB).counter("inet", "t44", name)
+}
+
+/// Global IPv6 addresses of a router interface with their prefix lengths
+/// and valid lifetimes in seconds.
+fn global_ipv6(t: &testbed::Topology, iface: &str) -> Result<Vec<(IpAddr, u64, u64)>> {
+    let v = t.router().ip_json(&format!("-6 addr show dev {iface} scope global"))?;
+    Ok(v.as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|l| l["addr_info"].as_array().cloned().unwrap_or_default())
+        .filter_map(|a| {
+            Some((
+                a["local"].as_str()?.parse().ok()?,
+                a["prefixlen"].as_u64()?,
+                a["valid_life_time"].as_u64()?,
+            ))
+        })
+        .collect())
+}
+
+/// The router's DHCPv6 address on B (from the server's pool,
+/// 2001:db8:b:ffff::1000-1fff) and its valid lifetime.
+fn dhcpv6_lease(t: &testbed::Topology) -> Result<Option<(IpAddr, u64)>> {
+    let pool: plan::Prefix = "2001:db8:b:ffff::1000/116".parse()?;
+    Ok(global_ipv6(t, "wanb")?
+        .into_iter()
+        .find(|(a, len, _)| *len == 128 && pool.contains(*a))
+        .map(|(a, _, valid)| (a, valid)))
+}
+
+/// The router's LAN address from the prefix that B delegated.
+fn delegated_lan_address(t: &testbed::Topology) -> Result<Option<IpAddr>> {
+    let pool: plan::Prefix = DELEGATED_POOL.parse()?;
+    Ok(global_ipv6(t, "lan")?
+        .into_iter()
+        .map(|(a, _, _)| a)
+        .find(|a| pool.contains(*a)))
+}
+
+/// AS-44 (DHCPv6 with prefix delegation and the server-unicast variant):
+/// FTR runs for IPv6 on A and B before either is configured (empty active
+/// set). B's provider runs a DHCPv6 server that delegates prefixes and
+/// announces the server-unicast option at an address outside the uplink's
+/// on-link prefix; the router's client (dhcpcd, or ISC dhclient where
+/// dhcpcd is not installed) gets an address and a prefix, assigned to the
+/// LAN, and renews at T1 by unicast through B while B is in the active set.
+/// While B is out of the active set (its probes fail, A is up), its
+/// unicast renewals do not reach B's link: dhcpcd leaves their route lookup
+/// unbound, so they are balanced through A (and dropped, the provider's
+/// service being out of reach from the internet); dhclient binds them to
+/// B's interface with a link-local source, so the balancing table, without
+/// B, rejects them and they never leave through A. Either way the client
+/// keeps its lease by rebinding at T2 by multicast (FR-CT-5).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
+    let client = Dhcpv6Client::detect()?;
+    eprintln!("DHCPv6 client: {client:?}");
+    let t = build_with(testbed::Options {
+        uplink_clients: false,
+        ..testbed::Options::default()
+    });
+    for u in [Uplink::A, Uplink::B] {
+        unconfigure_ipv6(&t, u)?;
+    }
+    t.start_dhcpv6_server()?;
+    dhcpv6_counters(&t)?;
+    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    f.wait_installed(&t)?;
+    assert!(balancing_members(&t, Family::V6)?.is_empty(), "empty active set");
+
+    // B comes up: advertisements and DHCPv6. dhcpcd sends its Request by
+    // unicast (the Advertise carries the option), rejected until B joins
+    // the active set.
+    configure_ipv6(&t, Uplink::B)?;
+    t.start_dhcpv6_client(client)?;
+    t.wait_for(
+        "B's DHCPv6 address and delegated prefix",
+        Duration::from_secs(60),
+        || Ok(dhcpv6_lease(&t)?.is_some() && delegated_lan_address(&t)?.is_some()),
+    )?;
+    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(20))?;
+    let (leased, _) = dhcpv6_lease(&t)?.expect("the lease just seen");
+    let lan = delegated_lan_address(&t)?;
+    let renewed = || -> Result<bool> {
+        Ok(dhcpv6_lease(&t)?.is_some_and(|(a, valid)| a == leased && valid + 10 >= DHCPV6_VALID))
+    };
+
+    // Renewal at T1 by unicast through B, the only member of the active set.
+    t.wait_for(
+        "a Renew by unicast on B's link",
+        Duration::from_secs(DHCPV6_T1 + 10),
+        || Ok(dhcpv6_counter(&t, "renew")? > 0),
+    )?;
+    t.wait_for("the renewed lease", Duration::from_secs(5), &renewed)?;
+    assert_eq!(dhcpv6_counter(&t, "elsewhere")?, 0, "every message went through B");
+
+    // B fails its probes and A comes up, before the next T1.
+    t.drop_probe_echoes(Uplink::B, 1)?;
+    configure_ipv6(&t, Uplink::A)?;
+    wait_members(&t, Family::V6, &["wana"], Duration::from_secs(20))?;
+    let renew = dhcpv6_counter(&t, "renew")?;
+    let rebind = dhcpv6_counter(&t, "rebind")?;
+    t.wait_for("a Rebind by multicast", Duration::from_secs(DHCPV6_T2 + 10), || {
+        Ok(dhcpv6_counter(&t, "rebind")? > rebind)
+    })?;
+    t.wait_for("the rebound lease", Duration::from_secs(5), &renewed)?;
+    assert_eq!(
+        dhcpv6_counter(&t, "renew")?,
+        renew,
+        "no Renew by unicast reached B's link while B was out of the active set"
+    );
+    let elsewhere = dhcpv6_counter(&t, "elsewhere")?;
+    match client {
+        Dhcpv6Client::Dhcpcd => assert!(elsewhere > 0, "dhcpcd's unbound renewals were balanced through A"),
+        Dhcpv6Client::Dhclient => assert_eq!(elsewhere, 0, "dhclient's renewals never left through A"),
+    }
+    assert_eq!(delegated_lan_address(&t)?, lan, "the delegated prefix stays on the LAN");
+    assert_eq!(t.ipv6_leaks()?, 0, "INV-3");
     Ok(())
 }
