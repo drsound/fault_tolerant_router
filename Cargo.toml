@@ -8,7 +8,7 @@ exclude = ["spikes"]
 version = "2.0.0-dev"
 edition = "2024"
 rust-version = "1.89"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/drsound/fault_tolerant_router"
 authors = ["Alessandro Zarrilli <alessandro@zarrilli.net>"]
 

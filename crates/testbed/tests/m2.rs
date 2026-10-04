@@ -747,17 +747,20 @@ fn as44_ipv6_boot_before_any_uplink_is_configured() -> Result<()> {
 }
 
 /// DHCPv6 message types (RFC 8415), the first byte of the UDP payload.
+const DHCPV6_REQUEST: u8 = 3;
 const DHCPV6_RENEW: u8 = 5;
 const DHCPV6_REBIND: u8 = 6;
 
 /// Counters of the DHCPv6 messages that reach provider B's server (table
-/// `inet t44`, input hook): `uni` and `renew` (Renew messages) at its
-/// unicast address from the uplink's link, `rebind` by multicast; messages
-/// to the server from the internet are counted in `elsewhere` and dropped,
-/// as by a provider whose DHCPv6 service only its access network reaches.
+/// `inet t44`, input hook): `uni`, `request_uni` (Request messages) and
+/// `renew` (Renew messages) at its unicast address from the uplink's link,
+/// `request_multi` and `rebind` by multicast; messages to the server from
+/// the internet are counted in `elsewhere` (Requests also in
+/// `request_elsewhere`) and dropped, as by a provider whose DHCPv6 service
+/// only its access network reaches.
 fn dhcpv6_counters(t: &testbed::Topology) -> Result<()> {
     t.ns(Node::IspB).nft(&format!(
-        "table inet t44 {{\n  counter uni {{}}\n  counter renew {{}}\n  counter rebind {{}}\n  counter elsewhere {{}}\n  chain in {{\n    type filter hook input priority -10; policy accept;\n    iifname != \"wan\" udp dport 547 counter name elsewhere drop\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 counter name uni\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 @th,64,8 {DHCPV6_RENEW} counter name renew\n    ip6 daddr ff02::1:2 udp dport 547 @th,64,8 {DHCPV6_REBIND} counter name rebind\n  }}\n}}\n"
+        "table inet t44 {{\n  counter uni {{}}\n  counter request_uni {{}}\n  counter request_multi {{}}\n  counter request_elsewhere {{}}\n  counter renew {{}}\n  counter rebind {{}}\n  counter elsewhere {{}}\n  chain in {{\n    type filter hook input priority -10; policy accept;\n    iifname != \"wan\" udp dport 547 @th,64,8 {DHCPV6_REQUEST} counter name request_elsewhere\n    iifname != \"wan\" udp dport 547 counter name elsewhere drop\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 counter name uni\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 @th,64,8 {DHCPV6_REQUEST} counter name request_uni\n    ip6 daddr {DHCPV6_UNICAST} udp dport 547 @th,64,8 {DHCPV6_RENEW} counter name renew\n    ip6 daddr ff02::1:2 udp dport 547 @th,64,8 {DHCPV6_REQUEST} counter name request_multi\n    ip6 daddr ff02::1:2 udp dport 547 @th,64,8 {DHCPV6_REBIND} counter name rebind\n  }}\n}}\n"
     ))
 }
 
@@ -819,8 +822,13 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
 
     // B comes up: advertisements and DHCPv6. dhcpcd sends its Request by
     // unicast (the Advertise carries the option), rejected until B joins
-    // the active set.
+    // the active set. dhclient sends it by multicast; it starts once B is
+    // the active set, so that its acquisition is seen with B in it (the
+    // other scenario sees it with A in it).
     configure_ipv6(&t, Uplink::B)?;
+    if client == Dhcpv6Client::Dhclient {
+        wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(20))?;
+    }
     t.start_dhcpv6_client(client)?;
     t.wait_for(
         "B's DHCPv6 address and delegated prefix",
@@ -828,6 +836,14 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
         || Ok(dhcpv6_lease(&t)?.is_some() && delegated_lan_address(&t)?.is_some()),
     )?;
     wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(20))?;
+    let requests = |name| provider_counter(&t, Node::IspB, "inet", "t44", name);
+    match client {
+        Dhcpv6Client::Dhcpcd => assert!(requests("request_uni")? > 0, "dhcpcd's Request by unicast through B"),
+        Dhcpv6Client::Dhclient => {
+            assert!(requests("request_multi")? > 0, "dhclient's Request by multicast");
+            assert_eq!(requests("request_uni")?, 0, "no Request by unicast");
+        }
+    }
     let (leased, _) = dhcpv6_lease(&t)?.expect("the lease just seen");
     let lan = delegated_lan_address(&t)?;
     // The address and the delegated prefix, both renewed: a lease kept
@@ -873,6 +889,82 @@ fn as44_dhcpv6_prefix_delegation_and_server_unicast() -> Result<()> {
         Dhcpv6Client::Dhclient => assert_eq!(elsewhere, 0, "dhclient's renewals never left through A"),
     }
     assert_eq!(delegated_lan_address(&t)?, lan, "the delegated prefix stays on the LAN");
+    assert_eq!(t.ipv6_leaks()?, 0, "INV-3");
+    Ok(())
+}
+
+/// AS-44 (DHCPv6 acquisition while another uplink is the active set,
+/// FR-CT-5): A is the only member of the active set when B's DHCPv6
+/// client starts, B's probes failing. dhcpcd sends its Request by unicast
+/// (the Advertise carries the server-unicast option) with an unbound route
+/// lookup: balanced through A, every retransmission too, and dropped by the
+/// provider, so no lease until B replaces A in the active set; the next
+/// retransmission then goes through B and the client gets its address and
+/// prefix. ISC dhclient sends its Request by multicast: it gets them while
+/// B is still out of the active set, and nothing goes through A.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as44_dhcpv6_acquisition_while_another_uplink_is_active() -> Result<()> {
+    let client = Dhcpv6Client::detect()?;
+    eprintln!("DHCPv6 client: {client:?}");
+    let t = build_with(testbed::Options {
+        uplink_clients: false,
+        ..testbed::Options::default()
+    });
+    for u in [Uplink::A, Uplink::B] {
+        unconfigure_ipv6(&t, u)?;
+    }
+    t.start_dhcpv6_server()?;
+    dhcpv6_counters(&t)?;
+    let f = t.start_ftr(&ftr::family(&ab(), Family::V6))?;
+    f.wait_installed(&t)?;
+    configure_ipv6(&t, Uplink::A)?;
+    wait_members(&t, Family::V6, &["wana"], Duration::from_secs(20))?;
+    t.drop_probe_echoes(Uplink::B, 1)?;
+    configure_ipv6(&t, Uplink::B)?;
+    t.start_dhcpv6_client(client)?;
+    let acquired = || -> Result<bool> { Ok(dhcpv6_lease(&t)?.is_some() && delegated_lan_address(&t)?.is_some()) };
+    let counter = |name| provider_counter(&t, Node::IspB, "inet", "t44", name);
+    match client {
+        Dhcpv6Client::Dhcpcd => {
+            t.wait_for("three Requests balanced through A", Duration::from_secs(40), || {
+                Ok(counter("request_elsewhere")? >= 3)
+            })?;
+            assert_eq!(
+                balancing_members(&t, Family::V6)?,
+                ["wana"],
+                "B stayed out of the active set"
+            );
+            assert_eq!(dhcpv6_lease(&t)?, None, "no address while A is the active set");
+            assert_eq!(delegated_lan_address(&t)?, None, "no prefix while A is the active set");
+            assert_eq!(counter("request_uni")?, 0, "no Request by unicast reached B's link");
+            assert_eq!(counter("request_multi")?, 0, "no Request by multicast");
+            t.clear_provider_rules(Uplink::B)?;
+            t.drop_probe_echoes(Uplink::A, 1)?;
+            wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(20))?;
+            t.wait_for(
+                "B's DHCPv6 address and delegated prefix through B",
+                Duration::from_secs(60),
+                &acquired,
+            )?;
+            assert!(counter("request_uni")? > 0, "the Request by unicast went through B");
+        }
+        Dhcpv6Client::Dhclient => {
+            t.wait_for(
+                "B's DHCPv6 address and delegated prefix",
+                Duration::from_secs(60),
+                &acquired,
+            )?;
+            assert_eq!(
+                balancing_members(&t, Family::V6)?,
+                ["wana"],
+                "B stayed out of the active set"
+            );
+            assert!(counter("request_multi")? > 0, "dhclient's Request by multicast");
+            assert_eq!(counter("request_uni")?, 0, "no Request by unicast");
+            assert_eq!(counter("elsewhere")?, 0, "nothing went through A");
+        }
+    }
     assert_eq!(t.ipv6_leaks()?, 0, "INV-3");
     Ok(())
 }

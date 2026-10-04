@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 description = "Spike S5: probe sockets with SO_BINDTODEVICE, SO_MARK and a bound source (throw-away)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 getrandom = "0.4.3"
