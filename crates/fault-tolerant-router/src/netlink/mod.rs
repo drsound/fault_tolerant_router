@@ -219,13 +219,14 @@ pub mod groups {
     ];
 }
 
-/// A notification and the port id of the request that caused it (0 for the
-/// kernel itself).
+/// A notification, the port id of the request that caused it (0 for the
+/// kernel itself) and its header flags (`NLM_F_REPLACE`, `NLM_F_APPEND`).
 #[derive(Debug)]
 pub enum Notification {
     Message {
         message: RouteNetlinkMessage,
         port: u32,
+        flags: u16,
     },
     /// `ENOBUFS`: notifications were lost; the observer must resynchronise.
     Overrun,
@@ -260,6 +261,7 @@ impl Subscription {
                     return Some(Notification::Message {
                         message,
                         port: m.header.port_number,
+                        flags: m.header.flags,
                     });
                 }
                 NetlinkPayload::Overrun(_) => return Some(Notification::Overrun),

@@ -597,7 +597,10 @@ impl Daemon {
     }
 
     /// Notification handling (§12.2, FR-COEX-3).
-    fn notification(&mut self, message: RouteNetlinkMessage, port: u32) {
+    fn notification(&mut self, message: RouteNetlinkMessage, port: u32, flags: u16) {
+        if let Some(table) = self.system.stale_after(&self.scope, &message, flags) {
+            self.reread.insert(table);
+        }
         let removed_rule = match &message {
             RouteNetlinkMessage::DelRule(r) => crate::netlink::msg::ObservedRule::parse(r)
                 .filter(|o| o.protocol == self.protocol && self.layout.priorities().contains(&o.priority)),
@@ -660,6 +663,37 @@ impl Daemon {
             Change::Route { .. } | Change::Rule { .. } => self.dirty = true,
             Change::None => {}
         }
+    }
+
+    /// The default routes of the discovery tables, which make paths ready.
+    fn discovery_defaults(&self) -> impl Iterator<Item = &crate::netlink::msg::ObservedRoute> {
+        self.system.routes.values().filter(|r| {
+            r.is_default() && r.protocol != self.protocol && self.cfg.routing.discovery_tables.contains(&r.table)
+        })
+    }
+
+    /// The next expiry of a discovery-table default route (Router
+    /// Advertisements): the kernel collects it without a notification.
+    fn next_expiry(&self) -> Option<Instant> {
+        let now = std::time::Instant::now();
+        self.discovery_defaults()
+            .filter_map(|r| r.expires_at)
+            .filter(|t| *t > now)
+            .min()
+            .map(Instant::from_std)
+    }
+
+    /// Re-reads the tables of expired routes before the next evaluation:
+    /// later Router Advertisements may have refreshed them without a
+    /// notification (FR-DISC-5).
+    fn reread_expired(&mut self) {
+        let now = std::time::Instant::now();
+        let tables: Vec<(Family, u32)> = self
+            .discovery_defaults()
+            .filter(|r| r.expired(now))
+            .map(|r| (r.family, r.table))
+            .collect();
+        self.reread.extend(tables);
     }
 
     /// The uplink on an interface, also after the interface is gone.
@@ -1303,11 +1337,12 @@ impl Daemon {
                 .iter()
                 .chain(self.sysctl_retries.values())
                 .map(|r| r.at)
+                .chain(self.next_expiry())
                 .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
                 n = subscription.next() => match n {
-                    Some(Notification::Message { message, port }) => self.notification(message, port),
+                    Some(Notification::Message { message, port, flags }) => self.notification(message, port, flags),
                     Some(Notification::Overrun) => {
                         warn!("netlink notifications were lost (ENOBUFS): full resynchronisation");
                         self.full_reconciliation().await;
@@ -1320,6 +1355,7 @@ impl Daemon {
                         next_full = Instant::now() + self.cfg.routing.reconcile_interval;
                         self.full_reconciliation().await;
                     } else {
+                        self.reread_expired();
                         self.dirty = true;
                     }
                 }

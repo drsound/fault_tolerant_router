@@ -118,7 +118,7 @@ pub async fn resync<D: Dumper>(c: &D, scope: &Scope, old: &System) -> Result<Vie
         .routes
         .keys()
         .filter(|k| !new.routes.contains_key(k))
-        .map(|(f, t, _, _)| (*f, *t))
+        .map(|(f, t, ..)| (*f, *t))
         .collect();
     for (f, t) in missing_tables {
         // A strict dump of one table is small enough for one batch.

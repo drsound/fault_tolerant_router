@@ -5,6 +5,7 @@
 //! one-member multipath route.
 
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressMessage};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
@@ -39,6 +40,20 @@ fn host_len(a: IpAddr) -> u8 {
     match a {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,
+    }
+}
+
+/// `rta_expires` of `RTA_CACHEINFO`: clock ticks (`USER_HZ`, 100 on every
+/// supported architecture) until expiry, negative once past, 0 without
+/// expiry.
+fn expiry(ticks: u32) -> Option<Instant> {
+    let ticks = ticks as i32;
+    let left = Duration::from_millis(u64::from(ticks.unsigned_abs()) * 10);
+    let now = Instant::now();
+    match ticks {
+        0 => None,
+        t if t > 0 => Some(now + left),
+        _ => Some(now.checked_sub(left).unwrap_or(now)),
     }
 }
 
@@ -290,6 +305,11 @@ pub struct ObservedRoute {
     pub nexthop_id: Option<u32>,
     /// IPv6 router preference: -1 low, 0 medium, 1 high.
     pub preference: i8,
+    /// When the route expires (Router Advertisement routes), as of the
+    /// message's parsing. The kernel collects an expired route without a
+    /// deletion notification and refreshes the expiry without a
+    /// notification either (FR-DISC-5).
+    pub expires_at: Option<Instant>,
     pub message: RouteMessage,
 }
 
@@ -300,8 +320,10 @@ impl ObservedRoute {
         let (mut metric, mut dst, mut source, mut gateway, mut oif, mut nh_id) = (0, None, None, None, None, None);
         let mut multipath = None;
         let mut preference = 0;
+        let mut expires_at = None;
         for a in &m.attributes {
             match a {
+                RouteAttribute::CacheInfo(c) => expires_at = expiry(c.expires),
                 RouteAttribute::Table(t) => table = *t,
                 RouteAttribute::Priority(p) => metric = *p,
                 RouteAttribute::Destination(d) => dst = ip(d),
@@ -371,8 +393,15 @@ impl ObservedRoute {
             nexthops,
             nexthop_id: nh_id,
             preference,
+            expires_at,
             message: m.clone(),
         })
+    }
+
+    /// Whether the route has expired (an expired route can stay listed for
+    /// a moment before the kernel collects it).
+    pub fn expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|t| t <= now)
     }
 
     pub fn is_default(&self) -> bool {
@@ -675,6 +704,34 @@ mod tests {
         let o = ObservedRoute::parse(&m).unwrap();
         assert!(o.nexthops[0].linkdown);
         assert_eq!(o.as_planned().unwrap(), single);
+    }
+
+    #[test]
+    fn route_expiry_follows_the_cache_info_ticks() {
+        let before = Instant::now();
+        assert_eq!(expiry(0), None, "no expiry");
+        let t = expiry(1800 * 100).unwrap();
+        assert!(t >= before + Duration::from_secs(1800));
+        assert!(t <= Instant::now() + Duration::from_secs(1800));
+        // Listed after its expiry, before the kernel collects it.
+        assert!(expiry((-150i32) as u32).unwrap() < before);
+        let gw: IpAddr = "fe80::1".parse().unwrap();
+        let route = Route {
+            family: Family::V6,
+            table: 254,
+            source: None,
+            nexthops: vec![NextHop {
+                ifindex: 5,
+                gateway: Some(gw),
+                onlink: false,
+                weight: 1,
+            }],
+        };
+        let mut o = ObservedRoute::parse(&route_message(&route, 9)).unwrap();
+        assert!(!o.expired(Instant::now()));
+        o.expires_at = expiry(100);
+        assert!(!o.expired(before));
+        assert!(o.expired(before + Duration::from_secs(2)));
     }
 
     #[test]

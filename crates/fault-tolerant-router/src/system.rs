@@ -6,13 +6,32 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use netlink_packet_core::{NLM_F_APPEND, NLM_F_REPLACE};
 use netlink_packet_route::RouteNetlinkMessage;
 
 use crate::model::Family;
 use crate::netlink::msg::{ObservedAddress, ObservedLink, ObservedRoute, ObservedRule, TABLE_MAIN};
 
-/// A route's identity in the kernel: (family, table, destination, metric).
-pub type RouteKey = (Family, u32, Option<(IpAddr, u8)>, u32);
+/// A route's identity in the kernel: (family, table, destination, metric,
+/// next hop). Outside FTR's tables, routes with the same destination and
+/// metric coexist when their next hops differ: IPv6 keeps the Router
+/// Advertisement default routes of every interface, `fe80::/64` of every
+/// interface and routes using different nexthop objects.
+pub type RouteKey = (Family, u32, Option<(IpAddr, u8)>, u32, Via);
+
+/// The next-hop part of a route's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Via {
+    /// FTR's tables hold one route each (§4.3): a replacement changes the
+    /// next hops of the same route.
+    Table,
+    /// A nexthop object (`RTA_NH_ID`).
+    Object(u32),
+    /// A single next hop: interface and gateway.
+    Hop(u32, Option<IpAddr>),
+    /// Several next hops, or none (unreachable, blackhole…).
+    Other,
+}
 
 /// Which routes the model keeps.
 #[derive(Clone, Debug)]
@@ -48,8 +67,17 @@ pub enum Change {
     None,
 }
 
-fn route_key(r: &ObservedRoute) -> RouteKey {
-    (r.family, r.table, r.destination, r.metric)
+fn route_key(scope: &Scope, r: &ObservedRoute) -> RouteKey {
+    let via = if scope.ftr_tables.contains(&r.table) {
+        Via::Table
+    } else if let Some(id) = r.nexthop_id {
+        Via::Object(id)
+    } else if let [h] = r.nexthops.as_slice() {
+        Via::Hop(h.ifindex, h.gateway)
+    } else {
+        Via::Other
+    };
+    (r.family, r.table, r.destination, r.metric, via)
 }
 
 impl System {
@@ -92,7 +120,7 @@ impl System {
             RouteNetlinkMessage::NewRoute(r) => match ObservedRoute::parse(r) {
                 Some(r) if scope.keeps(&r) => {
                     let (family, table) = (r.family, r.table);
-                    self.routes.insert(route_key(&r), r);
+                    self.routes.insert(route_key(scope, &r), r);
                     Change::Route {
                         family,
                         table,
@@ -103,7 +131,7 @@ impl System {
             },
             RouteNetlinkMessage::DelRoute(r) => match ObservedRoute::parse(r) {
                 Some(r) if scope.keeps(&r) => {
-                    self.routes.remove(&route_key(&r));
+                    self.routes.remove(&route_key(scope, &r));
                     Change::Route {
                         family: r.family,
                         table: r.table,
@@ -141,7 +169,7 @@ impl System {
     /// Replaces every route of a family and table with a fresh dump (the
     /// re-reads of §12.2).
     pub fn replace_table(&mut self, scope: &Scope, family: Family, table: u32, dump: &[RouteNetlinkMessage]) {
-        self.routes.retain(|(f, t, _, _), _| !(*f == family && *t == table));
+        self.routes.retain(|(f, t, ..), _| !(*f == family && *t == table));
         for m in dump {
             if let RouteNetlinkMessage::NewRoute(r) = m
                 && let Some(r) = ObservedRoute::parse(r)
@@ -149,9 +177,36 @@ impl System {
                 && r.table == table
                 && scope.keeps(&r)
             {
-                self.routes.insert(route_key(&r), r);
+                self.routes.insert(route_key(scope, &r), r);
             }
         }
+    }
+
+    /// Adds a route as a dump would.
+    pub fn insert_route(&mut self, scope: &Scope, r: ObservedRoute) {
+        self.routes.insert(route_key(scope, &r), r);
+    }
+
+    /// The table to re-read after a route notification that can leave a
+    /// stale entry in the view: a replacement or an append outside FTR's
+    /// tables (the kernel drops or merges the old route without a deletion
+    /// notification, in both families), or a deletion that matches no
+    /// entry (one member of a multipath route).
+    pub fn stale_after(&self, scope: &Scope, m: &RouteNetlinkMessage, flags: u16) -> Option<(Family, u32)> {
+        let (r, deleted) = match m {
+            RouteNetlinkMessage::NewRoute(r) => (ObservedRoute::parse(r)?, false),
+            RouteNetlinkMessage::DelRoute(r) => (ObservedRoute::parse(r)?, true),
+            _ => return None,
+        };
+        if !scope.keeps(&r) || scope.ftr_tables.contains(&r.table) {
+            return None;
+        }
+        let stale = if deleted {
+            !self.routes.contains_key(&route_key(scope, &r))
+        } else {
+            flags & (NLM_F_REPLACE | NLM_F_APPEND) != 0
+        };
+        stale.then_some((r.family, r.table))
     }
 
     pub fn routes_in(&self, family: Family, table: u32) -> impl Iterator<Item = &ObservedRoute> {
@@ -177,6 +232,8 @@ fn same_rule(a: &ObservedRule, b: &ObservedRule) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use netlink_packet_route::AddressFamily;
+    use netlink_packet_route::route::{RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteType};
     use netlink_packet_route::rule::RuleAttribute;
 
     use super::*;
@@ -207,5 +264,70 @@ mod tests {
         assert_eq!(s.rules.len(), 1);
         s.apply(&scope, &RouteNetlinkMessage::DelRule(notified));
         assert!(s.rules.is_empty(), "a third-party deletion removes it");
+    }
+
+    fn scope() -> Scope {
+        Scope {
+            ftr_tables: 1000..=1191,
+            discovery_tables: vec![254],
+        }
+    }
+
+    /// A route message as the kernel notifies it.
+    fn route(table: u32, ifindex: u32, gw: &str, metric: u32) -> RouteMessage {
+        let mut m = RouteMessage::default();
+        m.header.address_family = AddressFamily::Inet6;
+        m.header.table = RouteHeader::RT_TABLE_UNSPEC;
+        m.header.kind = RouteType::Unicast;
+        m.header.protocol = RouteProtocol::Ra;
+        m.attributes.push(RouteAttribute::Table(table));
+        m.attributes.push(RouteAttribute::Priority(metric));
+        m.attributes
+            .push(RouteAttribute::Gateway(gw.parse::<IpAddr>().unwrap().into()));
+        m.attributes.push(RouteAttribute::Oif(ifindex));
+        m
+    }
+
+    #[test]
+    fn routes_with_the_same_destination_and_metric_coexist_outside_ftr_tables() {
+        let scope = scope();
+        let mut s = System::default();
+        // RA default routes of two uplinks: same destination, metric and
+        // link-local gateway (S1, AS-28).
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(route(254, 5, "fe80::1", 1024)));
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(route(254, 6, "fe80::1", 1024)));
+        assert_eq!(s.routes_in(Family::V6, 254).count(), 2);
+        s.apply(&scope, &RouteNetlinkMessage::DelRoute(route(254, 5, "fe80::1", 1024)));
+        let left: Vec<u32> = s.routes_in(Family::V6, 254).map(|r| r.nexthops[0].ifindex).collect();
+        assert_eq!(left, [6]);
+        // FTR's tables hold one route: a replacement replaces it.
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(route(1001, 5, "fe80::1", 100)));
+        s.apply(&scope, &RouteNetlinkMessage::NewRoute(route(1001, 6, "fe80::2", 100)));
+        let ftr: Vec<u32> = s.routes_in(Family::V6, 1001).map(|r| r.nexthops[0].ifindex).collect();
+        assert_eq!(ftr, [6]);
+    }
+
+    #[test]
+    fn replacements_appends_and_unmatched_deletions_call_for_a_reread() {
+        let scope = scope();
+        let mut s = System::default();
+        let a = RouteNetlinkMessage::NewRoute(route(254, 5, "fe80::1", 1024));
+        assert_eq!(s.stale_after(&scope, &a, 0x600), None, "a plain addition");
+        s.apply(&scope, &a);
+        // The kernel replaced the first route with that metric, whatever
+        // its interface, without notifying its removal.
+        let replaced = RouteNetlinkMessage::NewRoute(route(254, 6, "fe80::5", 1024));
+        assert_eq!(s.stale_after(&scope, &replaced, 0x100), Some((Family::V6, 254)));
+        let appended = RouteNetlinkMessage::NewRoute(route(254, 6, "fe80::5", 1024));
+        assert_eq!(s.stale_after(&scope, &appended, 0x800), Some((Family::V6, 254)));
+        let known = RouteNetlinkMessage::DelRoute(route(254, 5, "fe80::1", 1024));
+        assert_eq!(s.stale_after(&scope, &known, 0), None);
+        let unknown = RouteNetlinkMessage::DelRoute(route(254, 7, "fe80::1", 1024));
+        assert_eq!(s.stale_after(&scope, &unknown, 0), Some((Family::V6, 254)));
+        // FTR's own tables and tables outside the scope never need it.
+        let ftr = RouteNetlinkMessage::NewRoute(route(1000, 6, "fe80::5", 100));
+        assert_eq!(s.stale_after(&scope, &ftr, 0x100), None);
+        let other = RouteNetlinkMessage::NewRoute(route(300, 6, "fe80::5", 1024));
+        assert_eq!(s.stale_after(&scope, &other, 0x100), None);
     }
 }

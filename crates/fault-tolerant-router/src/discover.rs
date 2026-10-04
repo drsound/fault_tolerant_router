@@ -203,11 +203,13 @@ fn auto_gateway(
     // Ordered by metric, router preference (highest first), table order, gateway.
     type Rank = (u32, i8, usize, IpAddr);
     let mut best: Option<(Rank, (Option<IpAddr>, bool))> = None;
+    let now = std::time::Instant::now();
     for (order, table) in tables.iter().enumerate() {
         for r in system.routes_in(family, *table) {
             if !r.is_default()
                 || r.kind != netlink_packet_route::route::RouteType::Unicast
                 || r.protocol == own_protocol
+                || r.expired(now)
             {
                 continue;
             }
