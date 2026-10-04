@@ -12,31 +12,9 @@ use testbed::polywan::{self, HealthSpec, UplinkSpec};
 use testbed::traffic::tally;
 use testbed::{Options, Outcome, Topology};
 
+#[macro_use]
 mod common;
 use common::*;
-
-/// The IPv4 and IPv6 variants of scenarios written for either family:
-/// tests `<scenario>::ipv4` and `<scenario>::ipv6`, which run
-/// `<scenario>(Family::V4)` and `<scenario>(Family::V6)`.
-macro_rules! per_family {
-    ($($scenario:ident),+ $(,)?) => {$(
-        mod $scenario {
-            use super::*;
-
-            #[test]
-            #[ignore = "needs root and network namespaces"]
-            fn ipv4() -> Result<()> {
-                super::$scenario(Family::V4)
-            }
-
-            #[test]
-            #[ignore = "needs root and network namespaces"]
-            fn ipv6() -> Result<()> {
-                super::$scenario(Family::V6)
-            }
-        }
-    )+};
-}
 
 per_family!(as01_equal_weights_split_connections_evenly);
 
@@ -782,13 +760,6 @@ fn as40_foreign_earlier_rule_and_missing_local_rule(fam: Family) -> Result<()> {
     );
     t.router().ip(&format!("{flag} rule add pref 0 lookup local"))?;
     Ok(())
-}
-
-/// Starts the test servers in another node (ports 7000/tcp and 7001/udp).
-fn serve_in(t: &Topology, node: Node) -> Result<std::process::Child> {
-    let log = t.dir().join(format!("server-{}.log", node.short()));
-    t.ns(node)
-        .spawn(&t.agent_bin().to_string_lossy(), ["agent", "serve"], &log)
 }
 
 per_family!(as09_inbound_replies_leave_through_the_arrival_uplink);
@@ -1684,52 +1655,7 @@ fn as50_unmanaged_interface_replies_are_not_pinned(fam: Family) -> Result<()> {
     let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     let _client = serve_in(&t, Node::Client)?;
-    // An unmanaged link between the router and the internet node; the
-    // internet node reaches the LAN through it from 198.18.100.50, which the
-    // router reaches only through its uplinks.
-    testbed::netns::host(
-        "ip",
-        [
-            "link",
-            "add",
-            "wanx",
-            "netns",
-            t.router().name(),
-            "type",
-            "veth",
-            "peer",
-            "name",
-            "rx",
-            "netns",
-            t.inet().name(),
-        ],
-    )?;
-    let i = t.inet();
-    let remote = testbed::plan::server(fam, 50);
-    t.router().ip("link set wanx up")?;
-    i.ip("link set rx up")?;
-    if fam == Family::V4 {
-        t.router().ip("addr add 10.250.0.1/30 dev wanx")?;
-        i.ip("addr add 10.250.0.2/30 dev rx")?;
-        i.ip("addr add 198.18.100.50/32 dev lo")?;
-        i.ip("route add 198.51.100.0/24 via 10.250.0.1 src 198.18.100.50")?;
-        for k in ["all", "default", "rx"] {
-            i.sysctl(&[&format!("net.ipv4.conf.{k}.rp_filter=0")])?;
-        }
-        for name in i.run("ls", ["/proc/sys/net/ipv4/conf"])?.split_whitespace() {
-            let _ = i.output("sysctl", ["-qw", &format!("net.ipv4.conf.{name}.rp_filter=0")]);
-        }
-    } else {
-        // The test servers' prefix is local to the internet node (AnyIP),
-        // and IPv6 has no reverse-path filter.
-        t.router().ip("addr add 2001:db8:250::1/64 dev wanx nodad")?;
-        i.ip("addr add 2001:db8:250::2/64 dev rx nodad")?;
-        // A route's source must be an assigned address (AnyIP is not one).
-        i.ip(&format!("addr add {remote}/128 dev lo nodad"))?;
-        i.ip(&format!(
-            "-6 route add 2001:db8:1::/64 via 2001:db8:250::1 src {remote}"
-        ))?;
-    }
+    let remote = unmanaged_link(&t, fam)?;
     let ipk = ip(fam);
     counter(&t, "a", &format!("oifname \"wana\" {ipk} daddr {remote}"))?;
     counter(&t, "b", &format!("oifname \"wanb\" {ipk} daddr {remote}"))?;
@@ -2425,7 +2351,9 @@ per_family!(as27_failure_after_each_step);
 /// AS-27: a failure injected after each step of the uplink addition and
 /// removal orders (FR-REC-3) and of runtime updates (an active-set change,
 /// a new source address, a recreated interface), with continuous traffic: pinned client
-/// connections, a router-originated connection, an inbound connection. While
+/// connections, a router-originated connection, an inbound connection, and
+/// connections matching a balance policy to C and a block policy to A (the
+/// policy variants, whose tables and rules are steps of these orders). While
 /// the failed generation is held and after its retry, no packet is routed by
 /// an operating-system route (INV-3) and no packet of a pinned or inbound
 /// connection leaves through another uplink; connections on B, which no
@@ -2436,8 +2364,17 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
     // A path whose route failed is not ready until a discovery change or the
     // next full reconciliation (FR-DISC-7).
     let routing = "reconcile_interval = \"10s\"";
-    let with_c = polywan::config(&abc(), stack_families(fam), &health, routing, "");
-    let without_c = polywan::config(&ab(), stack_families(fam), &health, routing, "");
+    // Test server 64 by a balance policy to C, 65 by a block policy to A.
+    let policy = |name: &str, server: u8, uplink: &str, fallback: &str| {
+        format!(
+            "[[policy]]\nname = \"{name}\"\nfamily = \"{fam}\"\ndestination = \"{}\"\nuplink = \"{uplink}\"\nfallback = \"{fallback}\"\n",
+            testbed::plan::server(fam, server)
+        )
+    };
+    let on_c = policy("to-c", 64, "c", "balance");
+    let on_a = policy("to-a", 65, "a", "block");
+    let with_c = polywan::config(&abc(), stack_families(fam), &health, routing, &format!("{on_c}{on_a}"));
+    let without_c = polywan::config(&ab(), stack_families(fam), &health, routing, &on_a);
     // Leaks of every managed family (the IPv6 variant is dual-stack).
     let leaks = || -> Result<u64> {
         let mut n = 0;
@@ -2468,6 +2405,7 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
     // those of the uplink it affects.
     let a_addr: std::net::IpAddr = a.parse()?;
     let start_traffic = || -> Result<Vec<testbed::traffic::Flow>> {
+        // Servers 60 to 71: 64 and 65 are those of the policies.
         let mut flows = start_flows(&t, fam, 60, 12)?;
         flows.push(t.start_flow(Node::Router, testbed::plan::server(fam, 75), Duration::from_millis(50))?);
         flows.push(t.start_flow(Node::Inet, a_addr, Duration::from_millis(50))?);

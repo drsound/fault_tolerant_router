@@ -1,0 +1,53 @@
+version = 2
+[[downlink]]
+interface = "lan"
+[[downlink]]
+interface = "dmz"
+[[uplink]]
+id = 1
+name = "a"
+interface = "wana"
+priority = 1
+[uplink.ipv4]
+[uplink.ipv6]
+nat = "masquerade"
+[[uplink]]
+id = 2
+name = "b"
+interface = "wanb"
+priority = 1
+[uplink.ipv4]
+[[policy]]
+name = "smtp via a"
+family = "ipv4"
+source = "198.51.100.25"
+protocol = "tcp"
+destination_port = 25
+uplink = "a"
+fallback = "block"
+[[policy]]
+name = "voip"
+family = "ipv4"
+input_interface = "dmz"
+destination = "192.0.2.77/24"
+protocol = "udp"
+destination_port = "5060-5070"
+uplink = "b"
+[[policy]]
+name = "ping"
+family = "ipv4"
+protocol = "icmp"
+uplink = "b"
+[[policy]]
+name = "v6\nsctp"
+family = "ipv6"
+source = "2001:db8:1::/64"
+protocol = "sctp"
+destination_port = 9899
+uplink = "a"
+fallback = "block"
+[[policy]]
+name = "v6 echo"
+family = "ipv6"
+protocol = "icmpv6"
+uplink = "a"

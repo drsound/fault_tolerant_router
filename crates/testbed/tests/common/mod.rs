@@ -1,7 +1,7 @@
 //! Helpers shared by the acceptance scenarios of `m1.rs`, `m2.rs` and `m3.rs`.
 
 // Each scenario file uses part of them.
-#![allow(dead_code)]
+#![allow(dead_code, unused_macros)]
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -24,6 +24,87 @@ pub fn build_with(opts: Options) -> Topology {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_polywan-testbed")));
     Topology::build(Options { agent_bin, ..opts }).unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+/// The IPv4 and IPv6 variants of scenarios written for either family:
+/// tests `<scenario>::ipv4` and `<scenario>::ipv6`, which run
+/// `<scenario>(Family::V4)` and `<scenario>(Family::V6)`.
+macro_rules! per_family {
+    ($($scenario:ident),+ $(,)?) => {$(
+        mod $scenario {
+            use super::*;
+
+            #[test]
+            #[ignore = "needs root and network namespaces"]
+            fn ipv4() -> Result<()> {
+                super::$scenario(Family::V4)
+            }
+
+            #[test]
+            #[ignore = "needs root and network namespaces"]
+            fn ipv6() -> Result<()> {
+                super::$scenario(Family::V6)
+            }
+        }
+    )+};
+}
+
+/// An interface the router does not manage (`wanx`), linked to the internet
+/// node, which reaches the LAN through it from the returned address of the
+/// test servers' prefix, an address the router reaches only through its
+/// uplinks (AS-50).
+pub fn unmanaged_link(t: &Topology, fam: Family) -> Result<IpAddr> {
+    testbed::netns::host(
+        "ip",
+        [
+            "link",
+            "add",
+            "wanx",
+            "netns",
+            t.router().name(),
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "rx",
+            "netns",
+            t.inet().name(),
+        ],
+    )?;
+    let i = t.inet();
+    let remote = testbed::plan::server(fam, 50);
+    t.router().ip("link set wanx up")?;
+    i.ip("link set rx up")?;
+    if fam == Family::V4 {
+        t.router().ip("addr add 10.250.0.1/30 dev wanx")?;
+        i.ip("addr add 10.250.0.2/30 dev rx")?;
+        i.ip("addr add 198.18.100.50/32 dev lo")?;
+        i.ip("route add 198.51.100.0/24 via 10.250.0.1 src 198.18.100.50")?;
+        for k in ["all", "default", "rx"] {
+            i.sysctl(&[&format!("net.ipv4.conf.{k}.rp_filter=0")])?;
+        }
+        for name in i.run("ls", ["/proc/sys/net/ipv4/conf"])?.split_whitespace() {
+            let _ = i.output("sysctl", ["-qw", &format!("net.ipv4.conf.{name}.rp_filter=0")]);
+        }
+    } else {
+        // The test servers' prefix is local to the internet node (AnyIP),
+        // and IPv6 has no reverse-path filter.
+        t.router().ip("addr add 2001:db8:250::1/64 dev wanx nodad")?;
+        i.ip("addr add 2001:db8:250::2/64 dev rx nodad")?;
+        // A route's source must be an assigned address (AnyIP is not one).
+        i.ip(&format!("addr add {remote}/128 dev lo nodad"))?;
+        i.ip(&format!(
+            "-6 route add 2001:db8:1::/64 via 2001:db8:250::1 src {remote}"
+        ))?;
+    }
+    Ok(remote)
+}
+
+/// Starts the test servers in another node (ports 7000/tcp and 7001/udp).
+pub fn serve_in(t: &Topology, node: Node) -> Result<std::process::Child> {
+    let log = t.dir().join(format!("server-{}.log", node.short()));
+    t.ns(node)
+        .spawn(&t.agent_bin().to_string_lossy(), ["agent", "serve"], &log)
 }
 
 /// The configuration of a scenario variant over `uplinks`: IPv4 alone for

@@ -129,7 +129,7 @@ fn spec_example_is_valid() {
     assert_eq!(email.sendmail, PathBuf::from("/usr/sbin/sendmail"));
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
     assert!(c.manages(Family::V6));
-    assert_eq!(c.unsupported_features().len(), 4, "policies, email, hooks, metrics");
+    assert_eq!(c.unsupported_features().len(), 3, "email, hooks, metrics");
 }
 
 #[test]

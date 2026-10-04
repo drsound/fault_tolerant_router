@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use crate::config::{AutoOr, Config, Nat};
+use crate::config::{AutoOr, Config, Fallback, Nat, Policy, Protocol};
 use crate::model::{Family, FieldValue, FwMask, UplinkId};
 
 /// Name of the managed table (`inet`, FR-FW-1).
@@ -67,6 +67,66 @@ impl Gen {
             Self::hex(self.mask.class_mask()),
             self.enc(FieldValue::PROBE_CLASS)
         )
+    }
+
+    /// One policy rule: the original direction only, so that replies of
+    /// connections without a path value follow FR-ROUTE-3.
+    fn policy(&mut self, config: &Config, p: &Policy) {
+        let (ip, l4) = match p.family {
+            Family::V4 => ("ip", "icmp"),
+            Family::V6 => ("ip6", "ipv6-icmp"),
+        };
+        let inputs = match &p.input_interface {
+            Some(i) => quote(i),
+            None => format!(
+                "{{ {} }}",
+                config.downlinks.iter().map(|d| quote(d)).collect::<Vec<_>>().join(", ")
+            ),
+        };
+        let mut rule = format!(
+            "meta nfproto {} iifname {inputs} ct direction original",
+            nfproto(p.family)
+        );
+        if let Some(n) = p.source {
+            let _ = write!(rule, " {ip} saddr {n}");
+        }
+        if let Some(n) = p.destination {
+            let _ = write!(rule, " {ip} daddr {n}");
+        }
+        if let Some(proto) = p.protocol {
+            let name = match proto {
+                Protocol::Tcp => "tcp",
+                Protocol::Udp => "udp",
+                Protocol::Sctp => "sctp",
+                Protocol::Icmp | Protocol::Icmpv6 => l4,
+            };
+            let _ = write!(rule, " meta l4proto {name}");
+        }
+        match p.destination_port {
+            Some((a, b)) if a == b => {
+                let _ = write!(rule, " th dport {a}");
+            }
+            Some((a, b)) => {
+                let _ = write!(rule, " th dport {a}-{b}");
+            }
+            None => {}
+        }
+        let (value, fallback) = match p.fallback {
+            Fallback::Balance => (FieldValue::policy_balance(p.uplink), "balance"),
+            Fallback::Block => (FieldValue::policy_block(p.uplink), "block"),
+        };
+        let _ = write!(rule, " {} return", self.set("meta mark", value));
+        let uplink = config.uplink(p.uplink).map_or("", |u| u.name.as_str());
+        // Policy names are free text: escaped, they stay on the comment line.
+        self.line(
+            2,
+            &format!(
+                "# policy \"{}\": uplink {uplink:?}, {}, fallback {fallback}",
+                p.name.escape_default(),
+                p.family
+            ),
+        );
+        self.line(2, &rule);
     }
 
     fn restore_all(&mut self) {
@@ -146,6 +206,19 @@ pub fn ruleset(config: &Config) -> String {
         );
         g.line(2, &format!("# uplink {:?}, {f}", u.name));
         g.line(2, &rule);
+    }
+    if !config.policies.is_empty() {
+        g.line(
+            2,
+            "# Policies, first match wins: new forwarded connections from downlinks get",
+        );
+        g.line(
+            2,
+            "# the policy value in the packet mark only (§4.7 step 1.3, FR-POL-1, FR-POL-2).",
+        );
+    }
+    for p in &config.policies {
+        g.policy(config, p);
     }
     g.line(1, "}");
 
@@ -282,6 +355,17 @@ mod tests {
         assert_eq!(text, expected);
         // Both families are managed: no family is skipped (§4.3).
         assert!(!text.contains("meta nfproto != "));
+    }
+
+    #[test]
+    fn golden_policies_ruleset() {
+        let cfg = config::parse(include_str!("../tests/golden/policies.toml")).unwrap();
+        let text = ruleset(&cfg);
+        let expected = include_str!("../tests/golden/policies.nft");
+        if text != expected {
+            eprintln!("{text}");
+        }
+        assert_eq!(text, expected);
     }
 
     #[test]

@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use testbed::Outcome;
-use testbed::plan::{Family, Node};
+use testbed::plan::{Family, Node, TCP_PORT, TCP_PORT_HTTPS, Uplink};
 use testbed::polywan::{self, HealthSpec};
 use testbed::traffic::tally;
 
+#[macro_use]
 mod common;
 use common::*;
 
@@ -188,5 +189,227 @@ fn impl6_unreadable_state_and_drain_pruning() -> Result<()> {
     f.wait_installed(&t)?;
     assert!(!drain.exists() || names(&drain)?.is_empty());
     f.stop()?;
+    Ok(())
+}
+
+/// `[[policy]]` tables: (name, family, uplink, fallback, extra keys).
+fn policies(list: &[(&str, Family, &str, &str, &str)]) -> String {
+    list.iter()
+        .map(|(name, fam, uplink, fallback, extra)| {
+            format!(
+                "[[policy]]\nname = \"{name}\"\nfamily = \"{fam}\"\nuplink = \"{uplink}\"\nfallback = \"{fallback}\"\n{extra}"
+            )
+        })
+        .collect()
+}
+
+/// Connections rejected by a guard: none succeeds and at least one gets
+/// the ICMP error; the kernel rate-limits these errors (more strictly on
+/// Linux 6.1), so later attempts time out instead.
+fn assert_rejected(r: &[testbed::traffic::ConnResult]) {
+    let outcomes: Vec<Outcome> = r.iter().map(|c| c.outcome).collect();
+    assert!(
+        outcomes.contains(&Outcome::Unreachable) && !outcomes.contains(&Outcome::Ok),
+        "rejected: {outcomes:?}"
+    );
+}
+
+per_family!(as15_block_and_balance_policies_across_a_failure);
+
+/// AS-15: a block policy (TCP 443) and a balance policy (TCP 7000) to A.
+/// While A is healthy both go through A; while A is down, new block-policy
+/// connections are rejected and new balance-policy connections use B;
+/// connections opened before the failure stay on A, and those opened on B
+/// stay on B after A recovers (INV-2).
+fn as15_block_and_balance_policies_across_a_failure(fam: Family) -> Result<()> {
+    let t = build();
+    let rules = policies(&[
+        (
+            "https-on-a",
+            fam,
+            "a",
+            "block",
+            &format!("protocol = \"tcp\"\ndestination_port = {TCP_PORT_HTTPS}\n"),
+        ),
+        (
+            "flows-on-a",
+            fam,
+            "a",
+            "balance",
+            &format!("protocol = \"tcp\"\ndestination_port = {TCP_PORT}\n"),
+        ),
+    ]);
+    let config = polywan::config(&ab(), stack_families(fam), &HealthSpec::fast(), "", &rules);
+    let f = t.start_polywan(&config)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    let on = |port: u16| {
+        t.connect_to(
+            Node::Client,
+            &servers(fam, 1, 20, port),
+            20,
+            false,
+            Duration::from_secs(2),
+        )
+    };
+    for port in [TCP_PORT, TCP_PORT_HTTPS] {
+        let r = on(port)?;
+        assert_eq!(tally(&r).get(&Some(Uplink::A)), Some(&20), "{port}: {:?}", tally(&r));
+    }
+    // Traffic that no policy matches is balanced.
+    let r = t.connect_many(Node::Client, fam, 20, 40, true)?;
+    assert!(r.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&r));
+    let before = start_flows(&t, fam, 30, 6)?;
+    std::thread::sleep(Duration::from_millis(500));
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, fam, &["wanb"], Duration::from_secs(15))?;
+    let r = on(TCP_PORT)?;
+    assert_eq!(
+        tally(&r).get(&Some(Uplink::B)),
+        Some(&20),
+        "balance fallback: {:?}",
+        tally(&r)
+    );
+    // Rejected by the policy-block guard.
+    counter(
+        &t,
+        "https",
+        &format!("oifname {{ \"wana\", \"wanb\" }} tcp dport {TCP_PORT_HTTPS}"),
+    )?;
+    assert_rejected(&on(TCP_PORT_HTTPS)?);
+    assert_eq!(counter_value(&t, "https")?, 0, "no block-policy packet leaves");
+    let during = start_flows(&t, fam, 40, 6)?;
+    std::thread::sleep(Duration::from_millis(500));
+    t.upstream_up(Uplink::A)?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(20))?;
+    let r = on(TCP_PORT)?;
+    assert_eq!(tally(&r).get(&Some(Uplink::A)), Some(&20), "{:?}", tally(&r));
+    std::thread::sleep(Duration::from_secs(1));
+    for r in before.into_iter().map(|f| f.stop()).collect::<Result<Vec<_>>>()? {
+        assert!(
+            r.uplink() == Some(Uplink::A) && r.received > 0,
+            "opened before the failure: {r:?}"
+        );
+    }
+    for r in during.into_iter().map(|f| f.stop()).collect::<Result<Vec<_>>>()? {
+        assert!(
+            r.uplink() == Some(Uplink::B) && r.continuous(Duration::from_secs(1)),
+            "opened on B: {r:?}"
+        );
+    }
+    Ok(())
+}
+
+per_family!(as15_replies_of_unassigned_connections_are_not_policy_marked);
+
+/// AS-15, §4.7 step 1.3: a block policy to A matching the LAN host's TCP
+/// traffic does not catch the host's replies to a connection that arrived on
+/// an interface PolyWAN does not manage (no path value): while A is down
+/// they follow the balancing route through B instead of being rejected.
+fn as15_replies_of_unassigned_connections_are_not_policy_marked(fam: Family) -> Result<()> {
+    let t = build();
+    let rules = policies(&[(
+        "lan-host-on-a",
+        fam,
+        "a",
+        "block",
+        &format!("source = \"{}\"\nprotocol = \"tcp\"\n", lan_client(fam)),
+    )]);
+    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", &rules))?;
+    f.wait_installed(&t)?;
+    let _client = serve_in(&t, Node::Client)?;
+    let remote = unmanaged_link(&t, fam)?;
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, fam, &["wanb"], Duration::from_secs(15))?;
+    // The policy applies to the host's own new connections.
+    let r = t.connect_to(
+        Node::Client,
+        &servers(fam, 1, 5, TCP_PORT),
+        5,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert_rejected(&r);
+    counter(&t, "b", &format!("oifname \"wanb\" {} daddr {remote}", ip(fam)))?;
+    let flow = t.start_flow(Node::Inet, lan_client(fam), Duration::from_millis(50))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let report = flow.stop()?;
+    assert!(
+        report.received > 0 && report.continuous(Duration::from_secs(1)),
+        "{report:?}"
+    );
+    assert!(counter_value(&t, "b")? > 0, "replies balanced through B");
+    t.upstream_up(Uplink::A)?;
+    Ok(())
+}
+
+per_family!(as48_policy_marked_traffic_from_a_router_address_is_balanced);
+
+/// AS-48: a forwarded connection whose source is A's address (a constructed
+/// case: the LAN host uses it) matches a balance policy to A while A is
+/// down: it is balanced through B, neither routed by A's source rule nor
+/// rejected by the source guard (INV-4). IPv4 needs `accept_local = 1` on
+/// the downlink, or the kernel drops the packet as a martian.
+fn as48_policy_marked_traffic_from_a_router_address_is_balanced(fam: Family) -> Result<()> {
+    let t = build();
+    let a = t
+        .uplink_address(Uplink::A, fam)?
+        .ok_or_else(|| anyhow::anyhow!("A has no {fam} address"))?;
+    let rules = policies(&[(
+        "from-a",
+        fam,
+        "a",
+        "balance",
+        &format!("source = \"{a}\"\nprotocol = \"tcp\"\n"),
+    )]);
+    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", &rules))?;
+    f.wait_installed(&t)?;
+    match fam {
+        Family::V4 => {
+            t.router().sysctl(&["net.ipv4.conf.lan.accept_local=1"])?;
+            t.client().ip(&format!("addr add {a}/32 dev lo"))?;
+        }
+        Family::V6 => {
+            t.client().ip(&format!("addr add {a}/128 dev lo nodad"))?;
+        }
+    }
+    t.upstream_down(Uplink::A)?;
+    wait_members(&t, fam, &["wanb"], Duration::from_secs(15))?;
+    // TCP only: A's probes have A's address too.
+    let ipk = ip(fam);
+    for (name, iface) in [("a", "wana"), ("b", "wanb")] {
+        counter(
+            &t,
+            name,
+            &format!("oifname \"{iface}\" ct original {ipk} saddr {a} tcp dport {TCP_PORT}"),
+        )?;
+    }
+    // The replies go to A's address, which is the router's: the connections
+    // cannot complete, only their first packets matter.
+    let binding = testbed::agent::Binding {
+        source: Some(a),
+        device: None,
+    };
+    let connect = || {
+        t.connect_bound(
+            Node::Client,
+            &servers(fam, 1, 5, TCP_PORT),
+            5,
+            false,
+            Duration::from_secs(1),
+            &binding,
+        )
+    };
+    connect()?;
+    let (via_a, via_b) = (counter_value(&t, "a")?, counter_value(&t, "b")?);
+    assert!(via_a == 0 && via_b > 0, "balanced through B: a={via_a} b={via_b}");
+    // Control: without the policy the same packets carry no PolyWAN value,
+    // and A's source rule routes them through A's path table.
+    f.write_config(&polywan::family(&ab(), fam))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    connect()?;
+    assert!(counter_value(&t, "a")? > 0, "the source rule takes unmarked packets");
+    t.upstream_up(Uplink::A)?;
     Ok(())
 }
