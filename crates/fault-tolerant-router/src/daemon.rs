@@ -71,8 +71,22 @@ fn gateway_warning() -> Duration {
     crate::test_hooks::gateway_warning(GATEWAY_WARNING)
 }
 
-/// Queued netlink notifications handled before the pass they lead to.
+/// Queued netlink notifications handled before the pass they lead to, a
+/// bound that keeps the other events of the loop served.
 const NOTIFICATION_BATCH: usize = 1000;
+
+/// `first` and the items `queued` yields, at most `limit` in all, ending
+/// with the first one that `ends` the batch; no item is taken beyond them.
+fn batch<T>(first: T, mut queued: impl FnMut() -> Option<T>, limit: usize, ends: impl Fn(&T) -> bool) -> Vec<T> {
+    let mut items = vec![first];
+    while items.len() < limit
+        && !items.last().is_some_and(&ends)
+        && let Some(n) = queued()
+    {
+        items.push(n);
+    }
+    items
+}
 
 /// A path's mark assignment in the nftables table: the path and the
 /// interface its rules match.
@@ -1524,23 +1538,21 @@ impl Daemon {
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
                 n = subscription.next() => {
+                    let Some(first) = n else {
+                        bail!("the netlink subscription closed");
+                    };
                     // A burst is handled in one pass: the notifications
-                    // already queued first, up to a bound that keeps the
-                    // other events of the loop served.
-                    let mut n = n;
-                    for _ in 0..NOTIFICATION_BATCH {
+                    // already queued first.
+                    let queued = batch(first, || subscription.queued(), NOTIFICATION_BATCH, |n| {
+                        matches!(n, Notification::Overrun)
+                    });
+                    for n in queued {
                         match n {
-                            Some(Notification::Message { message, port, flags }) => self.notification(message, port, flags),
-                            Some(Notification::Overrun) => {
+                            Notification::Message { message, port, flags } => self.notification(message, port, flags),
+                            Notification::Overrun => {
                                 warn!("netlink notifications were lost (ENOBUFS): full resynchronisation");
                                 self.full_reconciliation().await;
-                                break;
                             }
-                            None => bail!("the netlink subscription closed"),
-                        }
-                        n = subscription.queued();
-                        if n.is_none() {
-                            break;
                         }
                     }
                 }
@@ -1651,6 +1663,20 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_takes_nothing_beyond_its_bound_or_its_end() {
+        let mut source = 2..=1001;
+        let items = batch(1, || source.next(), 1000, |_| false);
+        assert_eq!(items, (1..=1000).collect::<Vec<_>>());
+        assert_eq!(source.next(), Some(1001), "left for the next batch");
+        // An overrun ends its batch; what follows waits.
+        let mut source = 2..=10;
+        assert_eq!(batch(1, || source.next(), 1000, |n| *n == 5), [1, 2, 3, 4, 5]);
+        assert_eq!(source.next(), Some(6));
+        let mut empty = std::iter::empty::<u32>();
+        assert_eq!(batch(7, || empty.next(), 1000, |_| false), [7]);
+    }
 
     #[test]
     fn paths_without_their_assignment_wait_for_the_replacement() {
