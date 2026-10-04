@@ -2961,8 +2961,17 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
     let flows: Vec<_> = (80..86)
         .map(|n| t.start_flow(Node::Client, testbed::plan::server(fam, n), Duration::from_millis(50)))
         .collect::<Result<_>>()?;
+    // Stops the stream also when an assertion below panics: the scope joins
+    // the stream thread before it propagates the panic.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| -> Result<()> {
+        let stopping = StopOnDrop(&stop);
         let stream = s.spawn(|| -> Result<Vec<testbed::ConnResult>> {
             let mut all = Vec::new();
             while !stop.load(Ordering::Relaxed) {
@@ -3011,7 +3020,7 @@ fn as36_active_set_updates_under_new_connections(fam: Family) -> Result<()> {
             }
             Ok(())
         })();
-        stop.store(true, Ordering::Relaxed);
+        drop(stopping);
         let all = stream.join().expect("stream thread")?;
         result?;
         assert!(all.len() >= 40, "a continuous stream: {} connections", all.len());
