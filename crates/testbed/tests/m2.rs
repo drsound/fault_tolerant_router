@@ -485,8 +485,12 @@ fn fr_sys_3_router_advertisement_warnings() -> Result<()> {
         "once, and not for A: {}",
         f.log()
     );
-    // Router Advertisements again: B becomes ready.
+    // Router Advertisements again: B's link comes up again, as a network
+    // manager would bring it up, and its solicitation gets an advertisement
+    // at once (the provider's next unsolicited one can be minutes away).
     r.sysctl(&["net.ipv6.conf.wanb.accept_ra=2"])?;
+    t.router_link(Uplink::B, false)?;
+    t.router_link(Uplink::B, true)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(20))?;
     Ok(())
 }

@@ -2300,7 +2300,8 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
     t.wait_for("A's unicast renewal", lease, || {
         Ok(provider_counter(&t, Node::IspA, "ip", "t44", "uni")? > 0)
     })?;
-    t.wait_for("A's renewed lease", Duration::from_secs(5), || renewed(Uplink::A))?;
+    t.wait_for("A's renewed lease", Duration::from_secs(5), || renewed(Uplink::A))
+        .with_context(|| format!("A's valid lifetime {:?}\n{}", valid_lft(&t, Uplink::A), t.diagnostics()))?;
     let left = lease.saturating_sub(acquired.elapsed());
     t.wait_for("B's broadcast rebinding", left, || {
         Ok(provider_counter(&t, Node::IspB, "ip", "t44", "bc")? > bc_b)
