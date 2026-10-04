@@ -71,6 +71,21 @@ fn gateway_warning() -> Duration {
     crate::test_hooks::gateway_warning(GATEWAY_WARNING)
 }
 
+/// A path's mark assignment in the nftables table: the path and the
+/// interface its rules match.
+type Assignment = (PathKey, String);
+
+/// FR-REC-3: the configured paths whose assignments the table does not
+/// hold (`known`: the assignments last applied, or adopted at startup), a
+/// family added to an uplink or an uplink moved to another interface
+/// included. They join the balancing and policy routes only after the
+/// replacement installs them; without a known table, none is held back.
+fn unassigned(configured: &BTreeSet<Assignment>, known: Option<&BTreeSet<Assignment>>) -> BTreeSet<PathKey> {
+    known.map_or_else(BTreeSet::new, |known| {
+        configured.difference(known).map(|(k, _)| *k).collect()
+    })
+}
+
 /// Retry state after a failed application (FR-REC-5).
 struct Retry {
     at: Instant,
@@ -122,8 +137,8 @@ struct Daemon {
     active: BTreeMap<Family, BTreeSet<UplinkId>>,
     drained: BTreeSet<UplinkId>,
     route_failed: BTreeMap<PathKey, String>,
-    /// The transaction last applied and the paths it assigns.
-    nft_applied: Option<(String, BTreeSet<PathKey>)>,
+    /// The transaction last applied and the assignments it holds.
+    nft_applied: Option<(String, BTreeSet<Assignment>)>,
     nft_listing: Option<serde_json::Value>,
     nft_missing: bool,
     /// Configured paths that FTR's table found at startup already assigns
@@ -131,7 +146,7 @@ struct Daemon {
     /// were added while FTR was stopped: like an addition by reload, they
     /// join the balancing and policy routes only after the replacement
     /// installs their assignments (FR-REC-3).
-    nft_adopted: Option<BTreeSet<PathKey>>,
+    nft_adopted: Option<BTreeSet<Assignment>>,
     retry: Option<Retry>,
     degraded: BTreeSet<&'static str>,
     ownership: BTreeMap<&'static str, Ownership>,
@@ -307,18 +322,17 @@ pub async fn run(opts: Options) -> Result<()> {
     if d.cfg.firewall.mode == FirewallMode::Managed
         && let Ok(Some(listing)) = nftctl::table(&d.cfg.firewall.nft_path).await
     {
-        // The paths whose assignments the table has.
+        // The assignments the table has.
         let mask = d.cfg.routing.fwmark_mask;
         d.nft_adopted = Some(
-            d.configured_paths()
+            d.assignments()
                 .into_iter()
-                .filter(|k| {
-                    let u = d.cfg.uplink(k.uplink).expect("configured");
+                .filter(|(k, interface)| {
                     nftctl::assigns(
                         &listing,
                         k.family.key(),
-                        &u.interface,
-                        mask.encode(FieldValue::path(u.id)),
+                        interface,
+                        mask.encode(FieldValue::path(k.uplink)),
                     )
                 })
                 .collect(),
@@ -1076,12 +1090,16 @@ impl Daemon {
         }
     }
 
-    /// Every configured path.
-    fn configured_paths(&self) -> BTreeSet<PathKey> {
+    /// The mark assignment of every configured path: its interface, which a
+    /// reload may change while the uplink keeps its id.
+    fn assignments(&self) -> BTreeSet<Assignment> {
         self.cfg
             .uplinks
             .iter()
-            .flat_map(|u| u.families().map(|family| PathKey { uplink: u.id, family }))
+            .flat_map(|u| {
+                u.families()
+                    .map(|family| (PathKey { uplink: u.id, family }, u.interface.clone()))
+            })
             .collect()
     }
 
@@ -1178,15 +1196,16 @@ impl Daemon {
         let input = self.evaluate();
         let managed = self.cfg.firewall.mode == FirewallMode::Managed;
         let transaction = nft::transaction(&self.cfg);
-        let configured = self.configured_paths();
+        let configured = self.assignments();
         let nft_pending =
             managed && (self.nft_missing || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
-        // Paths without assignments yet, also a family added to an existing
-        // uplink, join the balancing and policy routes after them (FR-REC-3).
-        let new_paths: BTreeSet<PathKey> = match (&self.nft_applied, &self.nft_adopted, managed) {
-            (Some((_, applied)), _, true) => configured.difference(applied).copied().collect(),
-            (None, Some(adopted), true) => configured.difference(adopted).copied().collect(),
-            _ => BTreeSet::new(),
+        let new_paths = if managed {
+            unassigned(
+                &configured,
+                self.nft_applied.as_ref().map(|(_, a)| a).or(self.nft_adopted.as_ref()),
+            )
+        } else {
+            BTreeSet::new()
         };
         let desired = plan::plan(&self.cfg, &input);
         let before = (!new_paths.is_empty()).then(|| plan::plan(&self.cfg, &plan::without(&input, &new_paths)));
@@ -1620,5 +1639,31 @@ impl Daemon {
         }
         info!(operations = ops.len(), "dry run complete; nothing was changed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_without_their_assignment_wait_for_the_replacement() {
+        let path = |uplink: u8, family| PathKey {
+            uplink: UplinkId::new(uplink).expect("an uplink id"),
+            family,
+        };
+        let a4 = (path(1, Family::V4), "wana".to_owned());
+        let a6 = (path(1, Family::V6), "wana".to_owned());
+        let b4 = (path(2, Family::V4), "wanb".to_owned());
+        let applied: BTreeSet<Assignment> = [a4.clone(), b4.clone()].into();
+        // Nothing known: nothing held back.
+        assert!(unassigned(&applied, None).is_empty());
+        assert!(unassigned(&applied, Some(&applied)).is_empty());
+        // A family added to an uplink.
+        let added: BTreeSet<Assignment> = [a4.clone(), a6, b4.clone()].into();
+        assert_eq!(unassigned(&added, Some(&applied)), [path(1, Family::V6)].into());
+        // An uplink moved to another interface by a reload.
+        let moved: BTreeSet<Assignment> = [a4, (path(2, Family::V4), "wanc".to_owned())].into();
+        assert_eq!(unassigned(&moved, Some(&applied)), [path(2, Family::V4)].into());
     }
 }

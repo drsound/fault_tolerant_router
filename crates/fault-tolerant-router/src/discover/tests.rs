@@ -249,6 +249,17 @@ fn multipath_defaults_and_nexthop_objects() {
         },
     );
     assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 33])));
+    // An IPv6 gateway for an IPv4 route (RFC 5549) is not used either.
+    s.nexthops.insert(
+        7,
+        NexthopMessage {
+            id: 7,
+            ifindex: Some(5),
+            gateway: Some(v6("fe80::1")),
+            ..NexthopMessage::default()
+        },
+    );
+    assert_eq!(run(&cfg, &s)[&key(1)].ready.unwrap().gateway, Some(v4([192, 0, 2, 33])));
 }
 
 #[test]
@@ -296,6 +307,22 @@ fn nexthop_groups_are_never_used() {
     let d = run(&cfg, &s);
     assert_eq!(d[&key6(1)].ready.unwrap().gateway, Some(v6("fe80::9")));
     assert!(!d[&key6(1)].group_only && d[&key6(2)].group_only);
+    // With nexthop_compat_mode = 0 the group's route carries no resolved
+    // next hops: its members' objects tell the interfaces.
+    for r in s.routes.values_mut().filter(|r| r.nexthop_id == Some(20)) {
+        r.nexthops.clear();
+    }
+    s.nexthops.insert(
+        11,
+        NexthopMessage {
+            id: 11,
+            ifindex: Some(6),
+            gateway: Some(v6("fe80::2")),
+            ..NexthopMessage::default()
+        },
+    );
+    let d = run(&cfg, &s);
+    assert!(!d[&key6(1)].group_only && d[&key6(2)].group_only && !d[&key6(3)].group_only);
 }
 
 #[test]

@@ -240,22 +240,34 @@ fn candidates(
     })
 }
 
-/// Whether a default route through a nexthop group uses the interface
-/// (the kernel reports the group's members as resolved next hops).
+/// Whether a default route through a nexthop group uses the interface: by
+/// the group's members, which the kernel also reports as resolved next hops
+/// unless `nexthop_compat_mode` is 0.
 fn group_routes(config: &Config, system: &System, own_protocol: u8, family: Family, ifindex: u32) -> bool {
     let now = std::time::Instant::now();
     config.routing.discovery_tables.iter().any(|t| {
         candidates(system, own_protocol, family, *t, now).any(|r| {
-            r.nexthop_id
-                .and_then(|id| system.nexthops.get(&id))
-                .is_some_and(|n| !n.group.is_empty())
-                && r.nexthops.iter().any(|h| h.ifindex == ifindex)
+            r.nexthop_id.and_then(|id| system.nexthops.get(&id)).is_some_and(|n| {
+                !n.group.is_empty()
+                    && (r.nexthops.iter().any(|h| h.ifindex == ifindex)
+                        || n.group
+                            .iter()
+                            .any(|m| system.nexthops.get(m).is_some_and(|o| o.ifindex == Some(ifindex))))
+            })
         })
     })
 }
 
-/// Usable gateways of a default route on the interface.
+/// Usable gateways of a default route on the interface. A gateway of the
+/// other family (an IPv4 route through an IPv6 nexthop object) cannot be
+/// written as FTR's path route, which carries `RTA_GATEWAY`.
 fn route_gateways(r: &ObservedRoute, nexthops: &BTreeMap<u32, NexthopMessage>, ifindex: u32) -> Vec<(IpAddr, bool)> {
+    let mut gateways = all_gateways(r, nexthops, ifindex);
+    gateways.retain(|(g, _)| Family::of(*g) == r.family);
+    gateways
+}
+
+fn all_gateways(r: &ObservedRoute, nexthops: &BTreeMap<u32, NexthopMessage>, ifindex: u32) -> Vec<(IpAddr, bool)> {
     if let Some(id) = r.nexthop_id {
         // Recognised by RTA_NH_ID although the kernel also reports the
         // resolved gateway; only single nexthop objects are used (an
