@@ -640,8 +640,11 @@ impl Daemon {
                     if matches!(change, Change::Link(_))
                         && let Some(up) = self.cfg.uplink(u)
                     {
+                        // A new incarnation of the interface gets its
+                        // settings at once, not after the old one's backoff.
                         self.sysctls_pending
                             .insert(SysctlScope::Interface(up.interface.clone()));
+                        self.sysctl_retries.remove(&up.interface);
                     }
                 }
                 self.dirty = true;
@@ -893,7 +896,6 @@ impl Daemon {
         plan::plan(&self.cfg, &i)
     }
 
-    /// Applies the pending sysctls, keeping those that failed.
     /// Every scope of the desired settings: the global ones, then each
     /// interface's.
     fn sysctl_scopes(&self) -> Vec<SysctlScope> {
@@ -1245,7 +1247,12 @@ impl Daemon {
         let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
         self.prune_paths(|k| configured.contains(&k.uplink));
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
-        self.sysctls_pending.extend(self.sysctl_scopes());
+        // The settings of removed uplinks' interfaces are no longer FTR's
+        // to apply, nor their retries to keep: re-added, they start afresh.
+        self.sysctls_pending = self.sysctl_scopes().into_iter().collect();
+        let kept = |i: &String| self.sysctls_pending.contains(&SysctlScope::Interface(i.clone()));
+        self.sysctl_retries.retain(|i, _| kept(i));
+        self.sysctls_failed.retain(|i, _| kept(i));
         info!("config_reloaded");
         self.dirty = true;
     }

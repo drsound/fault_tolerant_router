@@ -2477,15 +2477,17 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
     wait_members(&t, &["ppp0", "wana"], Duration::from_secs(15))?;
     faults.arm_matching("sysctls (ppp0)")?;
     t.pppoe_reset()?;
-    // Four failures: C's retry now waits about 8 s.
+    // Five failures: C's next retry is about 16 s away.
     t.wait_for("C's settings failing repeatedly", Duration::from_secs(40), || {
-        Ok(faults.steps().iter().filter(|s| s.ends_with(" failed")).count() >= 4)
+        Ok(faults.steps().iter().filter(|s| s.ends_with(" failed")).count() >= 5)
     })?;
     assert_eq!(balancing_members(&t)?, ["wana"], "C is not ready");
     let svm = || t.router().sysctl_get("net.ipv4.conf.wanb.src_valid_mark");
     assert_eq!(svm()?, "0", "B is not FTR's yet");
     f.write_config(&ftr::ipv4(&[a, b, c]))?;
     f.reload()?;
+    // Well before C's retry: a shared backoff would hold B back.
+    t.wait_for("B's settings", Duration::from_secs(4), || Ok(svm()? == "1"))?;
     t.wait_for("B in the balancing route", Duration::from_secs(15), || {
         let joined = balancing_members(&t)?.contains(&"wanb".to_owned());
         assert!(!joined || svm()? == "1", "B carries traffic without its settings");
@@ -2493,6 +2495,38 @@ fn as27_an_added_uplink_gets_its_settings_during_another_backoff() -> Result<()>
     })?;
     faults.disarm()?;
     wait_members(&t, &["ppp0", "wana", "wanb"], Duration::from_secs(70))?;
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-27, an interface recreated while its settings wait for a long
+/// backoff gets them at once: the backoff belonged to the old interface.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as27_a_recreated_interface_gets_its_settings_at_once() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_ftr(&ftr::ipv4(&abc()))?;
+    let faults = Faults::new(&mut f);
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let all = ["ppp0", "wana", "wanb"];
+    wait_members(&t, &all, Duration::from_secs(15))?;
+    faults.arm_matching("sysctls (ppp0)")?;
+    t.pppoe_reset()?;
+    // Six failures: C's next retry is about 32 s away.
+    t.wait_for("C's settings failing repeatedly", Duration::from_secs(60), || {
+        Ok(faults.steps().iter().filter(|s| s.ends_with(" failed")).count() >= 6)
+    })?;
+    faults.disarm()?;
+    let before = t.ifindex("ppp0");
+    t.pppoe_reset()?;
+    t.wait_for("a new ppp0", Duration::from_secs(20), || {
+        Ok(t.ifindex("ppp0").is_some_and(|i| Some(i) != before))
+    })?;
+    t.wait_for("C's settings on the new ppp0", Duration::from_secs(4), || {
+        Ok(t.router().sysctl_get("net.ipv4.conf.ppp0.src_valid_mark")? == "1")
+    })?;
+    wait_members(&t, &all, Duration::from_secs(15))?;
     f.stop()?;
     Ok(())
 }
