@@ -157,7 +157,7 @@ fn as03_connections_on_a_survive_failure_and_recovery_of_b(fam: Family) -> Resul
     let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows = start_flows(&t, fam, 1, 16)?;
+    let flows = start_flows(&t, fam, 1, 20)?;
     std::thread::sleep(Duration::from_secs(1));
     t.carrier_down(Uplink::B)?;
     wait_members(&t, fam, &["wana"], Duration::from_secs(3))?;
@@ -948,7 +948,7 @@ fn as17_third_party_deletions_are_repaired(fam: Family) -> Result<()> {
     t.reset_counters()?;
     let c = t.connect_many(Node::Client, fam, 20, 100, false)?;
     assert!(c.iter().all(|c| c.outcome == Outcome::Ok), "{:?}", tally(&c));
-    let flows = start_flows(&t, fam, 30, 12)?;
+    let flows = start_flows(&t, fam, 30, 20)?;
     std::thread::sleep(Duration::from_secs(2));
     flows_on_continuous(flows, &[Uplink::A])?;
     assert_eq!(t.leaks(fam)?, 0, "INV-3");
@@ -1066,7 +1066,7 @@ fn as19_reload_adds_removes_reorders_and_protects_ids(fam: Family) -> Result<()>
     let mut f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows = start_flows(&t, fam, 20, 12)?;
+    let flows = start_flows(&t, fam, 20, 20)?;
     std::thread::sleep(Duration::from_millis(500));
     // C added first in the file, A removed, B unchanged.
     f.write_config(&polywan::family(
@@ -1224,7 +1224,7 @@ fn as10_lease_change_updates_artifacts_within_a_second() -> Result<()> {
     let f = t.start_polywan(&polywan::ipv4(&ab()))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows = start_flows(&t, Family::V4, 40, 12)?;
+    let flows = start_flows(&t, Family::V4, 40, 20)?;
     std::thread::sleep(Duration::from_millis(500));
     let old = address(&t, Family::V4, Uplink::A)?;
     t.ns(Node::IspA).ip("addr add 192.0.2.254/24 dev wan")?;
@@ -1279,7 +1279,7 @@ fn as10_lease_change_updates_artifacts_within_a_second_ipv6() -> Result<()> {
     let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows = start_flows(&t, Family::V6, 40, 12)?;
+    let flows = start_flows(&t, Family::V6, 40, 20)?;
     std::thread::sleep(Duration::from_millis(500));
     let old = address(&t, Family::V6, Uplink::A)?;
     t.ns(Node::IspA).ip("addr add fe80::99/64 dev wan nodad")?;
@@ -2018,7 +2018,7 @@ fn as23_external_firewall_mode(fam: Family) -> Result<()> {
     split(&t, fam, 500, 50)?;
     // AS-03: connections on A survive a failure and the recovery of B.
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows = start_flows(&t, fam, 1, 12)?;
+    let flows = start_flows(&t, fam, 1, 20)?;
     std::thread::sleep(Duration::from_millis(500));
     t.carrier_down(Uplink::B)?;
     wait_members(&t, fam, &["wana"], Duration::from_secs(3))?;

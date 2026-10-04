@@ -77,7 +77,7 @@ fn as45b_reload_hands_ipv6_back_without_touching_ipv4() -> Result<()> {
         "1",
         "FR-ROUTE-5"
     );
-    let flows = start_flows(&t, Family::V4, 1, 16)?;
+    let flows = start_flows(&t, Family::V4, 1, 20)?;
     std::thread::sleep(Duration::from_secs(1));
     f.write_config(&polywan::ipv4(&ab()))?;
     f.reload()?;
@@ -118,7 +118,7 @@ fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
-    let flows4 = start_flows(&t, Family::V4, 1, 16)?;
+    let flows4 = start_flows(&t, Family::V4, 1, 20)?;
     std::thread::sleep(Duration::from_secs(1));
     std::fs::write(&flag, "")?;
     f.write_config(&config(&Family::ALL))?;
@@ -148,7 +148,7 @@ fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
         "{counts:?}"
     );
     assert_eq!(t.ipv6_leaks()?, 0, "INV-3");
-    let flows6 = start_flows(&t, Family::V6, 20, 12)?;
+    let flows6 = start_flows(&t, Family::V6, 20, 20)?;
     std::thread::sleep(Duration::from_secs(2));
     flows_on_continuous(flows6, &[Uplink::A])?;
     flows_on_continuous(flows4, &[Uplink::A, Uplink::B])

@@ -154,6 +154,8 @@ pub fn start_flows(t: &Topology, f: Family, first: u8, count: u8) -> Result<Vec<
 /// Stops `flows` and checks, for each of `uplinks`, that at least one ran on
 /// it and that every flow on it was uninterrupted (no stall longer than a
 /// second): a check that cannot pass because no flow happened to use it.
+/// Flows are hashed, so over two equal uplinks 12 flows leave one of them
+/// without a flow once in 4,096 runs, 20 flows once in a million.
 pub fn flows_on_continuous(flows: Vec<testbed::traffic::Flow>, uplinks: &[Uplink]) -> Result<()> {
     let reports: Vec<_> = flows.into_iter().map(|f| f.stop()).collect::<Result<_>>()?;
     for &u in uplinks {

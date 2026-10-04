@@ -52,6 +52,16 @@ impl Topology {
         };
         ns.ip(&format!("route replace default via {v4}"))?;
         ns.ip(&format!("-6 route replace default via {v6}"))?;
+        // Neighbour resolution on the link that came back can take a
+        // retransmission (1 s) or more, during which the provider drops
+        // forwarded traffic: return once it reaches the internet again.
+        for gw in [v4, v6] {
+            self.wait_for(
+                &format!("{uplink}'s upstream {gw} reachable"),
+                Duration::from_secs(10),
+                || Ok(ns.output("ping", ["-n", "-c", "1", "-W", "1", gw])?.status.success()),
+            )?;
+        }
         Ok(())
     }
 
