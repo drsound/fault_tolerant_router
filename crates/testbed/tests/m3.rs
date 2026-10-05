@@ -985,6 +985,42 @@ fn as46_drain_survives_a_crash_at_each_step() -> Result<()> {
     Ok(())
 }
 
+/// FR-SEL-3: a SIGHUP reload while a drain's intent is being written does
+/// not undo the drain once both complete: the reload waits for the write
+/// (the persistence lane writes slowly here).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn a_reload_signal_keeps_a_drain_being_written() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let writes = f.dir.join("slow-writes");
+    let waiting = f.dir.join("slow-writes.waiting");
+    f.set_env("POLYWAN_TEST_SLOW_WRITES", &writes.display().to_string());
+    f.start(&t)?;
+    f.wait_settled(&t)?;
+    let _ = std::fs::remove_file(&waiting);
+    std::fs::write(&writes, "1500")?;
+    let drained = std::thread::scope(|s| -> Result<std::process::Output> {
+        let drain = s.spawn(|| f.drain("a", true, false));
+        t.wait_for("the drain's write", Duration::from_secs(10), || Ok(waiting.exists()))?;
+        f.reload()?;
+        drain.join().expect("the drain")
+    })?;
+    succeeded(drained)?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(15))?;
+    std::fs::remove_file(&writes)?;
+    f.wait_settled(&t)?;
+    let status = f.status()?;
+    let a = status["uplinks"]
+        .as_array()
+        .and_then(|u| u.iter().find(|u| u["name"] == "a"))
+        .context("uplink a")?;
+    assert_eq!(a["drained"], true, "{status}");
+    wait_members(&t, Family::V4, &["wanb"], Duration::from_secs(5))?;
+    f.stop()?;
+    Ok(())
+}
+
 /// FR-API-3, FR-MARK-4, FR-CFG-3: `reload` through the control socket
 /// reports success with the applied generation, or the validation errors
 /// (only to the client and the log: the public `reload_failed` event has a

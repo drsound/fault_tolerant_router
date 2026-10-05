@@ -228,6 +228,9 @@ struct Daemon {
     hand_back: Option<(u64, String)>,
     reload: Option<ReloadPhase>,
     reload_again: bool,
+    /// A SIGHUP reload waits for the command writing its intent (a drain,
+    /// an undrain, a forget): the reload's bindings would overwrite it.
+    reload_deferred: bool,
     /// Operations applied since the last pass that left nothing to do,
     /// across the passes an nftables application splits.
     applied_ops: usize,
@@ -259,8 +262,6 @@ struct Daemon {
     /// Stops the email notifier after its flush; it answers on the sender
     /// it receives.
     mail: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
-    /// Commands of the control socket, one at a time.
-    orders: VecDeque<Order>,
     command: Option<Active>,
     layout: Layout,
     scope: Scope,
@@ -514,6 +515,7 @@ pub async fn run(opts: Options) -> Result<()> {
         hand_back: None,
         reload: None,
         reload_again: false,
+        reload_deferred: false,
         applied_ops: 0,
         fatal: None,
         desired_generation: 0,
@@ -529,7 +531,6 @@ pub async fn run(opts: Options) -> Result<()> {
         api: None,
         notify_config: watch::channel(Arc::new(cfg.notify.clone())).0,
         mail: None,
-        orders: VecDeque::new(),
         command: None,
         protocol: cfg.routing.route_protocol,
         layout,
@@ -1253,20 +1254,32 @@ impl Daemon {
     }
 
     /// Starts the next command if none is in progress.
-    fn next_order(&mut self) {
-        while self.command.is_none() {
-            let Some(Order { action: request, reply }) = self.orders.pop_front() else {
-                return;
-            };
-            match request {
-                Action::Drain { uplink, force } => self.start_drain(&uplink, true, force, reply),
-                Action::Undrain { uplink } => self.start_drain(&uplink, false, false, reply),
-                Action::Reload => {
-                    self.command = Some(Active::Reloading { reply });
-                    self.start_reload();
-                }
-                Action::Forget { uplink } => self.start_forget(uplink, reply),
+    /// A command of the control socket. The event loop takes one only
+    /// while no other command and no reload is in progress: the API's
+    /// bounded queue is the only one (FR-API-4).
+    fn start_order(&mut self, Order { action, reply }: Order) {
+        // Its client gave up waiting (it was told the command may still
+        // complete): a stale change is not applied.
+        if reply.is_closed() {
+            info!(?action, "a command whose client stopped waiting is dropped");
+            return;
+        }
+        match action {
+            Action::Drain { uplink, force } => self.start_drain(&uplink, true, force, reply),
+            Action::Undrain { uplink } => self.start_drain(&uplink, false, false, reply),
+            Action::Reload => {
+                self.command = Some(Active::Reloading { reply });
+                self.start_reload();
             }
+            Action::Forget { uplink } => self.start_forget(uplink, reply),
+        }
+    }
+
+    /// A command wrote its intent or ended: a SIGHUP reload deferred
+    /// meanwhile starts.
+    fn intent_written(&mut self) {
+        if self.reload.is_none() && std::mem::take(&mut self.reload_deferred) {
+            self.start_reload();
         }
     }
 
@@ -1378,7 +1391,7 @@ impl Daemon {
             Err(e) => Answer::error(StatusCode::CONFLICT, e),
         };
         let _ = reply.send(answer);
-        self.next_order();
+        self.intent_written();
     }
 
     /// The drain intent is durable: it applies now, and the command waits
@@ -1399,7 +1412,7 @@ impl Daemon {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "the drain state could not be written; nothing changed",
             ));
-            return self.next_order();
+            return self.intent_written();
         }
         let (kind, verb) = if drain {
             self.drained.insert(uplink);
@@ -1419,6 +1432,7 @@ impl Daemon {
             answer: serde_json::json!({ "uplink": name, "drained": drain }),
             reply,
         });
+        self.intent_written();
     }
 
     /// Answers the command in progress once applied, or once it waited too
@@ -1457,7 +1471,6 @@ impl Daemon {
             )
         };
         let _ = reply.send(answer);
-        self.next_order();
     }
 
     /// A health transition of a path: its since, the log line, the event and
@@ -2200,7 +2213,6 @@ impl Daemon {
                     "failed_steps": [{ "operation": f.op, "kind": f.kind.as_str(), "errno": f.errno }],
                 }),
             ));
-            self.next_order();
         }
         if let Some((family, table)) = f.route {
             // The view follows a route mutation only when it succeeds, but
@@ -2276,6 +2288,13 @@ impl Daemon {
             self.reload_again = true;
             return;
         }
+        if matches!(
+            self.command,
+            Some(Active::Persisting { .. } | Active::Forgetting { .. })
+        ) {
+            self.reload_deferred = true;
+            return;
+        }
         let seq = self.next_seq();
         let context = worker::ReloadContext {
             structural: self.cfg.structural(),
@@ -2292,7 +2311,6 @@ impl Daemon {
         }
         // A reload requested through the control socket gets the
         // diagnostics (FR-API-3, IMPL-11), unless another reload follows.
-        let mut answered = false;
         if !self.reload_again
             && let Some(Active::Reloading { reply }) = self.command.take_if(|c| matches!(c, Active::Reloading { .. }))
         {
@@ -2303,7 +2321,6 @@ impl Daemon {
                     "errors": errors,
                 }),
             ));
-            answered = true;
         }
         // Diagnostics stay in the log (FR-API-2, IMPL-11).
         self.pending_events.push(NewEvent::new(
@@ -2311,10 +2328,6 @@ impl Daemon {
             "the configuration was not reloaded; the running configuration is kept",
         ));
         self.end_reload();
-        // The next command starts once the reload state is clear.
-        if answered {
-            self.next_order();
-        }
     }
 
     fn end_reload(&mut self) {
@@ -2573,10 +2586,7 @@ impl Daemon {
                     }
                 }
                 r = probe_rx.recv() => if let Some(r) = r { self.probe_report(r) },
-                Some(o) = orders_rx.recv() => {
-                    self.orders.push_back(o);
-                    self.next_order();
-                }
+                Some(o) = orders_rx.recv(), if self.command.is_none() && self.reload.is_none() => self.start_order(o),
                 d = done_rx.recv() => match d {
                     Some(d) => self.completion(d),
                     None => bail!("the I/O lanes stopped"),
