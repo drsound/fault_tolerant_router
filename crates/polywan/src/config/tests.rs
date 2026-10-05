@@ -129,9 +129,6 @@ fn spec_example_is_valid() {
     assert_eq!(email.sendmail, PathBuf::from("/usr/sbin/sendmail"));
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
     assert!(c.manages(Family::V6));
-    assert!(c.unsupported_features().is_empty());
-    let gates = parse(&format!("{MINIMAL}[health.quality]\nmax_loss = 0.1\n")).unwrap();
-    assert!(gates.unsupported_features().is_empty(), "quality gates are supported");
 }
 
 #[test]
@@ -144,11 +141,11 @@ fn digest_is_the_sha256_of_the_text() {
 }
 
 #[test]
-fn generated_example_is_valid_and_supported() {
+fn generated_example_is_valid() {
     let c = parse(EXAMPLE).unwrap();
     assert_eq!(c.uplinks.len(), 3);
     assert!(c.manages(Family::V6));
-    assert!(c.unsupported_features().is_empty());
+    assert_eq!(c.metrics_listen.unwrap().port(), 9750);
 }
 
 #[test]

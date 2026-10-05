@@ -319,13 +319,6 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
         if !trust.errors.is_empty() {
             return Err(trust.errors);
         }
-        let unsupported = new.unsupported_features();
-        if !unsupported.is_empty() {
-            return Err(vec![format!(
-                "not supported by this development build: {}",
-                unsupported.join(", ")
-            )]);
-        }
         let descriptors = crate::subprocess::descriptor_errors(&new, &crate::subprocess::inherited_descriptors());
         if !descriptors.is_empty() {
             return Err(descriptors);

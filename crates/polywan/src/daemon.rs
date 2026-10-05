@@ -403,10 +403,6 @@ pub async fn run(opts: Options) -> Result<()> {
             "descriptors inherited without close-on-exec: hooks and sendmail stay refused while they are open"
         );
     }
-    let unsupported = cfg.unsupported_features();
-    if !unsupported.is_empty() {
-        bail!("not supported by this development build: {}", unsupported.join(", "));
-    }
     let mut findings = checks::kernel(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
     if cfg.firewall.mode == FirewallMode::Managed {
         let v = nftctl::run(&cfg.firewall.nft_path, &["--version"], None)

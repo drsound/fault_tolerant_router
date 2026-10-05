@@ -242,12 +242,6 @@ impl Config {
     pub fn uplink(&self, id: UplinkId) -> Option<&Uplink> {
         self.uplinks.iter().find(|u| u.id == id)
     }
-
-    /// Features that this build does not implement yet. The daemon refuses
-    /// to run a configuration that uses them rather than ignore them.
-    pub fn unsupported_features(&self) -> Vec<&'static str> {
-        Vec::new()
-    }
 }
 
 /// One validation problem.

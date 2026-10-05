@@ -219,14 +219,6 @@ async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
             anyhow::bail!("{}", f.errors.join("\n"));
         }
     }
-    let unsupported = cfg.unsupported_features();
-    if !unsupported.is_empty() {
-        anyhow::bail!(
-            "{}: not supported by this development build: {}",
-            path.display(),
-            unsupported.join(", ")
-        );
-    }
     println!("{}: valid", path.display());
     Ok(())
 }
