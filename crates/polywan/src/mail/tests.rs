@@ -26,23 +26,6 @@ fn event(message: &str) -> Event {
     }
 }
 
-/// Decodes the base64 lines of `render` (test only).
-fn decode(text: &str) -> Vec<u8> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut bits = 0u32;
-    let mut n = 0;
-    let mut out = Vec::new();
-    for c in text.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
-        bits = bits << 6 | ALPHABET.iter().position(|a| *a == c).expect("base64") as u32;
-        n += 6;
-        if n >= 8 {
-            n -= 8;
-            out.push((bits >> n) as u8);
-        }
-    }
-    out
-}
-
 #[test]
 fn base64_follows_rfc4648_in_lines_of_76() {
     let enc = |s: &str| base64_lines(s.as_bytes());
@@ -54,7 +37,7 @@ fn base64_follows_rfc4648_in_lines_of_76() {
     let long = base64_lines(&[0xff; 100]);
     let lines: Vec<&str> = long.lines().collect();
     assert_eq!(lines.iter().map(|l| l.len()).collect::<Vec<_>>(), [76, 60]);
-    assert_eq!(decode(&long), [0xff; 100]);
+    assert_eq!(long.replace('\n', ""), "////".repeat(33) + "/w==");
 }
 
 #[test]
@@ -103,7 +86,7 @@ fn messages_carry_the_headers_and_no_event_text_in_them() {
         head,
         "Date: Thu, 01 Jan 1970 00:00:00 +0000\nMessage-ID: <7.abc@example.com>\nFrom: router@example.com\nTo: admin@example.com,\n noc@example.org\nSubject: PolyWAN notification (gw)\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: base64\nAuto-Submitted: auto-generated"
     );
-    assert_eq!(String::from_utf8(decode(body)).unwrap(), m.body);
+    assert_eq!(body, base64_lines(m.body.as_bytes()));
     assert!(body.lines().all(|l| l.len() <= 76));
     let mut test = m.clone();
     test.kind = Kind::Test;
@@ -123,8 +106,11 @@ fn bodies_and_messages_keep_their_bounds() {
         due: Instant::now(),
     };
     let text = String::from_utf8(render(&m, &email(), None).unwrap()).unwrap();
-    let body = String::from_utf8(decode(text.split_once("\n\n").unwrap().1)).unwrap();
-    assert!(body.len() <= BODY_BYTES && body.ends_with("\n[truncated]\n"));
+    // The 13 octets of the marker leave an odd room: the cut drops the
+    // half of a two-octet character.
+    let body = "ü".repeat((BODY_BYTES - 13) / 2) + "\n[truncated]\n";
+    assert!(body.len() <= BODY_BYTES);
+    assert_eq!(text.split_once("\n\n").unwrap().1, base64_lines(body.as_bytes()));
     // Recipients are never truncated: a message that cannot hold them
     // fails.
     let mut many = email();
@@ -187,7 +173,7 @@ fn admission_holds_a_rolling_hour_with_one_notice() {
 #[test]
 fn closing_batches_admits_or_suppresses() {
     let t0 = Instant::now();
-    let mut mail = Mail::new("abc".into(), Times::default());
+    let mut mail = Mail::new("abc".into(), Times::default(), Arc::default(), Sendmail::default());
     let e = email();
     for _ in 0..4 {
         mail.add(t0, Duration::from_secs(30), &event("x"));
@@ -207,7 +193,7 @@ fn closing_batches_admits_or_suppresses() {
 #[test]
 fn failures_are_retried_after_1_5_and_15_minutes() {
     let t0 = Instant::now();
-    let mut mail = Mail::new("abc".into(), Times::default());
+    let mut mail = Mail::new("abc".into(), Times::default(), Arc::default(), Sendmail::default());
     let m = mail.message(Kind::Notification, "b".into(), &email(), t0);
     let id = m.id.clone();
     mail.wait(m);
@@ -230,7 +216,7 @@ fn failures_are_retried_after_1_5_and_15_minutes() {
 #[test]
 fn waiting_messages_are_bounded_and_discarded_with_email() {
     let t0 = Instant::now();
-    let mut mail = Mail::new("abc".into(), Times::default());
+    let mut mail = Mail::new("abc".into(), Times::default(), Arc::default(), Sendmail::default());
     for i in 0..10 {
         let m = mail.message(Kind::Notification, format!("{i}"), &email(), t0);
         mail.wait(m);

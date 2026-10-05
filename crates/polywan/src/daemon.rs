@@ -256,8 +256,9 @@ struct Daemon {
     api: Option<crate::api::Api>,
     /// The notification settings the notifiers follow (reloads change them).
     notify_config: watch::Sender<Arc<config::Notify>>,
-    /// The email notifier's requests (the flush at shutdown).
-    mail: Option<mpsc::Sender<crate::mail::Request>>,
+    /// Stops the email notifier after its flush; it answers on the sender
+    /// it receives.
+    mail: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
     /// Commands of the control socket, one at a time.
     orders: VecDeque<Order>,
     command: Option<Active>,
@@ -392,14 +393,10 @@ fn failure_event(op: &str, kind: FailureKind, errno: Option<i32>, extack: Option
 /// `run`: startup (FR-REC-1, FR-REC-8, IMPL-6) and the event loop.
 pub async fn run(opts: Options) -> Result<()> {
     let cfg = config::load(&opts.config).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // FR-CFG-5: nothing configured runs before its ownership is verified.
-    report(&checks::trusted(&opts.config, &cfg))?;
-    report(&checks::identities(&cfg))?;
+    // FR-CFG-5: nothing configured runs before its ownership is verified;
     // FR-HOOK-3: no subprocess may inherit a descriptor of ours.
     let inherited = crate::subprocess::inherited_descriptors();
-    if let Some(e) = crate::subprocess::descriptor_errors(&cfg, &inherited).first() {
-        bail!("{e}");
-    }
+    report(&checks::runnable(&opts.config, &cfg, &inherited))?;
     if !inherited.is_empty() {
         warn!(
             ?inherited,
@@ -595,14 +592,20 @@ pub async fn run(opts: Options) -> Result<()> {
         .add_notifier("email", crate::mail::QUEUE, crate::mail::QUEUE_BYTES);
     d.bus.select("email", Some(email_selection(&d.cfg)));
     d.totals().events_dropped = d.bus.dropped();
-    // A flush and a test at most (tests run one at a time).
-    let (mail, mail_requests) = mpsc::channel(2);
+    // FR-MAIL-3: notification tests take the notifier's sendmail turn.
+    let sendmail = crate::mail::Sendmail::default();
+    let mail_times = crate::test_hooks::mail_times(crate::mail::Times::default());
+    let (stop_mail, mail_stop) = tokio::sync::oneshot::channel();
     io_handle.spawn(crate::mail::notifier(
         mail_events,
         d.notify_config.subscribe(),
-        mail_requests,
-        d.bus.instance().to_owned(),
-        Arc::clone(&failures),
+        mail_stop,
+        crate::mail::Mail::new(
+            d.bus.instance().to_owned(),
+            mail_times,
+            Arc::clone(&failures),
+            sendmail.clone(),
+        ),
     ));
     let shared = crate::api::Shared {
         status: d.status.subscribe(),
@@ -612,15 +615,17 @@ pub async fn run(opts: Options) -> Result<()> {
         orders,
         tester: Arc::new(crate::notifytest::Tester::new(
             d.notify_config.subscribe(),
-            mail.clone(),
-            hook_slots,
-            d.bus.instance().to_owned(),
-            crate::test_hooks::mail_times(crate::mail::Times::default()),
+            crate::notifytest::Channels {
+                sendmail,
+                slots: hook_slots,
+                instance: d.bus.instance().to_owned(),
+                times: mail_times,
+            },
         )),
         failures,
         totals: Arc::clone(&d.totals),
     };
-    d.mail = Some(mail);
+    d.mail = Some(stop_mail);
     let api = crate::api::Api::start(&io_handle, endpoints, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
@@ -2601,7 +2606,7 @@ impl Daemon {
         // get their last attempt (bounded by mail::SHUTDOWN).
         if let Some(mail) = self.mail.take() {
             let (done, wait) = tokio::sync::oneshot::channel();
-            if mail.send(crate::mail::Request::Flush(done)).await.is_ok() {
+            if mail.send(done).is_ok() {
                 let _ = tokio::time::timeout(crate::mail::SHUTDOWN + Duration::from_secs(1), wait).await;
             }
         }

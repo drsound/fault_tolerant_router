@@ -2,10 +2,10 @@
 //! configured channel, bypassing coalescing, the email rate limit and the
 //! event filters, without retries and without touching ordinary work.
 //!
-//! The email test goes through the daemon's email notifier, so that it
-//! shares the limit of one sendmail submission at a time; hooks get the
-//! synthetic `notify_test` event (never in the ring) and share the hooks'
-//! concurrency limit. The whole test has a budget of the sendmail deadline
+//! The email test takes the sendmail turn of the daemon's email notifier,
+//! so that it shares the limit of one sendmail submission at a time; hooks
+//! get the synthetic `notify_test` event (never in the ring) and share the
+//! hooks' concurrency limit. The whole test has a budget of the sendmail deadline
 //! plus every hook's timeout; at its expiry the processes still running are
 //! killed with their groups and the channels not started are reported as
 //! such. `notify-test --offline` runs the same channels in the CLI.
@@ -15,11 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, watch};
 
 use crate::config::Notify;
 use crate::events::Event;
-use crate::mail::{self, Request, Times};
+use crate::mail::{self, Sendmail, Times};
 use crate::subprocess::{self, End};
 
 /// How a channel's test ended.
@@ -133,15 +133,14 @@ pub fn budget(notify: &Notify, times: Times) -> Duration {
 pub enum Refusal {
     /// Another test runs (429).
     Busy,
-    /// The email notifier cannot take it (503).
+    /// The email notifier stopped (503).
     Unavailable,
 }
 
-/// The channels of a test.
+/// What the channels of a test share with the notifiers.
 pub struct Channels {
-    pub notify: Arc<Notify>,
-    /// The daemon's email notifier; none offline, where email runs here.
-    pub mail: Option<mpsc::Sender<Request>>,
+    /// The email notifier's sendmail turn and Message-ID numbers.
+    pub sendmail: Sendmail,
     /// The hooks' concurrency limit (FR-HOOK-3).
     pub slots: Arc<Semaphore>,
     pub instance: String,
@@ -162,56 +161,37 @@ impl Slot {
 }
 
 /// Runs a test through every configured channel within the budget.
-pub async fn run(c: Channels) -> Result<Vec<Report>, Refusal> {
+pub async fn run(notify: &Notify, c: &Channels) -> Result<Vec<Report>, Refusal> {
+    // FR-MAIL-4: admission first; a refusal starts nothing.
+    if notify.email.is_some() && c.sendmail.turn.is_closed() {
+        return Err(Refusal::Unavailable);
+    }
     let mut tasks = tokio::task::JoinSet::new();
     let mut slots: Vec<(String, Option<String>, Arc<Slot>)> = Vec::new();
-    if let Some(email) = &c.notify.email {
+    if let Some(email) = &notify.email {
         let slot = Arc::new(Slot::default());
         slots.push(("email".into(), None, Arc::clone(&slot)));
-        match &c.mail {
-            // FR-MAIL-4: admission first; a refusal starts nothing.
-            Some(tx) => {
-                let (reply, answer) = oneshot::channel();
-                let started = Arc::clone(&slot);
-                tx.try_send(Request::Test {
-                    reply,
-                    started: Box::new(move || started.started.store(true, Ordering::Relaxed)),
-                })
-                .map_err(|_| Refusal::Unavailable)?;
-                tasks.spawn(async move {
-                    let run = answer
-                        .await
-                        .unwrap_or_else(|_| Err("the email notifier stopped".into()));
-                    slot.set(Report::of("email", None, run));
-                });
-            }
-            None => {
-                let (email, times, instance) = (email.clone(), c.times, c.instance.clone());
-                tasks.spawn(async move {
-                    slot.started.store(true, Ordering::Relaxed);
-                    let m = mail::test_message(&instance, 1, &email);
-                    let run = mail::attempt(&m, &email, times.deadline)
-                        .await
-                        .map_err(|e| e.to_string());
-                    slot.set(Report::of("email", None, run));
-                });
-            }
-        }
+        let (email, deadline, turn) = (email.clone(), c.times.deadline, Arc::clone(&c.sendmail.turn));
+        let m = mail::test_message(&c.instance, c.sendmail.next_id(), &email);
+        tasks.spawn(async move {
+            // After a running submission, before the next due message.
+            let Ok(_turn) = turn.acquire_owned().await else {
+                return slot.set(Report::of("email", None, Err("the email notifier stopped".into())));
+            };
+            slot.started.store(true, Ordering::Relaxed);
+            let run = mail::attempt(&m, &email, deadline).await.map_err(|e| e.to_string());
+            slot.set(Report::of("email", None, run));
+        });
     }
-    if !c.notify.hooks.is_empty() {
-        let name = c.notify.hook_user.clone();
-        let user = tokio::task::spawn_blocking(move || crate::identity::user(&name))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string()))
-            .and_then(|u| u.ok_or_else(|| format!("hook user {:?} not found", c.notify.hook_user)));
+    if !notify.hooks.is_empty() {
+        let user = crate::hooks::resolve_user(&notify.hook_user).await;
         let e = event(&c.instance);
-        for hook in &c.notify.hooks {
+        for hook in &notify.hooks {
             let program = hook.command.first().cloned();
             let slot = Arc::new(Slot::default());
             slots.push(("hook".into(), program.clone(), Arc::clone(&slot)));
             let spec = match &user {
-                Ok(u) => crate::hooks::spec(hook, &e, (u.uid, u.gid)).ok_or_else(|| "empty command".to_owned()),
+                Ok(ids) => crate::hooks::spec(hook, &e, *ids).ok_or_else(|| "empty command".to_owned()),
                 Err(e) => Err(e.clone()),
             };
             let permits = Arc::clone(&c.slots);
@@ -228,10 +208,9 @@ pub async fn run(c: Channels) -> Result<Vec<Report>, Refusal> {
             });
         }
     }
-    let budget = budget(&c.notify, c.times);
+    let budget = budget(notify, c.times);
     let _ = tokio::time::timeout(budget, async { while tasks.join_next().await.is_some() {} }).await;
-    // At the budget's end: what still runs is killed with its group (the
-    // email notifier cancels its test once the answer is dropped).
+    // At the budget's end: what still runs is killed with its group.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(slots
@@ -257,10 +236,7 @@ pub async fn run(c: Channels) -> Result<Vec<Report>, Refusal> {
 pub struct Tester {
     busy: AtomicBool,
     pub notify: watch::Receiver<Arc<Notify>>,
-    pub mail: mpsc::Sender<Request>,
-    pub slots: Arc<Semaphore>,
-    pub instance: String,
-    pub times: Times,
+    pub channels: Channels,
 }
 
 /// Marks the end of a test.
@@ -273,20 +249,11 @@ impl Drop for Running {
 }
 
 impl Tester {
-    pub fn new(
-        notify: watch::Receiver<Arc<Notify>>,
-        mail: mpsc::Sender<Request>,
-        slots: Arc<Semaphore>,
-        instance: String,
-        times: Times,
-    ) -> Tester {
+    pub fn new(notify: watch::Receiver<Arc<Notify>>, channels: Channels) -> Tester {
         Tester {
             busy: AtomicBool::new(false),
             notify,
-            mail,
-            slots,
-            instance,
-            times,
+            channels,
         }
     }
 
@@ -300,20 +267,13 @@ impl Tester {
 
     /// The budget of a test with the current configuration.
     pub fn budget(&self) -> Duration {
-        budget(&self.notify.borrow(), self.times)
+        budget(&self.notify.borrow(), self.channels.times)
     }
 
     /// Runs a test with the accepted configuration of this moment.
     pub async fn run(&self) -> Result<Vec<Report>, Refusal> {
         let notify = Arc::clone(&self.notify.borrow());
-        run(Channels {
-            notify,
-            mail: Some(self.mail.clone()),
-            slots: Arc::clone(&self.slots),
-            instance: self.instance.clone(),
-            times: self.times,
-        })
-        .await
+        run(&notify, &self.channels).await
     }
 }
 
@@ -393,29 +353,21 @@ mod tests {
             deadline: Duration::from_millis(100),
         };
         // No permit: the hook waits beyond the budget (0.2 s).
-        let r = run(Channels {
-            notify: Arc::new(notify(vec![hook(&["/bin/true"], 100)])),
-            mail: None,
-            slots: Arc::new(Semaphore::new(0)),
+        let channels = |permits: usize| Channels {
+            sendmail: Sendmail::default(),
+            slots: Arc::new(Semaphore::new(permits)),
             instance: "abc".into(),
             times,
-        })
-        .await
-        .unwrap();
+        };
+        let r = run(&notify(vec![hook(&["/bin/true"], 100)]), &channels(0))
+            .await
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(
             (r[0].outcome, r[0].program.as_deref()),
             (Outcome::NotStarted, Some("/bin/true"))
         );
-        let none = run(Channels {
-            notify: Arc::new(notify(Vec::new())),
-            mail: None,
-            slots: Arc::new(Semaphore::new(1)),
-            instance: "abc".into(),
-            times,
-        })
-        .await
-        .unwrap();
+        let none = run(&notify(Vec::new()), &channels(1)).await.unwrap();
         assert!(none.is_empty());
     }
 }

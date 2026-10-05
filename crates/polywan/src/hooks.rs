@@ -60,6 +60,17 @@ pub fn spec(hook: &Hook, event: &Event, user: (u32, u32)) -> Option<Spec> {
     })
 }
 
+/// The uid and gid of the hook user, looked up on the blocking pool.
+pub async fn resolve_user(name: &str) -> Result<(u32, u32), String> {
+    let owned = name.to_owned();
+    tokio::task::spawn_blocking(move || crate::identity::user(&owned))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+        .map(|u| (u.uid, u.gid))
+        .ok_or_else(|| format!("hook user {name:?} not found"))
+}
+
 /// Runs a hook and logs how it ended, with its output (FR-HOOK-3).
 pub async fn run_logged(spec: Spec, kind: &str) -> End {
     let program = spec.program.display().to_string();
@@ -91,15 +102,9 @@ pub async fn notifier(
         }
         // The hook user, resolved again when it changes (a reload).
         if user.as_ref().is_none_or(|(name, _)| *name != notify.hook_user) {
-            let name = notify.hook_user.clone();
-            let found = tokio::task::spawn_blocking(move || crate::identity::user(&name))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
-            match found {
-                Some(u) => user = Some((notify.hook_user.clone(), (u.uid, u.gid))),
-                None => {
+            match resolve_user(&notify.hook_user).await {
+                Ok(ids) => user = Some((notify.hook_user.clone(), ids)),
+                Err(_) => {
                     warn!(user = %notify.hook_user, "hook user not found: hooks not run");
                     user = None;
                     continue;

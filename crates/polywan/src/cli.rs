@@ -371,12 +371,8 @@ pub async fn notify_test_offline(path: &Path, lock: &Path) -> Result<()> {
         bail!("notify-test --offline needs root");
     }
     let cfg = load(path)?;
-    let mut f = crate::checks::trusted(path, &cfg);
-    f.extend(crate::checks::identities(&cfg));
+    let f = crate::checks::runnable(path, &cfg, &crate::subprocess::inherited_descriptors());
     if let Some(e) = f.errors.first() {
-        bail!("{e}");
-    }
-    if let Some(e) = crate::subprocess::descriptor_errors(&cfg, &crate::subprocess::inherited_descriptors()).first() {
         bail!("{e}");
     }
     let _lock = crate::state::InstanceLock::acquire(lock)
@@ -384,14 +380,14 @@ pub async fn notify_test_offline(path: &Path, lock: &Path) -> Result<()> {
     eprintln!(
         "WARNING: offline test: the service's sandbox was not exercised; only `polywan notify-test` through the daemon tests it"
     );
-    let reports = crate::notifytest::run(crate::notifytest::Channels {
-        notify: std::sync::Arc::new(cfg.notify.clone()),
-        mail: None,
+    let channels = crate::notifytest::Channels {
+        sendmail: crate::mail::Sendmail::default(),
         slots: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::hooks::CONCURRENCY)),
         instance: crate::events::instance_id(),
         times: crate::test_hooks::mail_times(crate::mail::Times::default()),
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    };
+    let reports = crate::notifytest::run(&cfg.notify, &channels)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     print_reports(&reports)
 }

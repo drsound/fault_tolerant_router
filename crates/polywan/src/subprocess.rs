@@ -134,12 +134,11 @@ pub async fn run(spec: &Spec) -> Outcome {
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let input = spec.input.clone();
     let work = async {
         let write = async {
             match stdin {
                 Some(mut i) => {
-                    let r = i.write_all(&input).await;
+                    let r = i.write_all(&spec.input).await;
                     // Closed: the end of the input.
                     drop(i);
                     r.map_err(|e| e.to_string())

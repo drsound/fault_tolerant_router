@@ -1077,13 +1077,7 @@ pub fn check_mailbox(text: &str) -> Result<(), String> {
     if let Some(c) = local.chars().next().filter(|c| matches!(c, '-' | '/' | '|')) {
         return fail(&format!("the local part must not start with {c:?}"));
     }
-    let label = |l: &str| {
-        (1..=63).contains(&l.len())
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    if domain.len() > 253 || !domain.split('.').all(label) {
+    if domain.len() > 253 || !domain.split('.').all(crate::mail::dns_label) {
         return fail("the domain must be a DNS name");
     }
     Ok(())

@@ -68,6 +68,22 @@ pub fn nftables(version_output: &str) -> Findings {
     f
 }
 
+/// What must hold before PolyWAN runs configured programs, each stage only
+/// once the previous one passed: the trust of the configuration and of its
+/// executables (FR-CFG-5), the accounts, and no descriptor that hooks and
+/// sendmail would inherit (FR-HOOK-3; `inherited` comes from
+/// [`crate::subprocess::inherited_descriptors`]).
+pub fn runnable(config_path: &Path, config: &Config, inherited: &[i32]) -> Findings {
+    let mut f = trusted(config_path, config);
+    if f.errors.is_empty() {
+        f.extend(identities(config));
+    }
+    if f.errors.is_empty() {
+        f.errors.extend(crate::subprocess::descriptor_errors(config, inherited));
+    }
+    f
+}
+
 /// FR-CFG-5 for the configuration file and the binaries PolyWAN runs as
 /// root, `firewall.nft_path` and, with email, `notify.email.sendmail`:
 /// checked before anything configured runs.

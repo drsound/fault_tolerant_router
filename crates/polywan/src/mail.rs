@@ -16,12 +16,14 @@
 //! most eight messages wait, with 4 MiB of retained bodies (a waiting
 //! message retains only its body; headers are built at each submission).
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -248,13 +250,16 @@ pub fn message_id(instance: &str, n: u64, from: &str) -> String {
 /// hyphens.
 pub fn host_suffix(raw: &str) -> Option<&str> {
     let h = raw.trim_end_matches('\n');
-    let label = |l: &str| {
-        !l.is_empty()
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    (!h.is_empty() && h.len() <= 63 && h.split('.').all(label)).then_some(h)
+    (!h.is_empty() && h.len() <= 63 && h.split('.').all(dns_label)).then_some(h)
+}
+
+/// A DNS label of letters, digits and inner hyphens, of 1 to 63 octets (of
+/// host names and of mailbox domains, FR-MAIL-1).
+pub fn dns_label(l: &str) -> bool {
+    (1..=63).contains(&l.len())
+        && !l.starts_with('-')
+        && !l.ends_with('-')
+        && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// The kernel host name, if it qualifies for the Subject.
@@ -320,12 +325,15 @@ fn truncate_utf8(body: &mut String, max: usize) {
 /// ends (the sendmail interface's convention). No event text enters a
 /// header (FR-MAIL-1).
 pub fn render(m: &Message, email: &Email, host: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut body = m.body.clone();
-    if body.len() > BODY_BYTES {
+    let body: Cow<str> = if m.body.len() > BODY_BYTES {
         const CUT: &str = "\n[truncated]\n";
+        let mut body = m.body.clone();
         truncate_utf8(&mut body, BODY_BYTES - CUT.len());
         body += CUT;
-    }
+        body.into()
+    } else {
+        m.body.as_str().into()
+    };
     let mut s = format!(
         "Date: {}\nMessage-ID: {}\nFrom: {}\nTo: {}\nSubject: {}{}\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: base64\nAuto-Submitted: auto-generated\n\n",
         rfc5322_date(m.date),
@@ -363,13 +371,41 @@ pub fn spec(email: &Email, input: Vec<u8>, deadline: Duration) -> Spec {
     }
 }
 
+/// What the email notifier shares with notification tests: one sendmail
+/// submission at a time, tests included (FR-MAIL-3), and the numbers of
+/// the instance's Message-IDs.
+#[derive(Clone, Debug)]
+pub struct Sendmail {
+    /// One permit. The semaphore is fair: a test waiting for a running
+    /// submission goes before the next due message. Closed once the
+    /// notifier ends.
+    pub turn: Arc<Semaphore>,
+    ids: Arc<AtomicU64>,
+}
+
+impl Default for Sendmail {
+    fn default() -> Sendmail {
+        Sendmail {
+            turn: Arc::new(Semaphore::new(1)),
+            ids: Arc::default(),
+        }
+    }
+}
+
+impl Sendmail {
+    /// The number of the next Message-ID.
+    pub fn next_id(&self) -> u64 {
+        self.ids.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 /// The decisions of the email notifier.
 pub struct Mail {
     pub times: Times,
     /// `polywan_notifications_failed_total{channel="email"}`.
     pub failures: Arc<Failures>,
     instance: String,
-    next_id: u64,
+    pub sendmail: Sendmail,
     pub batch: Option<Batch>,
     pub admission: Admission,
     /// Oldest first.
@@ -377,12 +413,12 @@ pub struct Mail {
 }
 
 impl Mail {
-    pub fn new(instance: String, times: Times) -> Mail {
+    pub fn new(instance: String, times: Times, failures: Arc<Failures>, sendmail: Sendmail) -> Mail {
         Mail {
             times,
-            failures: Arc::default(),
+            failures,
             instance,
-            next_id: 0,
+            sendmail,
             batch: None,
             admission: Admission::default(),
             waiting: VecDeque::new(),
@@ -395,14 +431,8 @@ impl Mail {
         self.batch.get_or_insert_with(|| Batch::new(now + coalesce)).add(e);
     }
 
-    /// The number of the next Message-ID.
-    fn next(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
-    }
-
     pub fn message(&mut self, kind: Kind, body: String, email: &Email, now: Instant) -> Message {
-        let n = self.next();
+        let n = self.sendmail.next_id();
         Message {
             kind,
             id: message_id(&self.instance, n, &email.from),
@@ -538,27 +568,6 @@ pub fn test_message(instance: &str, n: u64, email: &Email) -> Message {
     }
 }
 
-/// The answer to a notification test's email channel.
-pub type TestRun = Result<subprocess::Outcome, String>;
-
-/// Called when a test's process is about to run.
-pub type Started = Box<dyn FnOnce() + Send>;
-
-/// Requests to the email notifier.
-pub enum Request {
-    /// The daemon stops: close the batch, try what waits once, within
-    /// [`SHUTDOWN`], then answer and end.
-    Flush(oneshot::Sender<()>),
-    /// A notification test (FR-MAIL-4): it waits for a running submission
-    /// (one at a time), goes before waiting messages, is never retried, and
-    /// is cancelled when its answer is no longer awaited. `started` is
-    /// called when its process is about to run.
-    Test {
-        reply: oneshot::Sender<TestRun>,
-        started: Started,
-    },
-}
-
 /// Logs a submission's end, counts a failure and applies FR-MAIL-3.
 fn finished(mail: &mut Mail, m: Message, result: Submitted, now: Instant, retry: bool) {
     if result != Submitted::Accepted {
@@ -576,11 +585,18 @@ fn finished(mail: &mut Mail, m: Message, result: Submitted, now: Instant, retry:
     }
 }
 
-/// The running submission and the message it submits (none for a test).
-type Running = (
-    Option<Message>,
-    std::pin::Pin<Box<dyn Future<Output = Submitted> + Send>>,
-);
+/// The running submission: it gives its message back with how it ended.
+type Running = std::pin::Pin<Box<dyn Future<Output = (Message, Submitted)> + Send>>;
+
+/// Submits `m` with the configuration it starts with, holding the sendmail
+/// turn until it ends.
+fn submission(m: Message, email: Email, deadline: Duration, turn: OwnedSemaphorePermit) -> Running {
+    Box::pin(async move {
+        let result = submit(&m, &email, deadline).await;
+        drop(turn);
+        (m, result)
+    })
+}
 
 async fn at(t: Option<Instant>) {
     match t {
@@ -590,27 +606,33 @@ async fn at(t: Option<Instant>) {
 }
 
 /// The email notifier: `events` from the bus (selected by
-/// `notify.email.events`), the notification settings from `config`.
+/// `notify.email.events`), the notification settings from `config`. A
+/// stopping daemon sends `stop` the sender of its answer: the batch is
+/// closed and what waits is tried once, within [`SHUTDOWN`].
 pub async fn notifier(
+    events: Queue,
+    config: watch::Receiver<Arc<Notify>>,
+    stop: oneshot::Receiver<oneshot::Sender<()>>,
+    mut mail: Mail,
+) {
+    let turn = Arc::clone(&mail.sendmail.turn);
+    drive(events, config, stop, &mut mail).await;
+    // Tests waiting for the turn end; later ones are refused (FR-MAIL-4).
+    turn.close();
+}
+
+async fn drive(
     mut events: Queue,
     mut config: watch::Receiver<Arc<Notify>>,
-    mut requests: mpsc::Receiver<Request>,
-    instance: String,
-    failures: Arc<Failures>,
+    mut stop: oneshot::Receiver<oneshot::Sender<()>>,
+    mail: &mut Mail,
 ) {
-    let mut mail = Mail::new(instance, crate::test_hooks::mail_times(Times::default()));
-    mail.failures = failures;
     let mut notify = Arc::clone(&config.borrow_and_update());
-    // The running submission, with the message it submits.
     let mut running: Option<Running> = None;
-    let mut test: Option<(oneshot::Sender<TestRun>, Started)> = None;
     loop {
         let close = mail.batch.as_ref().map(|b| b.deadline);
-        let due = match (&running, &test) {
-            (Some(_), _) => None,
-            (None, Some(_)) => Some(Instant::now()),
-            (None, None) => mail.next_due(),
-        };
+        let due = if running.is_some() { None } else { mail.next_due() };
+        let turn = Arc::clone(&mail.sendmail.turn);
         tokio::select! {
             e = events.recv() => {
                 let Some(e) = e else { return };
@@ -624,45 +646,26 @@ pub async fn notifier(
                     mail.discard();
                 }
             },
-            () = at(due) => match &notify.email {
-                Some(email) if test.is_some() => {
-                    let (mut reply, started) = test.take().expect("a test");
-                    let n = mail.next();
-                    let m = test_message(&mail.instance, n, email);
-                    let (email, deadline) = (email.clone(), mail.times.deadline);
-                    started();
-                    running = Some((None, Box::pin(async move {
-                        let r = tokio::select! {
-                            r = attempt(&m, &email, deadline) => Some(r.map_err(|e| e.to_string())),
-                            () = reply.closed() => None,
-                        };
-                        if let Some(r) = r {
-                            let _ = reply.send(r);
+            // The message is taken once the turn is held: one that a reload
+            // discards meanwhile is not submitted.
+            permit = async { at(due).await; turn.acquire_owned().await }, if due.is_some() => {
+                let Ok(permit) = permit else { return };
+                match &notify.email {
+                    Some(email) => {
+                        if let Some(m) = mail.take_due(Instant::now()) {
+                            running = Some(submission(m, email.clone(), mail.times.deadline, permit));
                         }
-                        Submitted::Accepted
-                    })));
-                }
-                Some(email) => {
-                    if let Some(m) = mail.take_due(Instant::now()) {
-                        let (email, deadline) = (email.clone(), mail.times.deadline);
-                        let message = m.clone();
-                        running = Some((Some(m), Box::pin(async move { submit(&message, &email, deadline).await })));
+                    }
+                    None => {
+                        mail.discard();
                     }
                 }
-                None => {
-                    mail.discard();
-                    if let Some((reply, _)) = test.take() {
-                        let _ = reply.send(Err("email is not configured".into()));
-                    }
-                }
-            },
-            result = async { running.as_mut().expect("polled while running").1.as_mut().await }, if running.is_some() => {
-                // A test answered by itself.
-                if let (Some(m), _) = running.take().expect("running") {
-                    // A retry needs email still configured (FR-MAIL-1).
-                    let retry = notify.email.is_some();
-                    finished(&mut mail, m, result, Instant::now(), retry);
-                }
+            }
+            (m, result) = async { running.as_mut().expect("polled while running").await }, if running.is_some() => {
+                running = None;
+                // A retry needs email still configured (FR-MAIL-1).
+                let retry = notify.email.is_some();
+                finished(mail, m, result, Instant::now(), retry);
             }
             changed = config.changed() => {
                 if changed.is_err() {
@@ -677,25 +680,14 @@ pub async fn notifier(
                 }
                 notify = next;
             }
-            request = requests.recv() => {
-                let done = match request {
-                    None => return,
-                    Some(Request::Test { reply, started }) => {
-                        if test.is_some() {
-                            let _ = reply.send(Err("another test is running".into()));
-                        } else {
-                            test = Some((reply, started));
-                        }
-                        continue;
-                    }
-                    Some(Request::Flush(done)) => done,
-                };
+            done = &mut stop => {
+                let Ok(done) = done else { return };
                 while let Some(e) = events.try_recv() {
                     if notify.email.is_some() {
                         mail.add(Instant::now(), notify.coalesce, &e);
                     }
                 }
-                flush(&mut mail, &notify, running.take()).await;
+                flush(mail, &notify, running.take()).await;
                 let _ = done.send(());
                 return;
             }
@@ -704,19 +696,21 @@ pub async fn notifier(
 }
 
 /// The last submissions of a stopping daemon: the running one, then each
-/// waiting message once, retries included, within [`SHUTDOWN`].
+/// waiting message once, retries included, within [`SHUTDOWN`]. Each takes
+/// its turn: a running notification test ends first.
 async fn flush(mail: &mut Mail, notify: &Notify, running: Option<Running>) {
     let Some(email) = &notify.email else { return };
     mail.close_batch(Instant::now(), email, hostname().as_deref());
     let deadline = mail.times.deadline;
     let pending = std::mem::take(&mut mail.waiting);
+    let turn = Arc::clone(&mail.sendmail.turn);
     let work = async {
-        // A running test is cancelled (dropped).
-        if let Some((Some(m), f)) = running {
-            let r = f.await;
+        if let Some(f) = running {
+            let (m, r) = f.await;
             finished(mail, m, r, Instant::now(), false);
         }
         for m in pending {
+            let Ok(_turn) = turn.acquire().await else { return };
             let r = submit(&m, email, deadline).await;
             finished(mail, m, r, Instant::now(), false);
         }
