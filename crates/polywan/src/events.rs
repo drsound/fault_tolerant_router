@@ -9,6 +9,7 @@
 //! JSON under the lock and never serialise or wait under it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -95,11 +96,37 @@ impl NewEvent {
     }
 }
 
-/// A notifier's queue (FR-EV-3).
+/// A notifier's queue (FR-EV-3): at most `capacity` events and
+/// `max_bytes` of serialised event data, of the selected types only.
 struct Notifier {
     name: &'static str,
-    tx: mpsc::Sender<Arc<Event>>,
+    tx: mpsc::Sender<(Arc<Event>, usize)>,
+    bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    /// `None`: every type.
+    select: Option<Vec<String>>,
     dropped: u64,
+}
+
+/// The receiving end of a notifier's queue.
+pub struct Queue {
+    rx: mpsc::Receiver<(Arc<Event>, usize)>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Queue {
+    pub async fn recv(&mut self) -> Option<Arc<Event>> {
+        let (e, n) = self.rx.recv().await?;
+        self.bytes.fetch_sub(n, Ordering::Relaxed);
+        Some(e)
+    }
+
+    /// An event already queued, without waiting.
+    pub fn try_recv(&mut self) -> Option<Arc<Event>> {
+        let (e, n) = self.rx.try_recv().ok()?;
+        self.bytes.fetch_sub(n, Ordering::Relaxed);
+        Some(e)
+    }
 }
 
 /// The emitter, owned by the State task.
@@ -136,11 +163,28 @@ impl Bus {
         self.latest.subscribe()
     }
 
-    /// A notifier's queue, of at most `capacity` events.
-    pub fn add_notifier(&mut self, name: &'static str, capacity: usize) -> mpsc::Receiver<Arc<Event>> {
+    /// A notifier's queue, of at most `capacity` events and `max_bytes` of
+    /// serialised event data, receiving every type until [`Bus::select`].
+    pub fn add_notifier(&mut self, name: &'static str, capacity: usize, max_bytes: usize) -> Queue {
         let (tx, rx) = mpsc::channel(capacity);
-        self.notifiers.push(Notifier { name, tx, dropped: 0 });
-        rx
+        let bytes = Arc::new(AtomicUsize::new(0));
+        self.notifiers.push(Notifier {
+            name,
+            tx,
+            bytes: Arc::clone(&bytes),
+            max_bytes,
+            select: None,
+            dropped: 0,
+        });
+        Queue { rx, bytes }
+    }
+
+    /// The event types a notifier receives from now on (FR-MAIL-2:
+    /// selection precedes admission); `None` for every type.
+    pub fn select(&mut self, name: &str, types: Option<Vec<String>>) {
+        for n in self.notifiers.iter_mut().filter(|n| n.name == name) {
+            n.select = types.clone();
+        }
     }
 
     /// Events dropped per notifier (`polywan_events_dropped_total`).
@@ -164,12 +208,20 @@ impl Bus {
             test: false,
         });
         let json: Arc<str> = serde_json::to_string(&*event).unwrap_or_default().into();
+        let size = json.len();
         self.ring
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(event.seq, json);
         for n in &mut self.notifiers {
-            if n.tx.try_send(Arc::clone(&event)).is_err() {
+            if n.select.as_ref().is_some_and(|t| !t.iter().any(|k| k == event.kind)) {
+                continue;
+            }
+            // Counted before sending: the receiver subtracts what it takes.
+            if n.bytes.fetch_add(size, Ordering::Relaxed) + size > n.max_bytes
+                || n.tx.try_send((Arc::clone(&event), size)).is_err()
+            {
+                n.bytes.fetch_sub(size, Ordering::Relaxed);
                 n.dropped += 1;
             }
         }
@@ -281,7 +333,7 @@ pub fn rfc3339(t: SystemTime) -> String {
 
 /// Year, month and day of a day count since 1970-01-01 (proleptic
 /// Gregorian; Howard Hinnant's algorithm).
-fn civil(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -312,7 +364,7 @@ mod tests {
     #[test]
     fn events_carry_sequence_instance_and_fields() {
         let mut bus = Bus::new("abc".into());
-        let mut rx = bus.add_notifier("email", 1);
+        let mut rx = bus.add_notifier("email", 1, usize::MAX);
         let e = bus.emit(
             NewEvent::new("path_state_changed", "uplink a ipv4: up -> down (carrier_lost)")
                 .path("a", "ipv4")
@@ -332,6 +384,26 @@ mod tests {
         assert_eq!(bus.dropped(), [("email", 1)]);
         assert_eq!(rx.try_recv().unwrap().seq, 1);
         assert_eq!(*bus.subscribe().borrow(), 2);
+    }
+
+    #[test]
+    fn notifiers_receive_selected_types_within_their_byte_bound() {
+        let mut bus = Bus::new("abc".into());
+        let mut rx = bus.add_notifier("email", 10, 400);
+        bus.select("email", Some(vec!["daemon_started".into()]));
+        bus.emit(NewEvent::new("config_reloaded", "not selected"));
+        bus.emit(NewEvent::new("daemon_started", "x".repeat(100)));
+        // Selected, but beyond the 400 bytes with the first one: dropped.
+        bus.emit(NewEvent::new("daemon_started", "x".repeat(200)));
+        assert_eq!(bus.dropped(), [("email", 1)]);
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+        assert!(rx.try_recv().is_none());
+        // Taken events free their bytes.
+        bus.emit(NewEvent::new("daemon_started", "x".repeat(200)));
+        assert_eq!(rx.try_recv().unwrap().seq, 4);
+        bus.select("email", None);
+        bus.emit(NewEvent::new("config_reloaded", "every type"));
+        assert_eq!(rx.try_recv().unwrap().seq, 5);
     }
 
     fn ring_of(n: u64, size: usize) -> Ring {

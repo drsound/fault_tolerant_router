@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Semaphore, watch};
 use tracing::{info, warn};
 
 use crate::config::{Hook, Notify};
-use crate::events::Event;
+use crate::events::{Event, Queue};
 use crate::subprocess::{self, End, Spec};
 
 /// Hooks running at the same time (FR-HOOK-3).
@@ -74,7 +74,7 @@ pub async fn run_logged(spec: Spec, kind: &str) -> End {
 
 /// The hooks notifier: `events` from the bus, the notification settings
 /// from `config` (changed by reloads).
-pub async fn notifier(mut events: mpsc::Receiver<Arc<Event>>, mut config: watch::Receiver<Arc<Notify>>) {
+pub async fn notifier(mut events: Queue, mut config: watch::Receiver<Arc<Notify>>) {
     let slots = Arc::new(Semaphore::new(CONCURRENCY));
     let mut user: Option<(String, (u32, u32))> = None;
     while let Some(event) = events.recv().await {

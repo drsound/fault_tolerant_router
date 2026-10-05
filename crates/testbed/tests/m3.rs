@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use testbed::Outcome;
 use testbed::plan::{Family, Node, TCP_PORT, TCP_PORT_HTTPS, Uplink};
 use testbed::polywan::{self, HealthSpec};
+use testbed::sendmail::{Call, Mode, Stub};
 use testbed::traffic::tally;
 
 #[macro_use]
@@ -1089,10 +1090,383 @@ fn as25_hooks_run_bounded_and_detached() -> Result<()> {
         })
         .and_then(|_| Ok(std::fs::read_to_string(out.join("child"))?.trim().parse()?))?;
     t.wait_for("the child killed with its group", Duration::from_secs(6), || {
-        Ok(!std::path::Path::new(&format!("/proc/{child}")).exists())
+        Ok(gone(child))
     })?;
     f.wait_log(&t, "hook failed", 1, Duration::from_secs(5))?;
     assert!(f.log().contains("end=timed out"), "{}", f.log());
     t.carrier_up(Uplink::B)?;
     Ok(())
+}
+
+/// An IPv4 configuration over A and B with email through `sendmail`,
+/// coalescing over `coalesce`, and `more` keys of `[notify.email]`.
+fn with_email(sendmail: &std::path::Path, coalesce: &str, more: &str) -> String {
+    with(&format!(
+        "[notify]\ncoalesce = \"{coalesce}\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\", \"noc@example.org\"]\nsendmail = \"{}\"\n{more}",
+        sendmail.display()
+    ))
+}
+
+fn message_id(c: &Call) -> Option<String> {
+    c.message.as_ref()?.header("Message-ID").map(str::to_owned)
+}
+
+fn subject(c: &Call) -> String {
+    c.message
+        .as_ref()
+        .and_then(|m| m.header("Subject"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Whether a process has ended: gone, or a zombie (an orphan whose init
+/// does not reap, as in a virtme-ng guest).
+fn gone(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+        .is_none_or(|zombie| zombie)
+}
+
+/// AS-25, sendmail (FR-MAIL-1, FR-MAIL-3), with the minute of the retries
+/// shortened to 500 ms and the deadline to 2 s: sendmail runs as
+/// `-i -f FROM RECIPIENT...` in its own process group; a failing one is
+/// retried after 1, 5 and 15 (short) minutes with the same Message-ID,
+/// then the message is dropped; one that floods standard error or dies by
+/// a signal fails without blocking, and the retry is accepted; one that
+/// hangs with a child, and one that never reads its input, are killed with
+/// their group at the deadline, while routing meets its deadlines (INV-8),
+/// and the retry is accepted.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
+    let t = build();
+    let stub = Stub::new(&t, "sendmail")?;
+    let mut f = t.prepare_polywan(&with_email(&stub.path, "1s", ""))?;
+    f.set_env("POLYWAN_TEST_MAIL_TIMES", "500,2000");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    // The startup batch.
+    let calls = stub.wait_calls(&t, 1, Duration::from_secs(10))?;
+    let first = &calls[0];
+    assert_eq!(
+        first.args,
+        ["-i", "-f", "router@example.com", "admin@example.com", "noc@example.org"]
+    );
+    assert_eq!(first.pgid, first.pid, "its own process group");
+    let m = first.message.as_ref().context("the startup message")?;
+    assert!(m.body.contains(" daemon_started: polywan "), "{}", m.body);
+    assert!(subject(first).starts_with("PolyWAN notification"), "{}", m.raw);
+    let mut toggle = {
+        let mut drained = false;
+        move |f: &polywan::Polywan| -> Result<()> {
+            drained = !drained;
+            let out = f.drain("a", drained, false)?;
+            anyhow::ensure!(out.status.success(), "{}", polywan::output_text(&out));
+            Ok(())
+        }
+    };
+    // Exit status 75: three retries, 0.5, 2.5 and 7.5 s after each failure.
+    stub.set(Mode::Exit(75))?;
+    let before = stub.calls()?.len();
+    toggle(&f)?;
+    let calls = stub.wait_calls(&t, before + 4, Duration::from_secs(20))?;
+    let tries = &calls[before..before + 4];
+    let id = message_id(&tries[0]).context("Message-ID")?;
+    assert!(tries.iter().all(|c| message_id(c).as_ref() == Some(&id)), "{tries:?}");
+    for (pair, minutes) in tries.windows(2).zip([1u64, 5, 15]) {
+        let gap = pair[1].at.duration_since(pair[0].at)?;
+        let expected = Duration::from_millis(500 * minutes);
+        assert!(
+            gap >= expected && gap < expected + Duration::from_millis(1500),
+            "{gap:?}"
+        );
+    }
+    f.wait_log(&t, "email dropped after its last retry", 1, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(stub.calls()?.len(), before + 4, "no retry after the third");
+    // A flood of standard error, then a signal: each fails without
+    // blocking, and the retry with the same Message-ID is accepted.
+    for (mode, needle, n) in [
+        (Mode::Flood, "exit status 1, stderr: xxxx", 1),
+        (Mode::Signal, "killed by signal 9", 1),
+    ] {
+        stub.set(mode)?;
+        let before = stub.calls()?.len();
+        let submitted = f.log().matches("email submitted").count();
+        toggle(&f)?;
+        stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
+        stub.set(Mode::Accept)?;
+        let calls = stub.wait_calls(&t, before + 2, Duration::from_secs(10))?;
+        assert_eq!(message_id(&calls[before]), message_id(&calls[before + 1]));
+        f.wait_log(&t, "email submitted", submitted + 1, Duration::from_secs(5))?;
+        assert_eq!(f.log().matches(needle).count(), n, "{}", f.log());
+    }
+    assert!(f.log().contains("xxxx [truncated]"), "bounded standard error");
+    // Hanging with a child (A undrained by the toggle), then never reading:
+    // killed at the deadline, and routing meets its deadlines meanwhile.
+    for mode in [Mode::Hang, Mode::NoRead] {
+        stub.set(mode)?;
+        let before = stub.calls()?.len();
+        let timeouts = f.log().matches("timed out").count();
+        toggle(&f)?;
+        let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
+        let pid = calls[before].pid;
+        if mode == Mode::Hang {
+            t.wait_for("the stub's child", Duration::from_secs(5), || {
+                Ok(stub.child().is_some())
+            })?;
+            let lost = Instant::now();
+            t.carrier_down(Uplink::B)?;
+            wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
+            assert!(
+                lost.elapsed() < Duration::from_secs(2),
+                "routing unaffected by sendmail"
+            );
+            // The next toggle drains A, which needs B (FR-SEL-4).
+            t.carrier_up(Uplink::B)?;
+            wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+        }
+        stub.set(Mode::Accept)?;
+        t.wait_for("the timeout", Duration::from_secs(5), || {
+            Ok(f.log().matches("timed out").count() > timeouts)
+        })?;
+        t.wait_for("the group killed", Duration::from_secs(5), || {
+            Ok(gone(pid) && stub.child().is_none_or(gone))
+        })?;
+        // The retry (after the batch of B's carrier loss, due first), with
+        // the same Message-ID when the first attempt read it.
+        let calls = stub.wait_calls(&t, before + 2, Duration::from_secs(10))?;
+        if let Some(id) = message_id(&calls[before]) {
+            t.wait_for("the retry", Duration::from_secs(10), || {
+                Ok(stub.calls()?[before + 1..]
+                    .iter()
+                    .any(|c| message_id(c).as_ref() == Some(&id)))
+            })?;
+        } else {
+            assert!(calls[before + 1].message.is_some(), "the retry was accepted");
+        }
+    }
+    Ok(())
+}
+
+/// AS-25, reloads (FR-MAIL-1): a submission running when a reload changes
+/// the sendmail path and the recipients finishes with the configuration it
+/// started with; its retry uses the new path and recipients with the same
+/// Message-ID; a reload that removes `[notify.email]` discards the pending
+/// retry, logging the number.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as25_sendmail_retries_follow_reloads() -> Result<()> {
+    let t = build();
+    let old = Stub::new(&t, "sendmail")?;
+    let new = Stub::new(&t, "sendmail2")?;
+    let mut f = t.prepare_polywan(&with_email(&old.path, "1s", ""))?;
+    // Retries 2 s after a failure; the deadline 2 s.
+    f.set_env("POLYWAN_TEST_MAIL_TIMES", "2000,2000");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    old.wait_calls(&t, 1, Duration::from_secs(10))?;
+    old.set(Mode::Hang)?;
+    let out = f.drain("a", true, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    let calls = old.wait_calls(&t, 2, Duration::from_secs(10))?;
+    let pid = calls[1].pid;
+    let id = t
+        .wait_for("the running submission's message", Duration::from_secs(5), || {
+            Ok(old.calls()?.get(1).and_then(message_id).is_some())
+        })
+        .and_then(|_| old.calls()?.get(1).and_then(message_id).context("Message-ID"))?;
+    // While it runs, the path and the recipients change.
+    let changed = with(&format!(
+        "[notify]\ncoalesce = \"1s\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"ops@example.net\"]\nsendmail = \"{}\"\n",
+        new.path.display()
+    ));
+    f.write_config(&changed)?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    // It ends at its deadline, with the old path; the retry takes the new
+    // path and recipients, with the same Message-ID.
+    t.wait_for("the old submission's deadline", Duration::from_secs(5), || {
+        Ok(gone(pid))
+    })?;
+    let is_retry = |c: &Call| message_id(c).as_ref() == Some(&id);
+    t.wait_for("the retry through the new path", Duration::from_secs(10), || {
+        Ok(new.calls()?.iter().any(is_retry))
+    })?;
+    let retry = new.calls()?.into_iter().find(is_retry).context("the retry")?;
+    assert_eq!(retry.args, ["-i", "-f", "router@example.com", "ops@example.net"]);
+    let m = retry.message.as_ref().context("message")?;
+    assert_eq!(m.header("To"), Some("ops@example.net"));
+    assert!(m.body.contains(" uplink_drained a: "), "{}", m.body);
+    assert_eq!(old.calls()?.len(), 2, "nothing more through the old path");
+    // A failing submission, then email removed: the retry is discarded.
+    new.set(Mode::Exit(75))?;
+    let before = new.calls()?.len();
+    let out = f.drain("a", false, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    new.wait_calls(&t, before + 1, Duration::from_secs(10))?;
+    f.write_config(&polywan::ipv4(&ab()))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.wait_log(&t, "pending email discarded", 1, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(new.calls()?.len(), before + 1, "no retry once email is removed");
+    Ok(())
+}
+
+/// AS-07 (FR-HEALTH-2, FR-HEALTH-3, FR-MAIL-2), with the hour of the rate
+/// limit shortened to 12 s: while B's carrier flaps every 2 s for 60 s, B
+/// goes down once (with `rise = 5`, 2 s of carrier never bring it back) and
+/// up once after the flapping; the emails carry these events within the
+/// coalescing window, with their headers. Then, with `max_per_hour = 3`
+/// and events every second, every 12 s window holds at most three
+/// notifications and one suppression notice, and a notification after the
+/// window reports the suppressed ones.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
+    let t = build();
+    let stub = Stub::new(&t, "sendmail")?;
+    let health = HealthSpec {
+        text: HealthSpec::fast().text + "rise = 5\n",
+    };
+    let config = |max: u32| {
+        polywan::config(
+            &ab(),
+            &[Family::V4],
+            &health,
+            "",
+            &format!(
+                "[notify]\ncoalesce = \"2s\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\nsendmail = \"{}\"\nmax_per_hour = {max}\n",
+                stub.path.display()
+            ),
+        )
+    };
+    let mut f = t.prepare_polywan(&config(1000))?;
+    f.set_env("POLYWAN_TEST_MAIL_TIMES", "200,5000");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    stub.wait_calls(&t, 1, Duration::from_secs(10))?;
+    let start = f.events()?.last().map_or(0, |e| e.0);
+    for _ in 0..15 {
+        t.carrier_down(Uplink::B)?;
+        std::thread::sleep(Duration::from_secs(2));
+        t.carrier_up(Uplink::B)?;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let changes: Vec<String> = f
+        .events()?
+        .into_iter()
+        .filter(|(seq, kind, _)| *seq > start && kind == "path_state_changed")
+        .map(|(_, _, l)| l)
+        .collect();
+    assert_eq!(changes.len(), 2, "{changes:#?}");
+    // Every selected event reaches an email, within the coalescing window.
+    let selected = ["path_state_changed", "active_set_changed"];
+    t.wait_for("the emails of the flapping", Duration::from_secs(10), || {
+        let bodies: String = stub
+            .calls()?
+            .iter()
+            .filter_map(|c| Some(c.message.as_ref()?.body.clone()))
+            .collect();
+        Ok(f.events()?
+            .iter()
+            .filter(|(seq, kind, _)| *seq > start && selected.contains(&kind.as_str()))
+            .all(|(_, kind, l)| bodies.contains(&format!("{} {kind}", l.split(' ').next().unwrap_or("")))))
+    })?;
+    for c in stub.calls()? {
+        let m = c.message.as_ref().context("message")?;
+        for h in [
+            "Date",
+            "Message-ID",
+            "From",
+            "To",
+            "Subject",
+            "MIME-Version",
+            "Content-Type",
+        ] {
+            assert!(m.header(h).is_some(), "{h}: {}", m.raw);
+        }
+        assert_eq!(m.header("Content-Type"), Some("text/plain; charset=UTF-8"));
+        // The first change of the batch, then the call: the coalescing window.
+        let first = m
+            .body
+            .lines()
+            .nth(2)
+            .and_then(|l| l.split(' ').next())
+            .unwrap_or_default();
+        let at = timestamp(first)?;
+        let delay = c.at.duration_since(at).unwrap_or_default();
+        assert!(
+            delay >= Duration::from_millis(1900) && delay < Duration::from_secs(4),
+            "{delay:?}: {}",
+            m.body
+        );
+    }
+    // The rate limit: the earlier admissions leave the 12 s window first.
+    std::thread::sleep(Duration::from_secs(13));
+    f.write_config(&config(3))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    let from = std::time::SystemTime::now();
+    let mut drained = false;
+    while from.elapsed()? < Duration::from_secs(30) {
+        drained = !drained;
+        f.drain("a", drained, false)?;
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    let calls: Vec<Call> = stub
+        .calls()?
+        .into_iter()
+        .filter(|c| c.at >= from - Duration::from_secs(1))
+        .collect();
+    let notices: Vec<&Call> = calls
+        .iter()
+        .filter(|c| subject(c).starts_with("PolyWAN notifications suppressed"))
+        .collect();
+    let notes: Vec<&Call> = calls
+        .iter()
+        .filter(|c| !subject(c).starts_with("PolyWAN notifications suppressed"))
+        .collect();
+    let window = Duration::from_millis(12_000 - 300);
+    for c in &notes {
+        let within = notes
+            .iter()
+            .filter(|o| o.at <= c.at && c.at.duration_since(o.at).unwrap_or_default() < window)
+            .count();
+        assert!(within <= 3, "{} notifications within the window", within);
+    }
+    assert!(!notices.is_empty(), "a suppression notice");
+    for pair in notices.windows(2) {
+        assert!(pair[1].at.duration_since(pair[0].at)? >= window, "one notice per hour");
+    }
+    assert!(
+        notes.iter().any(|c| c
+            .message
+            .as_ref()
+            .is_some_and(|m| m.body.contains("suppressed by notify.email.max_per_hour"))),
+        "a notification after the window reports the suppressed ones"
+    );
+    Ok(())
+}
+
+/// An RFC 3339 UTC timestamp with milliseconds (event times).
+fn timestamp(s: &str) -> Result<std::time::SystemTime> {
+    let n = |r: std::ops::Range<usize>| -> Result<u64> { Ok(s.get(r).context("timestamp")?.parse()?) };
+    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    // Days since 1970-01-01 (Howard Hinnant's algorithm).
+    let (y, m) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?;
+    Ok(std::time::UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(n(20..23)?))
 }

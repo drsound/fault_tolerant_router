@@ -16,6 +16,7 @@ pub mod events;
 pub mod health;
 pub mod hooks;
 pub mod identity;
+pub mod mail;
 pub mod model;
 pub mod netlink;
 pub mod nft;

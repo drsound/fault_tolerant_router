@@ -48,6 +48,21 @@ pub fn slow_persistence() {
     }
 }
 
+/// `POLYWAN_TEST_MAIL_TIMES`: `MINUTE_MS,DEADLINE_MS`, the length of the
+/// minute of email retries and of the rolling hour, and the sendmail
+/// deadline, so that a scenario can cross them (AS-07, AS-25).
+#[cfg(feature = "test-hooks")]
+pub fn mail_times(default: crate::mail::Times) -> crate::mail::Times {
+    let Ok(v) = std::env::var("POLYWAN_TEST_MAIL_TIMES") else {
+        return default;
+    };
+    let mut ms = v.split(',').map(|n| n.trim().parse().ok().map(Duration::from_millis));
+    match (ms.next().flatten(), ms.next().flatten()) {
+        (Some(minute), Some(deadline)) => crate::mail::Times { minute, deadline },
+        _ => default,
+    }
+}
+
 /// A failure injected before a step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Injected {
@@ -158,6 +173,11 @@ pub fn hidden_deletion(family: Family, table: u32) -> bool {
 
 #[cfg(not(feature = "test-hooks"))]
 pub fn slow_persistence() {}
+
+#[cfg(not(feature = "test-hooks"))]
+pub fn mail_times(default: crate::mail::Times) -> crate::mail::Times {
+    default
+}
 
 #[cfg(not(feature = "test-hooks"))]
 pub fn boottime_shift_ms() -> u64 {

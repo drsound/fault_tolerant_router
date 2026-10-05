@@ -247,9 +247,6 @@ impl Config {
     /// to run a configuration that uses them rather than ignore them.
     pub fn unsupported_features(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if self.notify.email.is_some() {
-            v.push("email notifications ([notify.email])");
-        }
         if self.metrics_listen.is_some() {
             v.push("metrics (metrics.listen)");
         }

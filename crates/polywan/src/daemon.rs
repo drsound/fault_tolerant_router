@@ -260,6 +260,8 @@ struct Daemon {
     pending_answer: bool,
     /// The notification settings the notifiers follow (reloads change them).
     notify_config: watch::Sender<Arc<config::Notify>>,
+    /// The email notifier's requests (the flush at shutdown).
+    mail: Option<mpsc::Sender<crate::mail::Request>>,
     /// Commands of the control socket, one at a time.
     orders: VecDeque<Order>,
     command: Option<Active>,
@@ -526,6 +528,7 @@ pub async fn run(opts: Options) -> Result<()> {
         repairs_total: BTreeMap::new(),
         api: None,
         notify_config: watch::channel(Arc::new(cfg.notify.clone())).0,
+        mail: None,
         orders: VecDeque::new(),
         command: None,
         pending_answer: false,
@@ -582,9 +585,22 @@ pub async fn run(opts: Options) -> Result<()> {
         bail!("the I/O thread is not running");
     };
     // FR-HOOK-4: the hooks read their own bounded queue of the bus.
-    let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE);
+    let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE, usize::MAX);
     io.handle()
         .spawn(crate::hooks::notifier(hook_events, d.notify_config.subscribe()));
+    // FR-MAIL-2: the email queue receives the selected types only.
+    let mail_events = d
+        .bus
+        .add_notifier("email", crate::mail::QUEUE, crate::mail::QUEUE_BYTES);
+    d.bus.select("email", Some(email_selection(&d.cfg)));
+    let (mail, mail_requests) = mpsc::channel(1);
+    io.handle().spawn(crate::mail::notifier(
+        mail_events,
+        d.notify_config.subscribe(),
+        mail_requests,
+        d.bus.instance().to_owned(),
+    ));
+    d.mail = Some(mail);
     let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
@@ -628,6 +644,11 @@ pub async fn run(opts: Options) -> Result<()> {
         info!("external firewall mode: marking and NAT are the administrator's responsibility (export-nft)");
     }
     d.event_loop(subscription, probe_rx, done_rx, orders_rx).await
+}
+
+/// The event types the email queue admits: none without email (FR-MAIL-2).
+fn email_selection(cfg: &Config) -> Vec<String> {
+    cfg.notify.email.as_ref().map(|e| e.events.clone()).unwrap_or_default()
 }
 
 /// The system checks of `check-config` without `--offline` (§9).
@@ -2374,6 +2395,7 @@ impl Daemon {
         // Settings of the previous configuration still being applied are
         // forgotten: their completions only update the manifest.
         self.sysctls_flight.clear();
+        self.bus.select("email", Some(email_selection(&self.cfg)));
         self.notify_config.send_replace(Arc::new(self.cfg.notify.clone()));
         info!("config_reloaded");
         self.pending_events
@@ -2534,6 +2556,14 @@ impl Daemon {
         self.pending_events
             .push(NewEvent::new("daemon_stopping", "polywan is stopping"));
         self.flush_events();
+        // The batch holding `daemon_stopping` and the email still waiting
+        // get their last attempt (bounded by mail::SHUTDOWN).
+        if let Some(mail) = self.mail.take() {
+            let (done, wait) = tokio::sync::oneshot::channel();
+            if mail.send(crate::mail::Request::Flush(done)).await.is_ok() {
+                let _ = tokio::time::timeout(crate::mail::SHUTDOWN + Duration::from_secs(1), wait).await;
+            }
+        }
         listener.abort();
         for p in self.paths.values_mut() {
             if let Some((_, h)) = p.prober.take() {

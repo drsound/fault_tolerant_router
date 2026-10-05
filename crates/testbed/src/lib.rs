@@ -18,6 +18,7 @@ pub mod inject;
 pub mod netns;
 pub mod plan;
 pub mod polywan;
+pub mod sendmail;
 pub mod topology;
 pub mod traffic;
 
