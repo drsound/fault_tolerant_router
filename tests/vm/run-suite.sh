@@ -142,8 +142,11 @@ case $mode in
     # and a pipx installation lives in ~/.local/bin.
     # virtme-ng passes the --exec command on the kernel command line
     # (base64, within its 2048 bytes): the suite's commands go to a script
-    # in the shared directory.
-    printf '%s\n' "uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm POLYWAN_TESTBED_BIN=/mnt/polywan-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm" \
+    # in the shared directory. The guest's shell holds descriptors without
+    # close-on-exec (the daemon found 4 to 7 under virtme-ng 1.35), which
+    # the daemon refuses with hooks or email configured (FR-HOOK-3): they
+    # are listed, then closed (dash keeps the script itself above 9).
+    printf '%s\n' "ls -l /proc/\$\$/fd; exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; uname -r && nft --version && chmod 0755 /run && cd /tmp &&$kernel_in_vm POLYWAN_TESTBED_BIN=/mnt/polywan-testbed /mnt/netns --ignored --test-threads=${VM_TEST_THREADS:-2} $* $m1_in_vm" \
       > "$bindir/vm-suite.sh"
     exec $sudo env PATH="$PATH" "$vng" --run "$kernel" --root "$rootfs" --user root \
       --memory "${VM_MEMORY:-2G}" --cpus "${VM_CPUS:-2}" \
