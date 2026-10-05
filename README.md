@@ -14,7 +14,7 @@ PolyWAN 2.0 is a ground-up rewrite in Rust, under development on this branch (`v
 |---|---|---|
 | M1 | IPv4 core: configuration, discovery, probes, health, routing, nftables, `run`, `check-config`, `export-nft`, `cleanup`, `forget-uplink` | complete |
 | M2 | IPv6 | complete |
-| M3 | Operations: status API and the rest of the command line, drain, policies, events, email, hooks, Prometheus metrics, quality gates | in progress |
+| M3 | Operations: status API and the rest of the command line, drain, policies, events, email, hooks, Prometheus metrics, quality gates | complete |
 | M4 | Release: packages, documentation | planned |
 
 Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
