@@ -130,6 +130,9 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
     for u in t.uplinks() {
         steer_lan(&t, u)?;
         t.reset_counters()?;
+        // From here: steer_lan replaces the steering, and a late packet of
+        // the previous uplink's connections can meet the gap.
+        let leaks = lan_leaks()?;
         for f in t.families(u) {
             let tcp = t.connect_many(Node::Client, f, 50, 200, false)?;
             assert_eq!(
@@ -151,7 +154,7 @@ fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
             );
             assert!(t.egress_packets(u, f)? >= 250, "{u} {f} egress counter");
         }
-        assert_eq!(lan_leaks()?, 0, "steering routes carry no OS realm");
+        assert_eq!(lan_leaks()? - leaks, 0, "steering routes carry no OS realm");
     }
 
     // One-way UDP flow, attributed from the server log.
