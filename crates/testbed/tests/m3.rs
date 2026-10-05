@@ -599,9 +599,10 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     std::fs::remove_file(&slow)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(20))?;
     t.wait_for("the policy rule installed", Duration::from_secs(30), || {
+        // `udp`, or 17 without /etc/protocols.
         Ok(t.router()
             .sh("nft list table inet polywan")?
-            .contains("meta l4proto udp"))
+            .contains("iifname \"lan\" ct direction original meta l4proto"))
     })
     .with_context(|| {
         format!(
@@ -669,7 +670,9 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
     f.wait_event(
         &t,
         "path_state_changed",
-        "uplink b ipv4: up -> down (carrier_lost)",
+        // The reason is the first readiness loss observed (carrier,
+        // address), which depends on the kernel.
+        "uplink b ipv4: up -> down (",
         1,
         Duration::from_secs(5),
     )?;
@@ -687,8 +690,8 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
         .cloned()
         .unwrap_or_default();
     assert_eq!(
-        (b["state"].as_str(), b["reason"].as_str()),
-        (Some("down"), Some("carrier_lost")),
+        (b["state"].as_str(), b["ready"].as_bool()),
+        (Some("down"), Some(false)),
         "{s}"
     );
     t.carrier_up(Uplink::B)?;
