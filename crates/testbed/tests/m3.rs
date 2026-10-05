@@ -1769,18 +1769,21 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     })?;
     assert_eq!(get("127.0.0.1:9750", "POST", "/metrics")?.0, 405);
     assert_eq!(get("127.0.0.1:9750", "GET", "/v1/status")?.0, 404);
-    // B's transitions to down so far: a probe lost under load may have
-    // added one before the carrier loss.
+    // B's transitions to down so far, read in a scrape that shows B up: a
+    // probe lost under load may have added one before, and a later one is
+    // the only down transition left to the carrier loss.
     let downs = |text: &str| -> u64 {
         let name = "polywan_path_transitions_total{uplink=\"b\",family=\"ipv4\",to=\"down\"} ";
         text.lines()
             .find_map(|l| l.strip_prefix(name)?.parse().ok())
             .unwrap_or(0)
     };
-    f.wait_path_where(&t, "b", Family::V4, "up", Duration::from_secs(10), |p| {
-        p["state"] == "up"
+    let mut before = 0;
+    t.wait_for("B up in the metrics", Duration::from_secs(10), || {
+        let (_, text) = get("127.0.0.1:9750", "GET", "/metrics")?;
+        before = downs(&text);
+        Ok(metric(&text, "polywan_path_up{uplink=\"b\",family=\"ipv4\"} 1"))
     })?;
-    let before = downs(&get("127.0.0.1:9750", "GET", "/metrics")?.1);
     t.carrier_down(Uplink::B)?;
     wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
     t.wait_for("B down in the metrics", Duration::from_secs(5), || {
