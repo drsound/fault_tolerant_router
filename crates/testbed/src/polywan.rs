@@ -375,6 +375,12 @@ impl Polywan {
         self.cli(&args)
     }
 
+    /// `polywan reload` on the control socket.
+    pub fn reload_cli(&self) -> Result<Output> {
+        let socket = self.control_socket().display().to_string();
+        self.cli(&["reload", "--socket", &socket])
+    }
+
     /// Runs a CLI command with this run's configuration (`--config`).
     pub fn cli_config(&self, args: &[&str]) -> Result<Output> {
         let config = self.config.display().to_string();

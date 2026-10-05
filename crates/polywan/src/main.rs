@@ -88,9 +88,17 @@ enum Command {
         #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
         socket: PathBuf,
     },
-    /// Release the persisted id binding of a removed uplink.
+    /// Reload the configuration (through the control socket).
+    Reload {
+        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Release the persisted id binding of a removed uplink: through the
+    /// control socket while the daemon runs, offline otherwise.
     ForgetUplink {
         name: String,
+        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
+        socket: PathBuf,
         #[arg(long, default_value = config::DEFAULT_PATH)]
         config: PathBuf,
     },
@@ -155,7 +163,10 @@ fn main() -> ExitCode {
                 };
                 cleanup::run(&cfg, &dir).await
             }
-            Command::ForgetUplink { name, config } => forget(&config, &name, &cli.lock),
+            Command::ForgetUplink { name, socket, config } => {
+                polywan::cli::forget(&socket, &name, &config, &cli.lock).await
+            }
+            Command::Reload { socket } => polywan::cli::reload(&socket).await,
             Command::Status { json, socket } => polywan::cli::status(&socket, json).await,
             Command::Drain { name, force, socket } => polywan::cli::drain(&socket, &name, true, force).await,
             Command::Undrain { name, socket } => polywan::cli::drain(&socket, &name, false, false).await,
@@ -195,27 +206,5 @@ async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
         );
     }
     println!("{}: valid", path.display());
-    Ok(())
-}
-
-/// FR-MARK-4. While the daemon runs, the request belongs to the API, which
-/// this development build does not have yet.
-fn forget(path: &Path, name: &str, lock: &Path) -> anyhow::Result<()> {
-    let cfg = load(path)?;
-    let _lock = state::InstanceLock::acquire(lock).map_err(|e| {
-        anyhow::anyhow!("{e}; stop the daemon first (the API that forwards this request is not implemented yet)")
-    })?;
-    let dir = state::StateDir {
-        path: cfg.state_dir.clone(),
-    };
-    let mut m = dir
-        .manifest()?
-        .ok_or_else(|| anyhow::anyhow!("no manifest in {}", cfg.state_dir.display()))?;
-    if cfg.uplinks.iter().any(|u| u.name == name) {
-        anyhow::bail!("uplink {name:?} is still in the configuration; remove it first");
-    }
-    let id = m.forget(name).map_err(|e| anyhow::anyhow!(e))?;
-    dir.write_manifest(&m)?;
-    println!("uplink {name:?} forgotten; id {id} can be reused");
     Ok(())
 }

@@ -148,6 +148,15 @@ enum Active {
         drain: bool,
         reply: oneshot::Sender<Answer>,
     },
+    /// A reload requested through the API: answered when it ends, with its
+    /// errors or, once committed, when applied (FR-API-3).
+    Reloading { reply: oneshot::Sender<Answer> },
+    /// The binding of a removed uplink is being released (FR-MARK-4).
+    Forgetting {
+        seq: u64,
+        uplink: String,
+        reply: oneshot::Sender<Answer>,
+    },
     /// Applied when the applied generation reaches `target`, which the pass
     /// after the change sets (FR-REC-5).
     Applying {
@@ -246,6 +255,9 @@ struct Daemon {
     repairs_total: BTreeMap<&'static str, u64>,
     /// The API listener manager; none in a dry run.
     api: Option<crate::api::Api>,
+    /// A command was answered inside a reload's end: the next one starts
+    /// once the reload state is clear.
+    pending_answer: bool,
     /// Commands of the control socket, one at a time.
     orders: VecDeque<Order>,
     command: Option<Active>,
@@ -502,6 +514,7 @@ pub async fn run(opts: Options) -> Result<()> {
         api: None,
         orders: VecDeque::new(),
         command: None,
+        pending_answer: false,
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -1189,12 +1202,11 @@ impl Daemon {
             match request {
                 Action::Drain { uplink, force } => self.start_drain(&uplink, true, force, reply),
                 Action::Undrain { uplink } => self.start_drain(&uplink, false, false, reply),
-                Action::Forget { .. } | Action::Reload => {
-                    let _ = reply.send(Answer::error(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "not implemented by this development build",
-                    ));
+                Action::Reload => {
+                    self.command = Some(Active::Reloading { reply });
+                    self.start_reload();
                 }
+                Action::Forget { uplink } => self.start_forget(uplink, reply),
             }
         }
     }
@@ -1265,6 +1277,52 @@ impl Daemon {
             }
             Err(Lost::Closed) => self.lost(),
         }
+    }
+
+    /// FR-MARK-4: releases the binding of an uplink no longer configured.
+    fn start_forget(&mut self, uplink: String, reply: oneshot::Sender<Answer>) {
+        if self.cfg.uplinks.iter().any(|u| u.name == uplink) {
+            let _ = reply.send(Answer::error(
+                StatusCode::CONFLICT,
+                format!("uplink {uplink:?} is still in the configuration; remove it and reload first"),
+            ));
+            return;
+        }
+        let seq = self.next_seq();
+        match self.lanes.persist(PersistJob::Forget {
+            seq,
+            uplink: uplink.clone(),
+        }) {
+            Ok(()) => self.command = Some(Active::Forgetting { seq, uplink, reply }),
+            Err(Lost::Full) => {
+                let _ = reply.send(Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the state directory is busy",
+                ));
+            }
+            Err(Lost::Closed) => self.lost(),
+        }
+    }
+
+    fn forgotten(&mut self, seq: u64, result: std::result::Result<u8, String>) {
+        let Some(Active::Forgetting { seq: s, .. }) = &self.command else {
+            return;
+        };
+        if *s != seq {
+            return;
+        }
+        let Some(Active::Forgetting { uplink, reply, .. }) = self.command.take() else {
+            return;
+        };
+        let answer = match result {
+            Ok(id) => {
+                info!(uplink = %uplink, id, "uplink forgotten");
+                Answer::new(StatusCode::OK, serde_json::json!({ "uplink": uplink, "id": id }))
+            }
+            Err(e) => Answer::error(StatusCode::CONFLICT, e),
+        };
+        let _ = reply.send(answer);
+        self.next_order();
     }
 
     /// The drain intent is durable: it applies now, and the command waits
@@ -2147,6 +2205,21 @@ impl Daemon {
         for e in errors {
             error!("reload_failed: {e}");
         }
+        // A reload requested through the control socket gets the
+        // diagnostics (FR-API-3, IMPL-11), unless another reload follows.
+        if !self.reload_again
+            && matches!(self.command, Some(Active::Reloading { .. }))
+            && let Some(Active::Reloading { reply }) = self.command.take()
+        {
+            let _ = reply.send(Answer::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({
+                    "error": "the configuration was not reloaded; the running configuration is kept",
+                    "errors": errors,
+                }),
+            ));
+            self.pending_answer = true;
+        }
         // Diagnostics stay in the log (FR-API-2, IMPL-11).
         self.pending_events.push(NewEvent::new(
             "reload_failed",
@@ -2159,6 +2232,9 @@ impl Daemon {
         self.reload = None;
         if std::mem::take(&mut self.reload_again) {
             self.start_reload();
+        }
+        if std::mem::take(&mut self.pending_answer) {
+            self.next_order();
         }
     }
 
@@ -2283,6 +2359,19 @@ impl Daemon {
         info!("config_reloaded");
         self.pending_events
             .push(NewEvent::new("config_reloaded", "the configuration was reloaded"));
+        // Committed: the API's reload completes when applied.
+        if !self.reload_again
+            && matches!(self.command, Some(Active::Reloading { .. }))
+            && let Some(Active::Reloading { reply }) = self.command.take()
+        {
+            self.command = Some(Active::Applying {
+                target: None,
+                since: Instant::now(),
+                step: "respond reload",
+                answer: serde_json::json!({ "reloaded": true }),
+                reply,
+            });
+        }
         self.dirty = true;
         self.end_reload();
     }
@@ -2318,6 +2407,10 @@ impl Daemon {
             Done::Reload(outcome) => self.reload_validated(outcome),
             Done::ApiPrepared { seq, result } => self.api_prepared(seq, result),
             Done::Drained { seq, result } => self.drained(seq, result),
+            Done::Forgotten { seq, result, manifest } => {
+                self.manifest = manifest;
+                self.forgotten(seq, result);
+            }
         }
     }
 

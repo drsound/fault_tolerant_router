@@ -129,6 +129,8 @@ pub enum PersistJob {
     HandBack { seq: u64, families: Vec<Family> },
     /// The drain intent, durably before it is applied (FR-SEL-3).
     Drain { seq: u64, state: DrainState },
+    /// Releases the id binding of a removed uplink (FR-MARK-4).
+    Forget { seq: u64, uplink: String },
     /// A health checkpoint; only the latest waiting one is written.
     Checkpoint(Box<Checkpoint>),
     /// Logs the FR-SYS-3 warning about a missing IPv6 gateway, with the
@@ -173,6 +175,12 @@ pub enum Done {
     Drained {
         seq: u64,
         result: Result<(), String>,
+    },
+    /// The id released, or why not; the lane's manifest either way.
+    Forgotten {
+        seq: u64,
+        result: Result<u8, String>,
+        manifest: Manifest,
     },
     Reload(ReloadOutcome),
     /// The API listeners of a reloaded configuration are bound (FR-API-1).
@@ -514,6 +522,21 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                 .map_err(|e| e.to_string())
                 .and_then(|()| dir.write_drain(&state).map_err(|e| e.to_string()));
             (Some(Done::Drained { seq, result }), None)
+        }
+        PersistJob::Forget { seq, uplink } => {
+            let mut released = manifest.clone();
+            let result = released.forget(&uplink).and_then(|id| {
+                dir.write_manifest(&released)
+                    .map(|()| id.get())
+                    .map_err(|e| e.to_string())
+            });
+            let changed = result.is_ok();
+            let report = Done::Forgotten {
+                seq,
+                result,
+                manifest: if changed { released.clone() } else { manifest },
+            };
+            (Some(report), changed.then_some(released))
         }
         PersistJob::Checkpoint(c) => {
             if let Err(e) = dir.write_checkpoint(&c) {

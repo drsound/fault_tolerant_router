@@ -947,3 +947,63 @@ fn as46_drain_survives_a_crash_at_each_step() -> Result<()> {
     f.stop()?;
     Ok(())
 }
+
+/// FR-API-3, FR-MARK-4, FR-CFG-3: `reload` through the control socket
+/// reports success with the applied generation, or the validation errors
+/// (only to the client and the log: the public `reload_failed` event has a
+/// fixed message); `forget-uplink` through the control socket is refused
+/// while the uplink is configured, then releases its id for another name.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn api_reload_and_forget() -> Result<()> {
+    let t = build();
+    let f = t.start_polywan(&polywan::ipv4(&ab()))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let before = f.status()?["generation"]["applied"].as_u64().unwrap_or(0);
+    f.write_config(&polywan::ipv4(&[
+        polywan::UplinkSpec::new(Uplink::A, 1).weight(3),
+        polywan::UplinkSpec::new(Uplink::B, 2),
+    ]))?;
+    let out = f.reload_cli()?;
+    let text = polywan::output_text(&out);
+    assert!(
+        out.status.success() && text.contains("configuration reloaded"),
+        "{text}"
+    );
+    assert!(f.status()?["generation"]["applied"].as_u64().unwrap_or(0) > before);
+    // Validation errors go to the client, not to the public event.
+    f.write_config(&polywan::ipv4(&ab()).replace("version = 2\n", "version = 2\nbogus_key = 1\n"))?;
+    let out = f.reload_cli()?;
+    let text = polywan::output_text(&out);
+    assert!(!out.status.success() && text.contains("bogus_key"), "{text}");
+    f.wait_event(&t, "reload_failed", "was not reloaded", 1, Duration::from_secs(5))?;
+    assert!(
+        !f.events()?.iter().any(|(_, _, l)| l.contains("bogus_key")),
+        "no configuration excerpt in events"
+    );
+    // forget-uplink: refused while configured, then through the socket.
+    let socket = f.control_socket().display().to_string();
+    let out = f.cli_config(&["forget-uplink", "a", "--socket", &socket])?;
+    assert!(
+        !out.status.success() && polywan::output_text(&out).contains("still in the configuration"),
+        "{}",
+        polywan::output_text(&out)
+    );
+    f.write_config(&polywan::ipv4(&ab()[1..]))?;
+    assert!(f.reload_cli()?.status.success());
+    let reuse = polywan::ipv4(&ab()).replace("name = \"a\"", "name = \"fiber\"");
+    f.write_config(&reuse)?;
+    let out = f.reload_cli()?;
+    assert!(
+        !out.status.success() && polywan::output_text(&out).contains("forget-uplink a"),
+        "{}",
+        polywan::output_text(&out)
+    );
+    let out = f.cli_config(&["forget-uplink", "a", "--socket", &socket])?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(15))?;
+    Ok(())
+}

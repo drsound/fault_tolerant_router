@@ -193,3 +193,84 @@ pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Resul
     );
     Ok(())
 }
+
+/// `reload` (FR-API-3): the validation errors, or the applied generation.
+pub async fn reload(socket: &Path) -> Result<()> {
+    let (status, body) = client::request(socket, Method::POST, "/v1/reload", None, api::DEADLINE)
+        .await
+        .with_context(|| socket.display().to_string())?;
+    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+    if status != hyper::StatusCode::OK {
+        let mut message = format!(
+            "reload: {status}: {}",
+            v.get("error").and_then(Value::as_str).unwrap_or("request failed")
+        );
+        for e in v.get("errors").and_then(Value::as_array).into_iter().flatten() {
+            message += &format!("\n{}", e.as_str().unwrap_or_default());
+        }
+        if let Some(steps) = v.get("failed_steps") {
+            message += &format!("\nfailed steps: {steps}");
+        }
+        bail!("{message}");
+    }
+    println!("configuration reloaded, applied in generation {}", v["generation"]);
+    Ok(())
+}
+
+/// `forget-uplink` (FR-MARK-4, §9): through the control socket while the
+/// daemon runs; offline only when no daemon listens, never after a
+/// permission or protocol failure.
+pub async fn forget(socket: &Path, name: &str, config: &Path, lock: &Path) -> Result<()> {
+    if !crate::config::valid_uplink_name(name) {
+        bail!("{name:?} is not an uplink name");
+    }
+    let r = client::request(
+        socket,
+        Method::POST,
+        &format!("/v1/uplinks/{name}/forget"),
+        None,
+        api::DEADLINE,
+    )
+    .await;
+    match r {
+        Ok((status, body)) => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+            if status != hyper::StatusCode::OK {
+                bail!(
+                    "forget {name}: {status}: {}",
+                    v.get("error").and_then(Value::as_str).unwrap_or("request failed")
+                );
+            }
+            println!("uplink {name:?} forgotten; id {} can be reused", v["id"]);
+            Ok(())
+        }
+        Err(client::Error::Connect(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            forget_offline(config, name, lock)
+        }
+        Err(e) => Err(anyhow::anyhow!("{}: {e} (not retried offline)", socket.display())),
+    }
+}
+
+/// Offline: root, the configuration and the instance lock (FR-MARK-4).
+fn forget_offline(path: &Path, name: &str, lock: &Path) -> Result<()> {
+    let cfg = crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _lock = crate::state::InstanceLock::acquire(lock).map_err(|e| anyhow::anyhow!("{e}; stop the daemon first"))?;
+    let dir = crate::state::StateDir {
+        path: cfg.state_dir.clone(),
+    };
+    let mut m = dir
+        .manifest()?
+        .ok_or_else(|| anyhow::anyhow!("no manifest in {}", cfg.state_dir.display()))?;
+    if cfg.uplinks.iter().any(|u| u.name == name) {
+        bail!("uplink {name:?} is still in the configuration; remove it first");
+    }
+    let id = m.forget(name).map_err(|e| anyhow::anyhow!(e))?;
+    dir.write_manifest(&m)?;
+    println!("uplink {name:?} forgotten; id {id} can be reused");
+    Ok(())
+}
