@@ -30,14 +30,49 @@ fn quote(s: &str) -> String {
     format!("\"{s}\"")
 }
 
+/// The nftables limit of a comment, in bytes (`NFTNL_UDATA_COMMENT_MAXLEN`).
+const COMMENT_MAX: usize = 128;
+
+/// A `comment` attribute (FR-FW-3): an nftables quoted string cannot hold a
+/// double quote, and control characters would break the line, so both are
+/// replaced; the text is cut to the limit on a character boundary.
+fn comment(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        };
+        if out.len() + c.len_utf8() > COMMENT_MAX {
+            break;
+        }
+        out.push(c);
+    }
+    format!("comment \"{out}\"")
+}
+
 struct Gen {
     mask: FwMask,
     out: String,
 }
 
 impl Gen {
+    /// A line indented with tabs, as `nft list ruleset` prints.
     fn line(&mut self, indent: usize, text: &str) {
-        let _ = writeln!(self.out, "{:indent$}{text}", "", indent = indent * 2);
+        let _ = writeln!(self.out, "{}{text}", "\t".repeat(indent));
+    }
+
+    /// Opens a chain with its comment and base-chain declaration; chains
+    /// after the first are preceded by a blank line, as `nft list ruleset`
+    /// separates them.
+    fn chain(&mut self, name: &str, purpose: &str, declaration: &str) {
+        if self.out.lines().any(|l| l.starts_with("\tchain ")) {
+            self.out.push('\n');
+        }
+        self.line(1, &format!("chain {name} {{"));
+        self.line(2, &comment(purpose));
+        self.line(2, declaration);
     }
 
     fn hex(v: u32) -> String {
@@ -115,16 +150,18 @@ impl Gen {
             Fallback::Balance => (FieldValue::policy_balance(p.uplink), "balance"),
             Fallback::Block => (FieldValue::policy_block(p.uplink), "block"),
         };
-        let _ = write!(rule, " {} return", self.set("meta mark", value));
         let uplink = config.uplink(p.uplink).map_or("", |u| u.name.as_str());
-        // Policy names are free text: escaped, they stay on the comment line.
-        self.line(
-            2,
-            &format!(
-                "# policy \"{}\": uplink {uplink:?}, {}, fallback {fallback}",
-                p.name.escape_default(),
+        // Policy names are free text: comment() keeps them on the line.
+        let _ = write!(
+            rule,
+            " {} return {}",
+            self.set("meta mark", value),
+            comment(&format!(
+                "policy {}: uplink {uplink} (id {}), {}, fallback {fallback}",
+                p.name,
+                p.uplink.get(),
                 p.family
-            ),
+            ))
         );
         self.line(2, &rule);
     }
@@ -163,13 +200,9 @@ pub fn ruleset(config: &Config) -> String {
 
     g.line(0, &format!("table inet {TABLE} {{"));
 
-    g.line(
-        1,
-        "# §4.7 step 1: restore the path of known connections, assign new inbound ones.",
-    );
-    g.line(1, "chain prerouting {");
-    g.line(
-        2,
+    g.chain(
+        "prerouting",
+        "§4.7 step 1: restore the path of known connections, assign new inbound ones",
         &format!("type filter hook prerouting priority {MARK_PRIORITY}; policy accept;"),
     );
     if let Some(s) = &other_family_skip {
@@ -198,13 +231,13 @@ pub fn ruleset(config: &Config) -> String {
     for (u, f) in &paths {
         let v = FieldValue::path(u.id);
         let rule = format!(
-            "meta nfproto {} iifname {} ct direction original {} {} return",
+            "meta nfproto {} iifname {} ct direction original {} {} return {}",
             nfproto(*f),
             quote(&u.interface),
             g.set("ct mark", v),
-            g.set("meta mark", v)
+            g.set("meta mark", v),
+            comment(&format!("uplink {} (id {}), {f}: inbound", u.name, u.id.get()))
         );
-        g.line(2, &format!("# uplink {:?}, {f}", u.name));
         g.line(2, &rule);
     }
     if !config.policies.is_empty() {
@@ -222,13 +255,9 @@ pub fn ruleset(config: &Config) -> String {
     }
     g.line(1, "}");
 
-    g.line(
-        1,
-        "# §4.7 step 2: route chain, so that a restored mark triggers a new routing decision.",
-    );
-    g.line(1, "chain output {");
-    g.line(
-        2,
+    g.chain(
+        "output",
+        "§4.7 step 2: route chain, so that a restored mark triggers a new routing decision",
         &format!("type route hook output priority {MARK_PRIORITY}; policy accept;"),
     );
     if let Some(s) = &other_family_skip {
@@ -244,13 +273,9 @@ pub fn ruleset(config: &Config) -> String {
     g.restore_all();
     g.line(1, "}");
 
-    g.line(
-        1,
-        "# §4.7 step 3: outgoing connections get the path they actually left through.",
-    );
-    g.line(1, "chain postrouting {");
-    g.line(
-        2,
+    g.chain(
+        "postrouting",
+        "§4.7 step 3: outgoing connections get the path they actually left through",
         &format!("type filter hook postrouting priority {MARK_PRIORITY}; policy accept;"),
     );
     if let Some(s) = &other_family_skip {
@@ -268,21 +293,20 @@ pub fn ruleset(config: &Config) -> String {
     for (u, f) in &paths {
         let v = FieldValue::path(u.id);
         let rule = format!(
-            "meta nfproto {} oifname {} ct direction original {} {} return",
+            "meta nfproto {} oifname {} ct direction original {} {} return {}",
             nfproto(*f),
             quote(&u.interface),
             g.set("ct mark", v),
-            g.set("meta mark", v)
+            g.set("meta mark", v),
+            comment(&format!("uplink {} (id {}), {f}: outgoing", u.name, u.id.get()))
         );
-        g.line(2, &format!("# uplink {:?}, {f}", u.name));
         g.line(2, &rule);
     }
     g.line(1, "}");
 
-    g.line(1, "# §6: source NAT of traffic from the downlinks.");
-    g.line(1, "chain nat {");
-    g.line(
-        2,
+    g.chain(
+        "nat",
+        "§6: source NAT of traffic from the downlinks",
         &format!(
             "type nat hook postrouting priority {}; policy accept;",
             config.firewall.nat_priority
@@ -299,13 +323,13 @@ pub fn ruleset(config: &Config) -> String {
             // Rejected by validation (snat needs a static source).
             (Nat::Snat, AutoOr::Auto) => continue,
         };
-        g.line(2, &format!("# uplink {:?}, {f}: {action}", u.name));
         g.line(
             2,
             &format!(
-                "meta nfproto {} iifname {{ {downlinks} }} oifname {} {action}",
+                "meta nfproto {} iifname {{ {downlinks} }} oifname {} {action} {}",
                 nfproto(*f),
-                quote(&u.interface)
+                quote(&u.interface),
+                comment(&format!("uplink {} (id {}), {f}", u.name, u.id.get()))
             ),
         );
     }
@@ -389,6 +413,8 @@ mod tests {
             let uses = text
                 .lines()
                 .filter(|l| !l.trim_start().starts_with('#'))
+                .map(|l| l.split(" comment \"").next().unwrap_or(l))
+                .filter(|l| !l.trim_start().starts_with("comment \""))
                 .filter(|l| l.split_whitespace().any(|w| w.trim_end_matches(';') == word))
                 .filter(|l| !l.contains("policy accept;"))
                 .count();
@@ -405,6 +431,15 @@ mod tests {
             .filter(|l| l.trim_start().starts_with("ct mark & 0x00ff0000 =="))
             .count();
         assert_eq!(restores, 2 * 63);
+    }
+
+    #[test]
+    fn comments_fit_an_nftables_quoted_string() {
+        assert_eq!(comment("a \"b\"\nc"), "comment \"a 'b' c\"");
+        // 200 bytes of two-byte characters: cut at 128, on a boundary.
+        let c = comment(&"é".repeat(100));
+        let inner = &c["comment \"".len()..c.len() - 1];
+        assert_eq!((inner.len(), inner.chars().all(|ch| ch == 'é')), (COMMENT_MAX, true));
     }
 
     #[test]
