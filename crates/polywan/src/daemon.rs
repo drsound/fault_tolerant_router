@@ -10,13 +10,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use netlink_packet_route::RouteNetlinkMessage;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use crate::checks;
 use crate::config::{self, Config, FirewallMode, OnShutdown};
 use crate::discover::{self, Discovered};
+use crate::events::{self, Bus, NewEvent};
 use crate::health::{self, Hysteresis, Machine, Reason, Round};
 use crate::model::{Family, FieldValue, PathKey, UplinkId};
 use crate::netlink::{Client, Message, Notification, Subscription, groups};
@@ -29,6 +30,7 @@ use crate::quality;
 use crate::reconcile::{self, DiffInput, Failure, FailureKind, Op};
 use crate::select::{self, Candidate};
 use crate::state::{self, Checkpoint, InstanceLock, Manifest, PathCheckpoint, StateDir};
+use crate::status::{self, Status};
 use crate::sysctl;
 use crate::system::{Change, Scope, System};
 use crate::worker::{self, Done, Io, Lanes, Lost, NftJob, PersistJob, SysctlScope};
@@ -200,6 +202,16 @@ struct Daemon {
     last_desired: Option<(plan::Desired, String, String)>,
     /// Failed steps by kind, since startup.
     apply_failures: BTreeMap<FailureKind, u64>,
+    bus: Bus,
+    /// Events of the current step, emitted in order once it ends.
+    pending_events: Vec<NewEvent>,
+    status: watch::Sender<Arc<Status>>,
+    status_dirty: bool,
+    started: std::time::SystemTime,
+    /// Kinds of artifacts a third party removed, reported as repaired once
+    /// a pass leaves nothing to do (FR-COEX-3).
+    repairs: BTreeSet<&'static str>,
+    repairs_total: BTreeMap<&'static str, u64>,
     layout: Layout,
     scope: Scope,
     protocol: u8,
@@ -265,6 +277,57 @@ const RESYNC_AFTER_INTERRUPTED: Duration = Duration::from_secs(1);
 
 fn now_ms() -> u64 {
     state::boottime_ms().unwrap_or(0)
+}
+
+fn state_name(s: health::State) -> &'static str {
+    match s {
+        health::State::Up => "up",
+        health::State::Down => "down",
+    }
+}
+
+/// `path_state_changed` (FR-EV-1, FR-HEALTH-4).
+fn path_event(uplink: &str, family: Family, t: health::Transition) -> NewEvent {
+    let (from, to) = (state_name(t.from), state_name(t.to));
+    NewEvent::new(
+        "path_state_changed",
+        format!("uplink {uplink} {family}: {from} -> {to} ({})", t.reason),
+    )
+    .path(uplink, family.key())
+    .change(from, to)
+    .reason(t.reason.as_str())
+}
+
+/// `path_address_changed` or `path_gateway_changed`.
+fn change_event(
+    kind: &'static str,
+    what: &str,
+    uplink: &str,
+    family: Family,
+    old: Option<std::net::IpAddr>,
+    new: Option<std::net::IpAddr>,
+) -> NewEvent {
+    let text = |a: Option<std::net::IpAddr>| a.map_or_else(|| "none".to_owned(), |a| a.to_string());
+    let value = |a: Option<std::net::IpAddr>| a.map_or(serde_json::Value::Null, |a| a.to_string().into());
+    NewEvent::new(
+        kind,
+        format!("uplink {uplink} {family}: {what} {} -> {}", text(old), text(new)),
+    )
+    .path(uplink, family.key())
+    .change(value(old), value(new))
+}
+
+/// `apply_failed` (FR-REC-5): the operation, its kind, the errno and the
+/// extended acknowledgement, nothing else of the diagnostic.
+fn failure_event(op: &str, kind: FailureKind, errno: Option<i32>, extack: Option<&str>) -> NewEvent {
+    let mut message = format!("{op} failed");
+    if let Some(e) = errno {
+        message += &format!(" (errno {e})");
+    }
+    if let Some(x) = extack {
+        message += &format!(": {x}");
+    }
+    NewEvent::new("apply_failed", message).reason(kind.as_str())
 }
 
 /// `run`: startup (FR-REC-1, FR-REC-8, IMPL-6) and the event loop.
@@ -392,6 +455,13 @@ pub async fn run(opts: Options) -> Result<()> {
         applied_generation: 0,
         last_desired: None,
         apply_failures: BTreeMap::new(),
+        bus: Bus::new(events::instance_id()),
+        pending_events: Vec::new(),
+        status: watch::channel(Arc::new(Status::default())).0,
+        status_dirty: true,
+        started: std::time::SystemTime::now(),
+        repairs: BTreeSet::new(),
+        repairs_total: BTreeMap::new(),
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -461,6 +531,10 @@ pub async fn run(opts: Options) -> Result<()> {
         "polywan {} started",
         env!("CARGO_PKG_VERSION")
     );
+    d.pending_events.push(NewEvent::new(
+        "daemon_started",
+        format!("polywan {} started", env!("CARGO_PKG_VERSION")),
+    ));
     if d.cfg.firewall.mode == FirewallMode::External {
         info!("external firewall mode: marking and NAT are the administrator's responsibility (export-nft)");
     }
@@ -639,7 +713,13 @@ impl Daemon {
         let was_ok = self.degraded.is_empty();
         if self.degraded.insert(reason) && was_ok {
             warn!(reason, "status_degraded");
+            self.pending_events.push(
+                NewEvent::new("status_degraded", format!("status degraded ({reason})"))
+                    .change("ok", "degraded")
+                    .reason(reason),
+            );
         }
+        self.status_dirty = true;
     }
 
     /// Clears a degradation reason; `status_recovered` only when no other
@@ -647,7 +727,13 @@ impl Daemon {
     fn recover(&mut self, reason: &'static str) {
         if self.degraded.remove(reason) && self.degraded.is_empty() {
             info!(reason, "status_recovered");
+            self.pending_events.push(
+                NewEvent::new("status_recovered", format!("status ok ({reason} cleared)"))
+                    .change("degraded", "ok")
+                    .reason(reason),
+            );
         }
+        self.status_dirty = true;
     }
 
     /// The `flow_offload` reason from a flowtable listing, against the
@@ -671,6 +757,7 @@ impl Daemon {
     }
 
     fn count_removal(&mut self, kind: &'static str) {
+        self.repairs.insert(kind);
         let o = self.ownership.entry(kind).or_default();
         let now = Instant::now();
         o.removals.push_back(now);
@@ -943,6 +1030,7 @@ impl Daemon {
                     usize::from(health.quality_window),
                     health.quality_min_samples,
                 );
+                self.status_dirty = true;
                 let p = self.paths.get_mut(&r.path).expect("checked above");
                 p.window.push(r.samples, capacity);
                 p.stats = p.window.stats();
@@ -969,6 +1057,9 @@ impl Daemon {
                 if let Some(t) = p.machine.round(round, h) {
                     p.since_ms = now_ms();
                     info!(uplink = r.path.uplink.get(), family = %r.path.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
+                    if let Some(u) = self.cfg.uplink(r.path.uplink) {
+                        self.pending_events.push(path_event(&u.name, r.path.family, t));
+                    }
                     self.dirty = true;
                     self.write_checkpoint();
                 }
@@ -1028,6 +1119,81 @@ impl Daemon {
                 .get(&Family::V6)
                 .map(|s| s.iter().map(|i| i.get()).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Emits the events of the step in order, then publishes the status.
+    fn flush_events(&mut self) {
+        for e in std::mem::take(&mut self.pending_events) {
+            self.bus.emit(e);
+            self.status_dirty = true;
+        }
+        if std::mem::take(&mut self.status_dirty) {
+            let s = Arc::new(self.snapshot());
+            self.status.send_replace(s);
+        }
+    }
+
+    /// The status of FR-API-2.
+    fn snapshot(&self) -> Status {
+        let wall = std::time::SystemTime::now();
+        let boot_now = now_ms();
+        let since = |ms: u64| events::rfc3339(wall - Duration::from_millis(boot_now.saturating_sub(ms)));
+        let mut active = BTreeMap::new();
+        for (family, set) in &self.active {
+            active.insert(
+                family.key(),
+                set.iter()
+                    .filter_map(|id| self.cfg.uplink(*id).map(|u| u.name.clone()))
+                    .collect(),
+            );
+        }
+        Status {
+            version: env!("CARGO_PKG_VERSION"),
+            instance: self.bus.instance().to_owned(),
+            started: events::rfc3339(self.started),
+            config_digest: self.cfg.digest.clone(),
+            generation: status::Generations {
+                desired: self.desired_generation,
+                applied: self.applied_generation,
+            },
+            status: if self.degraded.is_empty() { "ok" } else { "degraded" },
+            reasons: self.degraded.iter().copied().collect(),
+            uplinks: self
+                .cfg
+                .uplinks
+                .iter()
+                .map(|u| status::UplinkStatus {
+                    name: u.name.clone(),
+                    id: u.id.get(),
+                    interface: u.interface.clone(),
+                    drained: self.drained.contains(&u.id),
+                })
+                .collect(),
+            paths: self
+                .paths
+                .iter()
+                .filter_map(|(k, p)| {
+                    let u = self.cfg.uplink(k.uplink)?;
+                    let d = p.discovered.as_ref();
+                    let ready = d.and_then(|d| d.ready.as_ref().ok());
+                    Some(status::PathStatus {
+                        uplink: u.name.clone(),
+                        family: k.family.key(),
+                        state: state_name(p.machine.state()),
+                        ready: p.machine.is_ready(),
+                        reason: p.machine.reason().as_str(),
+                        since: since(p.since_ms),
+                        source: ready.map(|r| r.source),
+                        gateway: ready.and_then(|r| r.gateway),
+                        addresses: d
+                            .map(|d| d.local_addresses.iter().copied().collect())
+                            .unwrap_or_default(),
+                        statistics: (&p.stats).into(),
+                    })
+                })
+                .collect(),
+            active,
         }
     }
 
@@ -1110,11 +1276,41 @@ impl Daemon {
             }
             if !unchanged {
                 info!(uplink = key.uplink.get(), family = %key.family, ready = ?raw.ready.as_ref().map(|r| (r.source, r.gateway, r.ifindex)), "path discovery changed");
+                // FR-EV-1: address and gateway changes of an observed path.
+                if let (Some(prev), Some(u)) = (p.discovered.as_ref(), self.cfg.uplink(key.uplink)) {
+                    let was = prev.ready.as_ref().ok();
+                    let now = raw.ready.as_ref().ok();
+                    let (old, new) = (was.map(|r| r.source), now.map(|r| r.source));
+                    if old != new {
+                        self.pending_events.push(change_event(
+                            "path_address_changed",
+                            "source",
+                            &u.name,
+                            key.family,
+                            old,
+                            new,
+                        ));
+                    }
+                    let (old, new) = (was.and_then(|r| r.gateway), now.and_then(|r| r.gateway));
+                    if old != new {
+                        self.pending_events.push(change_event(
+                            "path_gateway_changed",
+                            "gateway",
+                            &u.name,
+                            key.family,
+                            old,
+                            new,
+                        ));
+                    }
+                }
             }
             let reason = d.ready.as_ref().err().copied().unwrap_or(Reason::Startup);
             if let Some(t) = p.machine.set_ready(d.ready.is_ok(), reason) {
                 p.since_ms = now_ms();
                 info!(uplink = key.uplink.get(), family = %key.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
+                if let Some(u) = self.cfg.uplink(key.uplink) {
+                    self.pending_events.push(path_event(&u.name, key.family, t));
+                }
             }
             p.discovered = Some(raw);
             input.paths.insert(
@@ -1152,6 +1348,20 @@ impl Daemon {
             let set = select::active_set(&candidates, self.cfg.routing.all_down_policy, &previous);
             if set != previous {
                 info!(family = %family, old = ?previous, new = ?set, "active set changed");
+                let names = |s: &BTreeSet<UplinkId>| -> Vec<String> {
+                    s.iter()
+                        .filter_map(|id| self.cfg.uplink(*id).map(|u| u.name.clone()))
+                        .collect()
+                };
+                let (old, new) = (names(&previous), names(&set));
+                self.pending_events.push(
+                    NewEvent::new(
+                        "active_set_changed",
+                        format!("{family} active set: [{}] -> [{}]", old.join(", "), new.join(", ")),
+                    )
+                    .family(family.key())
+                    .change(old, new),
+                );
                 self.active.insert(family, set.clone());
                 self.write_checkpoint();
             }
@@ -1338,6 +1548,12 @@ impl Daemon {
                 self.sysctls_applied.remove(&scope);
                 *self.apply_failures.entry(FailureKind::Sysctl).or_default() += 1;
                 error!(interface = %i, kind = "sysctl", "apply_failed: set sysctls: {e}");
+                self.pending_events.push(failure_event(
+                    &format!("set sysctls of {i}"),
+                    FailureKind::Sysctl,
+                    None,
+                    None,
+                ));
                 self.sysctls_failed.insert(i.clone(), e);
                 self.degrade("apply_failed");
                 let backoff = self
@@ -1488,6 +1704,16 @@ impl Daemon {
             if self.sysctls_pending.is_empty() {
                 self.applied_generation = self.desired_generation;
             }
+            for kind in std::mem::take(&mut self.repairs) {
+                *self.repairs_total.entry(kind).or_default() += 1;
+                self.pending_events.push(
+                    NewEvent::new(
+                        "artifact_repaired",
+                        format!("PolyWAN's {kind} removed by a third party are restored"),
+                    )
+                    .reason(kind),
+                );
+            }
             if self.applied_ops > 0 {
                 info!(
                     operations = std::mem::take(&mut self.applied_ops),
@@ -1589,6 +1815,8 @@ impl Daemon {
         let count = self.apply_failures.entry(f.kind).or_default();
         *count += 1;
         error!(operation = %f.op, kind = f.kind.as_str(), errno = ?f.errno, extack = ?f.extack, failures = *count, "apply_failed: {}", f.error);
+        self.pending_events
+            .push(failure_event(&f.op, f.kind, f.errno, f.extack.as_deref()));
         self.degrade("apply_failed");
         if let Some((family, table)) = f.route {
             // The view follows a route mutation only when it succeeds, but
@@ -1678,6 +1906,11 @@ impl Daemon {
         for e in errors {
             error!("reload_failed: {e}");
         }
+        // Diagnostics stay in the log (FR-API-2, IMPL-11).
+        self.pending_events.push(NewEvent::new(
+            "reload_failed",
+            "the configuration was not reloaded; the running configuration is kept",
+        ));
         self.end_reload();
     }
 
@@ -1774,6 +2007,8 @@ impl Daemon {
         // forgotten: their completions only update the manifest.
         self.sysctls_flight.clear();
         info!("config_reloaded");
+        self.pending_events
+            .push(NewEvent::new("config_reloaded", "the configuration was reloaded"));
         self.dirty = true;
         self.end_reload();
     }
@@ -1827,10 +2062,12 @@ impl Daemon {
             if self.dirty {
                 self.dirty = false;
                 self.step().await;
+                self.status_dirty = true;
             }
             if let Some(e) = self.fatal.take() {
                 bail!("{e}");
             }
+            self.flush_events();
             if std::mem::take(&mut self.resync_due) {
                 info!("a netlink dump was still interrupted after its retries: full resynchronisation");
                 next_full = next_full.min(Instant::now() + RESYNC_AFTER_INTERRUPTED);
@@ -1890,6 +2127,9 @@ impl Daemon {
             }
         }
         info!("daemon_stopping");
+        self.pending_events
+            .push(NewEvent::new("daemon_stopping", "polywan is stopping"));
+        self.flush_events();
         listener.abort();
         for p in self.paths.values_mut() {
             if let Some((_, h)) = p.prober.take() {
