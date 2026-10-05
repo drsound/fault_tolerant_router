@@ -985,6 +985,34 @@ fn as46_drain_survives_a_crash_at_each_step() -> Result<()> {
     Ok(())
 }
 
+/// FR-API-3: a reload through the control socket answers once the
+/// generation that includes it is applied, also when the first pass after
+/// the commit cannot plan yet: a reload that adds IPv6 waits for the new
+/// family's global settings, which the persistence lane writes slowly here.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn api_reload_answers_once_its_generation_is_applied() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let writes = f.dir.join("slow-writes");
+    f.set_env("POLYWAN_TEST_SLOW_WRITES", &writes.display().to_string());
+    f.start(&t)?;
+    f.wait_settled(&t)?;
+    let before = f.status()?["generation"]["applied"].as_u64().unwrap_or(0);
+    std::fs::write(&writes, "1000")?;
+    f.reload_with(&polywan::dual(&ab()))?;
+    let applied = f.status()?["generation"]["applied"].as_u64().unwrap_or(0);
+    let forwarding = t.router().output("sysctl", ["-n", "net.ipv6.conf.all.forwarding"])?;
+    std::fs::remove_file(&writes)?;
+    assert!(
+        applied > before,
+        "answered before its generation: {before} -> {applied}"
+    );
+    assert_eq!(String::from_utf8_lossy(&forwarding.stdout).trim(), "1");
+    f.stop()?;
+    Ok(())
+}
+
 /// FR-SEL-3: a SIGHUP reload while a drain's intent is being written does
 /// not undo the drain once both complete: the reload waits for the write
 /// (the persistence lane writes slowly here).

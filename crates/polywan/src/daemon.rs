@@ -242,6 +242,10 @@ struct Daemon {
     /// included.
     desired_generation: u64,
     applied_generation: u64,
+    /// The last pass computed the desired generation of the running
+    /// configuration and intents: a pass that returned before (waiting for
+    /// the global settings, for example) gives no generation to wait for.
+    planned: bool,
     /// What the desired generation was computed from.
     last_desired: Option<(plan::Desired, Arc<str>, String)>,
     bus: Bus,
@@ -520,6 +524,7 @@ pub async fn run(opts: Options) -> Result<()> {
         fatal: None,
         desired_generation: 0,
         applied_generation: 0,
+        planned: false,
         last_desired: None,
         bus: Bus::new(events::instance_id()),
         pending_events: Vec::new(),
@@ -1966,6 +1971,7 @@ impl Daemon {
 
     /// One reconciliation pass.
     async fn step(&mut self) {
+        self.planned = false;
         // A failed attempt waits for its backoff; evaluation does not.
         let waiting = self
             .retry
@@ -2021,6 +2027,7 @@ impl Daemon {
             self.desired_generation += 1;
             self.last_desired = Some((desired.clone(), Arc::clone(&transaction), self.cfg.digest.clone()));
         }
+        self.planned = true;
         let before = (!new_paths.is_empty()).then(|| plan::plan(&self.cfg, &plan::without(&input, &new_paths)));
         let families: Vec<Family> = Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)).collect();
         let ops = reconcile::diff(
@@ -2533,9 +2540,11 @@ impl Daemon {
                 self.dirty = false;
                 self.step().await;
                 self.status_dirty = true;
-                if let Some(Active::Applying {
-                    target: target @ None, ..
-                }) = &mut self.command
+                // The generation that includes the command's change (FR-API-3).
+                if self.planned
+                    && let Some(Active::Applying {
+                        target: target @ None, ..
+                    }) = &mut self.command
                 {
                     *target = Some(self.desired_generation);
                 }
