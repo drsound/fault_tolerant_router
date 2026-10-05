@@ -367,6 +367,7 @@ pub fn spec(email: &Email, input: Vec<u8>, deadline: Duration) -> Spec {
         gid: 0,
         input,
         capture_stdout: false,
+        supervise_descendants: false,
         timeout: deadline,
     }
 }

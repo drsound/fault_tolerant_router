@@ -5,8 +5,10 @@
 //! groups, a new process group, standard input written then closed,
 //! standard error drained with at most 64 KiB retained, and a deadline
 //! after which the whole process group is killed and the child reaped.
-//! The run ends when the child exits: output still held open by its
-//! descendants is read only for [`AFTER_EXIT`] more.
+//! The run of sendmail ends when the child exits: output still held open
+//! by its descendants is read only for [`AFTER_EXIT`] more. The run of a
+//! hook lasts until its output closes too, so that descendants holding it
+//! stay within the deadline and the concurrency limit (FR-HOOK-3).
 //!
 //! Descriptors other than 0–2 are never passed on: PolyWAN's own are
 //! close-on-exec, and descriptors the daemon inherited without that flag
@@ -40,6 +42,11 @@ pub struct Spec {
     pub input: Vec<u8>,
     /// Standard output is captured (hooks) or discarded (sendmail).
     pub capture_stdout: bool,
+    /// The run lasts until the output closes, and the process group is
+    /// killed at the deadline even after the child exited (hooks); else it
+    /// ends at the child's exit and its descendants are left alone (a mail
+    /// system delivering in the background).
+    pub supervise_descendants: bool,
     pub timeout: Duration,
 }
 
@@ -167,24 +174,26 @@ pub async fn run(spec: &Spec) -> Outcome {
             }
         }
     };
-    let result = tokio::time::timeout(spec.timeout, work).await;
+    let deadline = tokio::time::Instant::now() + spec.timeout;
+    let result = tokio::time::timeout_at(deadline, work).await;
     let end = match result {
         Ok(((written, status), drained)) => {
-            group.disarm();
-            if !drained {
-                let _ = tokio::time::timeout(AFTER_EXIT, &mut drains).await;
-            }
-            // How the child ended comes first; a failed input write matters
-            // only for a child that exited with 0 (a dead child's pipe
-            // breaks).
-            match status {
-                Err(e) => End::SpawnFailed(e.to_string()),
-                Ok(s) => match (s.code(), std::os::unix::process::ExitStatusExt::signal(&s), written) {
-                    (_, Some(sig), _) => End::Signaled(sig),
-                    (Some(0), _, Err(e)) => End::InputFailed(e),
-                    (Some(c), _, _) => End::Exited(c),
-                    (None, None, _) => End::SpawnFailed("no exit status".into()),
-                },
+            let after_exit = if spec.supervise_descendants {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            } else {
+                AFTER_EXIT
+            };
+            let held = !drained && tokio::time::timeout(after_exit, &mut drains).await.is_err();
+            if held && spec.supervise_descendants {
+                // Descendants still hold the output at the deadline: the
+                // group is killed when dropped.
+                End::TimedOut
+            } else {
+                group.disarm();
+                // How the child ended comes first; a failed input write
+                // matters only for a child that exited with 0 (a dead
+                // child's pipe breaks).
+                exit_end(status, written)
             }
         }
         Err(_) => {
@@ -201,6 +210,19 @@ pub async fn run(spec: &Spec) -> Outcome {
         end,
         stdout: out,
         stderr: err,
+    }
+}
+
+/// How a child that exited ended.
+fn exit_end(status: std::io::Result<std::process::ExitStatus>, written: Result<(), String>) -> End {
+    match status {
+        Err(e) => End::SpawnFailed(e.to_string()),
+        Ok(s) => match (s.code(), std::os::unix::process::ExitStatusExt::signal(&s), written) {
+            (_, Some(sig), _) => End::Signaled(sig),
+            (Some(0), _, Err(e)) => End::InputFailed(e),
+            (Some(c), _, _) => End::Exited(c),
+            (None, None, _) => End::SpawnFailed("no exit status".into()),
+        },
     }
 }
 
@@ -291,6 +313,7 @@ mod tests {
             gid: nix::unistd::getegid().as_raw(),
             input: b"hello".to_vec(),
             capture_stdout: true,
+            supervise_descendants: false,
             timeout: Duration::from_millis(timeout_ms),
         }
     }
@@ -347,6 +370,24 @@ mod tests {
             (o.stdout.data.as_slice(), o.stderr.data.as_slice()),
             (&b"out\n"[..], &b"diag\n"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn a_hook_s_descendants_stay_within_its_deadline() {
+        // The hook exits at once; its worker holds the output and dies with
+        // the group at the deadline (FR-HOOK-3).
+        let dir = std::env::temp_dir().join(format!("polywan-supervised-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join("worker");
+        let mut spec = sh(&format!("(sleep 2; touch {}) & exit 0", mark.display()), 300);
+        spec.supervise_descendants = true;
+        assert_eq!(run(&spec).await.end, End::TimedOut);
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!mark.exists(), "the worker died with the group");
+        // Without a worker, the hook ends with its exit.
+        spec.args[1] = "echo done".into();
+        assert_eq!(run(&spec).await.end, End::Exited(0));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

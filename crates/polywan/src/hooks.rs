@@ -56,6 +56,7 @@ pub fn spec(hook: &Hook, event: &Event, user: (u32, u32)) -> Option<Spec> {
         gid: user.1,
         input: serde_json::to_vec(event).unwrap_or_default(),
         capture_stdout: true,
+        supervise_descendants: true,
         timeout: hook.timeout,
     })
 }
