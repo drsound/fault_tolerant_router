@@ -296,6 +296,33 @@ async fn a_reload_applies_before_a_submission_ready_at_the_same_time() {
 }
 
 #[tokio::test]
+async fn a_running_submission_finishes_at_shutdown_after_email_was_removed() {
+    let notify = Notify {
+        email: None,
+        ..notify_with_email()
+    };
+    let email = notify_with_email().email.unwrap();
+    let mut mail = Mail::new(
+        "abc".into(),
+        Times::default(),
+        Arc::new(Failures::default()),
+        Sendmail::default(),
+    );
+    let m = mail.message(Kind::Notification, "running".into(), &email, Instant::now());
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let running: Running = Box::pin({
+        let done = Arc::clone(&done);
+        async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            done.store(true, Ordering::Relaxed);
+            (m, Submitted::Accepted)
+        }
+    });
+    flush(&mut mail, &notify, Some(running)).await;
+    assert!(done.load(Ordering::Relaxed), "the running submission was not cancelled");
+}
+
+#[tokio::test]
 async fn the_shutdown_flush_keeps_the_retry_delays() {
     let notify = notify_with_email();
     let email = notify.email.as_ref().unwrap();

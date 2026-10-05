@@ -702,29 +702,39 @@ async fn drive(
 }
 
 /// The last submissions of a stopping daemon, within [`SHUTDOWN`]: the
-/// running one, then each waiting message that is due, once. A retry not
-/// due yet keeps its delay (FR-MAIL-3) and is discarded. Each submission
-/// takes its turn: a running notification test ends first.
+/// running one, also after a reload removed email (FR-MAIL-1: it finishes
+/// with the configuration it started with), then each waiting message that
+/// is due, once. A retry not due yet keeps its delay (FR-MAIL-3) and is
+/// discarded. Each submission takes its turn: a running notification test
+/// ends first.
 async fn flush(mail: &mut Mail, notify: &Notify, running: Option<Running>) {
-    let Some(email) = &notify.email else { return };
     let now = Instant::now();
-    mail.close_batch(now, email, hostname().as_deref());
-    let deadline = mail.times.deadline;
-    let (pending, later): (Vec<Message>, Vec<Message>) = std::mem::take(&mut mail.waiting)
-        .into_iter()
-        .partition(|m| m.due <= now);
-    if !later.is_empty() {
-        warn!(
-            discarded = later.len(),
-            "email retries not due yet at shutdown were discarded"
-        );
+    let mut pending = Vec::new();
+    if let Some(email) = &notify.email {
+        mail.close_batch(now, email, hostname().as_deref());
+        let later;
+        (pending, later) = std::mem::take(&mut mail.waiting)
+            .into_iter()
+            .partition(|m| m.due <= now);
+        if !later.is_empty() {
+            warn!(
+                discarded = later.len(),
+                "email retries not due yet at shutdown were discarded"
+            );
+        }
     }
+    if running.is_none() && pending.is_empty() {
+        return;
+    }
+    let deadline = mail.times.deadline;
     let turn = Arc::clone(&mail.sendmail.turn);
     let work = async {
         if let Some(f) = running {
             let (m, r) = f.await;
             finished(mail, m, r, Instant::now(), false);
         }
+        // Waiting messages exist only while email is configured.
+        let Some(email) = &notify.email else { return };
         for m in pending {
             let Ok(_turn) = turn.acquire().await else { return };
             let r = submit(&m, email, deadline).await;
