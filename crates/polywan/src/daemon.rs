@@ -258,6 +258,8 @@ struct Daemon {
     /// A command was answered inside a reload's end: the next one starts
     /// once the reload state is clear.
     pending_answer: bool,
+    /// The notification settings the notifiers follow (reloads change them).
+    notify_config: watch::Sender<Arc<config::Notify>>,
     /// Commands of the control socket, one at a time.
     orders: VecDeque<Order>,
     command: Option<Active>,
@@ -523,6 +525,7 @@ pub async fn run(opts: Options) -> Result<()> {
         repairs: BTreeSet::new(),
         repairs_total: BTreeMap::new(),
         api: None,
+        notify_config: watch::channel(Arc::new(cfg.notify.clone())).0,
         orders: VecDeque::new(),
         command: None,
         pending_answer: false,
@@ -578,6 +581,10 @@ pub async fn run(opts: Options) -> Result<()> {
     let Some(io) = d.io.as_ref() else {
         bail!("the I/O thread is not running");
     };
+    // FR-HOOK-4: the hooks read their own bounded queue of the bus.
+    let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE);
+    io.handle()
+        .spawn(crate::hooks::notifier(hook_events, d.notify_config.subscribe()));
     let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
@@ -2367,6 +2374,7 @@ impl Daemon {
         // Settings of the previous configuration still being applied are
         // forgotten: their completions only update the manifest.
         self.sysctls_flight.clear();
+        self.notify_config.send_replace(Arc::new(self.cfg.notify.clone()));
         info!("config_reloaded");
         self.pending_events
             .push(NewEvent::new("config_reloaded", "the configuration was reloaded"));

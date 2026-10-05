@@ -84,8 +84,7 @@ destination_port = 25
 uplink = "fiber"
 fallback = "block"
 
-# Notifications and metrics are not supported yet by this development
-# build.
+# Email and metrics are not supported yet by this development build.
 #
 # [notify.email]
 # from = "router@example.com"
@@ -94,12 +93,13 @@ fallback = "block"
 # # through the running daemon with `polywan notify-test`.
 # sendmail = "/usr/sbin/sendmail"
 #
+# [metrics]
+# listen = "127.0.0.1:9750"
+
+# A hook runs on events, as notify.hook_user (default nobody).
 # [[notify.hook]]
 # command = ["/usr/local/bin/polywan-to-ntfy"]
 # events = ["path_state_changed", "active_set_changed"]
-#
-# [metrics]
-# listen = "127.0.0.1:9750"
 
 [api]
 # Status and event history are readable by every local user by default.

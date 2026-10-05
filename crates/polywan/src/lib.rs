@@ -14,6 +14,7 @@ pub mod discover;
 pub mod duration;
 pub mod events;
 pub mod health;
+pub mod hooks;
 pub mod identity;
 pub mod model;
 pub mod netlink;

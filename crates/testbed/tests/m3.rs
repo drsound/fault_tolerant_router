@@ -1010,3 +1010,89 @@ fn api_reload_and_forget() -> Result<()> {
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(15))?;
     Ok(())
 }
+
+/// AS-25, hooks (FR-HOOK-1 to FR-HOOK-4): a recording hook gets the event
+/// as JSON on standard input and in the `POLYWAN_*` variables, runs as
+/// `nobody` without supplementary groups or capabilities, with only
+/// descriptors 0–2, as the leader of its own process group; a hook that
+/// sleeps 60 s with a background child is killed with its child at its 2 s
+/// timeout; routing is unaffected meanwhile (INV-8).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as25_hooks_run_bounded_and_detached() -> Result<()> {
+    let t = build();
+    let out = t.exec_dir()?.join("hook-out");
+    std::fs::create_dir_all(&out)?;
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o777))?;
+    let o = out.display();
+    let record = format!(
+        "ls /proc/$$/fd; f={o}/$$; echo \"event=$POLYWAN_EVENT uplink=$POLYWAN_UPLINK family=$POLYWAN_FAMILY old=$POLYWAN_OLD new=$POLYWAN_NEW reason=$POLYWAN_REASON\" > $f.env; id -u > $f.id; id -G >> $f.id; grep -E '^Cap(Eff|Prm):' /proc/self/status > $f.caps; cut -d' ' -f5 /proc/$$/stat > $f.pgid; echo $$ > $f.pid; env > $f.vars; cat > $f.stdin; mv $f.env $f.done"
+    );
+    let sleeper = format!("sleep 60 & echo $! > {o}/child; sleep 60");
+    let hooks = format!(
+        "[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {record:?}]\nevents = [\"path_state_changed\"]\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {sleeper:?}]\nevents = [\"path_state_changed\"]\ntimeout = \"2s\"\n"
+    );
+    let f = t.start_polywan(&with(&hooks))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let lost = Instant::now();
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
+    assert!(
+        lost.elapsed() < Duration::from_secs(2),
+        "routing unaffected by the hooks"
+    );
+    let done = t.wait_for("the recording hook", Duration::from_secs(10), || {
+        Ok(std::fs::read_dir(&out)?
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".done")))
+    });
+    done?;
+    let base = std::fs::read_dir(&out)?
+        .flatten()
+        .find_map(|e| e.file_name().to_str()?.strip_suffix(".done").map(str::to_owned))
+        .context("no hook record")?;
+    let read = |ext: &str| std::fs::read_to_string(out.join(format!("{base}.{ext}"))).unwrap_or_default();
+    assert!(
+        read("done").contains("event=path_state_changed uplink=b family=ipv4 old=up new=down reason="),
+        "{}",
+        read("done")
+    );
+    assert_eq!(read("id").split_whitespace().collect::<Vec<_>>(), ["65534", "65534"]);
+    assert!(
+        read("caps").lines().all(|l| l.ends_with("0000000000000000")),
+        "{}",
+        read("caps")
+    );
+    // Listed first, without a redirection (the shell saves descriptors
+    // around redirections), to the captured standard output.
+    assert!(f.log().contains("stdout=0\\n1\\n2\\n stderr="), "only 0–2: {}", f.log());
+    assert_eq!(read("pgid").trim(), read("pid").trim(), "its own process group");
+    let vars: Vec<String> = read("vars")
+        .lines()
+        .map(|l| l.split('=').next().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        vars.iter()
+            .all(|v| v.starts_with("POLYWAN_") || ["PATH", "PWD", "SHLVL", "_"].contains(&v.as_str())),
+        "{vars:?}"
+    );
+    let stdin: serde_json::Value = serde_json::from_str(&read("stdin"))?;
+    assert_eq!(
+        (stdin["type"].as_str(), stdin["uplink"].as_str()),
+        (Some("path_state_changed"), Some("b"))
+    );
+    // The sleeping hook and its child are gone after the timeout.
+    let child: u32 = t
+        .wait_for("the sleeping hook's child", Duration::from_secs(5), || {
+            Ok(out.join("child").exists())
+        })
+        .and_then(|_| Ok(std::fs::read_to_string(out.join("child"))?.trim().parse()?))?;
+    t.wait_for("the child killed with its group", Duration::from_secs(6), || {
+        Ok(!std::path::Path::new(&format!("/proc/{child}")).exists())
+    })?;
+    f.wait_log(&t, "hook failed", 1, Duration::from_secs(5))?;
+    assert!(f.log().contains("end=timed out"), "{}", f.log());
+    t.carrier_up(Uplink::B)?;
+    Ok(())
+}

@@ -250,9 +250,6 @@ impl Config {
         if self.notify.email.is_some() {
             v.push("email notifications ([notify.email])");
         }
-        if !self.notify.hooks.is_empty() {
-            v.push("hooks ([[notify.hook]])");
-        }
         if self.metrics_listen.is_some() {
             v.push("metrics (metrics.listen)");
         }
