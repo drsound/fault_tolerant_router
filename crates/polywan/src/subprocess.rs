@@ -3,9 +3,10 @@
 //! environment but `PATH` and the given variables, `/` as working
 //! directory, the given user and primary group without supplementary
 //! groups, a new process group, standard input written then closed,
-//! standard error drained to its end with at most 64 KiB retained, and a
-//! deadline after which the whole process group is killed and the child
-//! reaped.
+//! standard error drained with at most 64 KiB retained, and a deadline
+//! after which the whole process group is killed and the child reaped.
+//! The run ends when the child exits: output still held open by its
+//! descendants is read only for [`AFTER_EXIT`] more.
 //!
 //! Descriptors other than 0–2 are never passed on: PolyWAN's own are
 //! close-on-exec, and descriptors the daemon inherited without that flag
@@ -23,6 +24,10 @@ use tokio::process::Command;
 pub const PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// Retained output per stream (FR-MAIL-1, FR-HOOK-3).
 pub const CAPTURE: usize = 64 * 1024;
+/// How long output is still read after the child exited, when a
+/// descendant (a mail system delivering in the background) keeps the
+/// pipes open: what the child wrote is already there.
+pub const AFTER_EXIT: Duration = Duration::from_secs(1);
 
 /// What to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,29 +139,45 @@ pub async fn run(spec: &Spec) -> Outcome {
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let work = async {
-        let write = async {
-            match stdin {
-                Some(mut i) => {
-                    let r = i.write_all(&spec.input).await;
-                    // Closed: the end of the input.
-                    drop(i);
-                    r.map_err(|e| e.to_string())
-                }
-                None => Ok(()),
+    let (mut out, mut err) = (Captured::default(), Captured::default());
+    let mut drains = Box::pin(async {
+        tokio::join!(drain(stdout, &mut out), drain(stderr, &mut err));
+    });
+    // The input, then the child's exit, while the output is read (a
+    // verbose child never blocks on a full pipe).
+    let exited = async {
+        let written = match stdin {
+            Some(mut i) => {
+                let r = i.write_all(&spec.input).await;
+                // Closed: the end of the input.
+                drop(i);
+                r.map_err(|e| e.to_string())
             }
+            None => Ok(()),
         };
-        let (written, out, err) = tokio::join!(write, drain(stdout), drain(stderr));
-        let status = child.wait().await;
-        (written, out, err, status)
+        (written, child.wait().await)
     };
-    match tokio::time::timeout(spec.timeout, work).await {
-        Ok((written, stdout, stderr, status)) => {
+    let work = async {
+        let mut exited = std::pin::pin!(exited);
+        let mut drained = false;
+        loop {
+            tokio::select! {
+                r = &mut exited => break (r, drained),
+                () = &mut drains, if !drained => drained = true,
+            }
+        }
+    };
+    let result = tokio::time::timeout(spec.timeout, work).await;
+    let end = match result {
+        Ok(((written, status), drained)) => {
             group.disarm();
+            if !drained {
+                let _ = tokio::time::timeout(AFTER_EXIT, &mut drains).await;
+            }
             // How the child ended comes first; a failed input write matters
             // only for a child that exited with 0 (a dead child's pipe
             // breaks).
-            let end = match status {
+            match status {
                 Err(e) => End::SpawnFailed(e.to_string()),
                 Ok(s) => match (s.code(), std::os::unix::process::ExitStatusExt::signal(&s), written) {
                     (_, Some(sig), _) => End::Signaled(sig),
@@ -164,8 +185,7 @@ pub async fn run(spec: &Spec) -> Outcome {
                     (Some(c), _, _) => End::Exited(c),
                     (None, None, _) => End::SpawnFailed("no exit status".into()),
                 },
-            };
-            Outcome { end, stdout, stderr }
+            }
         }
         Err(_) => {
             // The group first, while the child is not reaped (its process
@@ -173,12 +193,14 @@ pub async fn run(spec: &Spec) -> Outcome {
             drop(group);
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-            Outcome {
-                end: End::TimedOut,
-                stdout: Captured::default(),
-                stderr: Captured::default(),
-            }
+            End::TimedOut
         }
+    };
+    drop(drains);
+    Outcome {
+        end,
+        stdout: out,
+        stderr: err,
     }
 }
 
@@ -199,15 +221,14 @@ impl Drop for Group {
     }
 }
 
-/// Reads a stream to its end, keeping the first [`CAPTURE`] bytes: a
-/// verbose child never blocks on a full pipe.
-pub(crate) async fn drain<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>) -> Captured {
-    let mut c = Captured::default();
-    let Some(mut s) = stream else { return c };
+/// Reads a stream to its end into `c`, keeping the first [`CAPTURE`]
+/// bytes.
+pub(crate) async fn drain<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>, c: &mut Captured) {
+    let Some(mut s) = stream else { return };
     let mut buf = [0u8; 8192];
     loop {
         match s.read(&mut buf).await {
-            Ok(0) | Err(_) => return c,
+            Ok(0) | Err(_) => return,
             Ok(n) => {
                 let room = CAPTURE.saturating_sub(c.data.len());
                 c.data.extend_from_slice(&buf[..n.min(room)]);
@@ -311,6 +332,21 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
         assert!(!mark.exists(), "the grandchild died with the group");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_run_ends_when_the_child_exits() {
+        // A descendant left in the background keeps both pipes open: the
+        // child's exit with 0 counts, with what it wrote, well before the
+        // deadline (FR-MAIL-3: an accepted message is not retried).
+        let started = std::time::Instant::now();
+        let o = run(&sh("sleep 5 & echo out; echo diag >&2; exit 0", 4000)).await;
+        assert_eq!(o.end, End::Exited(0));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(
+            (o.stdout.data.as_slice(), o.stderr.data.as_slice()),
+            (&b"out\n"[..], &b"diag\n"[..])
+        );
     }
 
     #[tokio::test]

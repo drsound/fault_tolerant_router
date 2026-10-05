@@ -38,7 +38,7 @@ pub async fn run(nft: &Path, args: &[&str], input: Option<&str>) -> Result<Strin
                 .map_err(|e| format!("writing to nft: {e}"))?;
         }
         let mut out = Vec::new();
-        let mut err = Vec::new();
+        let mut err = crate::subprocess::Captured::default();
         let read_out = async {
             if let Some(o) = stdout.as_mut() {
                 let _ = o.read_to_end(&mut out).await;
@@ -47,11 +47,11 @@ pub async fn run(nft: &Path, args: &[&str], input: Option<&str>) -> Result<Strin
         // Drained to its end, the first 64 KiB kept: a verbose nft never
         // blocks on a full pipe until the deadline.
         let read_err = async {
-            err = crate::subprocess::drain(stderr.take()).await.data;
+            crate::subprocess::drain(stderr.take(), &mut err).await;
         };
         tokio::join!(read_out, read_err);
         let status = child.wait().await.map_err(|e| format!("waiting for nft: {e}"))?;
-        Ok::<_, String>((status, out, err))
+        Ok::<_, String>((status, out, err.data))
     };
     match tokio::time::timeout(DEADLINE, work).await {
         Err(_) => Err(format!("nft did not finish within {} s", DEADLINE.as_secs())),
