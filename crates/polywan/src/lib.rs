@@ -29,6 +29,7 @@ pub mod probe;
 pub mod quality;
 pub mod ra;
 pub mod reconcile;
+pub mod sdnotify;
 pub mod select;
 pub mod state;
 pub mod status;

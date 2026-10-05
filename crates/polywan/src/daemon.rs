@@ -30,6 +30,7 @@ use crate::plan::{self, Input, Layout, PathInput};
 use crate::probe;
 use crate::quality;
 use crate::reconcile::{self, DiffInput, Failure, FailureKind, Op};
+use crate::sdnotify;
 use crate::select::{self, Candidate};
 use crate::state::{self, Checkpoint, InstanceLock, Manifest, PathCheckpoint, StateDir};
 use crate::status::{self, Status};
@@ -241,6 +242,18 @@ struct Daemon {
     /// settings of every scope completed, so that warm adoption never sees
     /// the paths of pending interfaces as not ready (FR-REC-8).
     installing: bool,
+    /// IMPL-10: systemd's notification socket; none without `NOTIFY_SOCKET`
+    /// and in a dry run.
+    notifier: Option<sdnotify::Notifier>,
+    /// The initial reconciliation attempt completed or reported a failure.
+    attempted: bool,
+    /// `READY=1` was sent.
+    ready_sent: bool,
+    /// The `STATUS=` line of the latest snapshot, and the one last sent.
+    status_line: String,
+    status_sent: String,
+    /// A notification found systemd's queue full: it is sent again then.
+    notify_retry: Option<Instant>,
     hand_back: Option<(u64, String)>,
     reload: Option<ReloadPhase>,
     reload_again: bool,
@@ -347,6 +360,9 @@ const RECEIVE_BUFFER: usize = 4 << 20;
 /// interrupted after its retries; it also bounds how often a kernel that
 /// keeps interrupting dumps makes the daemon resynchronise.
 const RESYNC_AFTER_INTERRUPTED: Duration = Duration::from_secs(1);
+
+/// When a notification that found systemd's queue full is sent again.
+const NOTIFY_RETRY: Duration = Duration::from_millis(200);
 
 fn now_ms() -> u64 {
     state::boottime_ms().unwrap_or(0)
@@ -545,6 +561,12 @@ pub async fn run(opts: Options) -> Result<()> {
         sysctls_flight: BTreeMap::new(),
         sysctls_applied: BTreeMap::new(),
         installing: true,
+        notifier: None,
+        attempted: false,
+        ready_sent: false,
+        status_line: String::new(),
+        status_sent: String::new(),
+        notify_retry: None,
         hand_back: None,
         reload: None,
         reload_again: false,
@@ -605,6 +627,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.dry_run {
         return d.dry_run();
     }
+    d.notifier = sdnotify::Notifier::from_env();
     // The API sockets (FR-API-1), served on the I/O runtime.
     let endpoints = crate::api::endpoints(&d.cfg).map_err(|e| anyhow::anyhow!("api: {e}"))?;
     let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
@@ -1537,7 +1560,43 @@ impl Daemon {
         }
         if std::mem::take(&mut self.status_dirty) {
             let s = Arc::new(self.snapshot());
+            if self.notifier.is_some() {
+                self.status_line = s.summary();
+            }
             self.status.send_replace(s);
+        }
+    }
+
+    /// IMPL-10: `READY=1` once the listeners are open and the initial
+    /// reconciliation attempt completed or reported a failure, nothing of
+    /// it in flight; `STATUS=` when the summary changes.
+    fn notify_systemd(&mut self) {
+        let Some(n) = self.notifier.as_mut() else {
+            return;
+        };
+        let ready = !self.ready_sent
+            && self.attempted
+            && !self.installing
+            && self.nft_flight.is_none()
+            && self.hand_back.is_none()
+            && self.sysctls_flight.is_empty();
+        let mut message = String::new();
+        if ready {
+            message += "READY=1\n";
+        }
+        if self.status_line != self.status_sent {
+            message += &format!("STATUS={}\n", self.status_line);
+        }
+        if message.is_empty() {
+            return;
+        }
+        match n.send(&message) {
+            sdnotify::Sent::Done => {
+                self.ready_sent |= ready;
+                self.status_sent.clone_from(&self.status_line);
+                self.notify_retry = None;
+            }
+            sdnotify::Sent::Again => self.notify_retry = Some(Instant::now() + NOTIFY_RETRY),
         }
     }
 
@@ -2157,6 +2216,7 @@ impl Daemon {
                     "applied"
                 );
             }
+            self.attempted = true;
             self.applied();
             return;
         }
@@ -2247,6 +2307,7 @@ impl Daemon {
 
     /// FR-REC-5: report, count, retry with exponential backoff (1 s to 60 s).
     fn failed(&mut self, f: Failure, attempt: String) {
+        self.attempted = true;
         let count = crate::metrics::Totals::count(&mut self.totals().apply_failures, f.kind);
         error!(operation = %f.op, kind = f.kind.as_str(), errno = ?f.errno, extack = ?f.extack, failures = count, "apply_failed: {}", f.error);
         self.pending_events
@@ -2595,6 +2656,7 @@ impl Daemon {
                 bail!("{e}");
             }
             self.flush_events();
+            self.notify_systemd();
             if std::mem::take(&mut self.resync_due) {
                 info!("a netlink dump was still interrupted after its retries: full resynchronisation");
                 next_full = next_full.min(Instant::now() + RESYNC_AFTER_INTERRUPTED);
@@ -2604,6 +2666,7 @@ impl Daemon {
                 .iter()
                 .chain(self.sysctl_retries.values())
                 .map(|r| r.at)
+                .chain(self.notify_retry)
                 .chain(self.next_expiry())
                 .chain(self.paths.values().filter_map(|p| match p.gateway_wait {
                     Some((since, false)) => Some(since + gateway_warning()),
@@ -2661,6 +2724,9 @@ impl Daemon {
         info!("daemon_stopping");
         self.pending_events
             .push(NewEvent::new("daemon_stopping", "polywan is stopping"));
+        if let Some(n) = self.notifier.as_mut() {
+            n.send("STOPPING=1\n");
+        }
         self.flush_events();
         // The batch holding `daemon_stopping` and the email still waiting
         // get their last attempt (bounded by mail::SHUTDOWN).

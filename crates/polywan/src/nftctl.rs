@@ -22,6 +22,8 @@ pub async fn run(nft: &Path, args: &[&str], input: Option<&str>) -> Result<Strin
     }
     let mut child = Command::new(nft)
         .args(args)
+        // IMPL-10: only the daemon notifies systemd.
+        .env_remove(crate::sdnotify::VARIABLE)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

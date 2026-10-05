@@ -1,17 +1,18 @@
 //! M4 acceptance scenarios (SPEC.md §14.3, §17): the systemd integration
 //! that the daemon provides by itself (IMPL-10: the configuration exit
-//! status), with the daemon under test (`POLYWAN_DAEMON_BIN`) in the router
-//! namespace.
+//! status, readiness, status and stopping notifications), with the daemon
+//! under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixDatagram;
 use std::process::Output;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use testbed::plan::{Family, Uplink};
-use testbed::polywan::{self, HealthSpec, UplinkSpec};
+use testbed::polywan::{self, HealthSpec, UplinkSpec, succeeded};
 
 #[macro_use]
 mod common;
@@ -123,5 +124,79 @@ fn impl10_configuration_exit_status() -> Result<()> {
         serde_json::from_slice::<serde_json::Value>(&valid)?["uplinks"]
     );
     f.stop()?;
+    Ok(())
+}
+
+/// The notifications received on `socket` so far, one entry per datagram.
+fn notifications(socket: &UnixDatagram) -> Vec<String> {
+    let mut v = Vec::new();
+    let mut buf = [0; 4096];
+    while let Ok(n) = socket.recv(&mut buf) {
+        v.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+    }
+    v
+}
+
+/// IMPL-10 without systemd: with its own datagram socket as `NOTIFY_SOCKET`,
+/// no `READY=1` before the initial attempt completed (a slow first nftables
+/// application) although the status socket already answers; `STATUS=`
+/// follows a carrier loss and its recovery; `STOPPING=1` at SIGTERM; `nft`
+/// never inherits the variable, and a dry run sends nothing.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn impl10_notifications_without_systemd() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan("")?;
+    let path = f.dir.join("notify");
+    let socket = UnixDatagram::bind(&path)?;
+    socket.set_nonblocking(true)?;
+    let env = f.dir.join("nft-env");
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"], &format!("env > {}; sleep 3", env.display()))?;
+    let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
+    let config = polywan::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", &firewall);
+    f.write_config(&config)?;
+    f.set_env("NOTIFY_SOCKET", &path.display().to_string());
+    // A dry run is one-shot and never notifies.
+    succeeded(f.cli_config(&["run", "--dry-run"])?)?;
+    assert_eq!(notifications(&socket), Vec::<String>::new());
+
+    std::fs::write(&flag, "")?;
+    f.start(&t)?;
+    let mut seen = Vec::new();
+    t.wait_for("the status socket", Duration::from_secs(10), || Ok(f.status().is_ok()))?;
+    t.wait_for("nft -f to start", Duration::from_secs(10), || Ok(env.exists()))?;
+    seen.extend(notifications(&socket));
+    assert!(!seen.iter().any(|n| n.contains("READY=1")), "{seen:?}");
+    t.wait_for("READY=1", Duration::from_secs(20), || {
+        seen.extend(notifications(&socket));
+        Ok(seen.iter().any(|n| n.contains("READY=1")))
+    })?;
+    assert!(f.log().contains("applied"), "{}", f.log());
+    std::fs::remove_file(&flag)?;
+    assert!(!std::fs::read_to_string(&env)?.contains("NOTIFY_SOCKET"));
+    // The latest `STATUS=` becomes `line`.
+    let status = |seen: &mut Vec<String>, line: &str| {
+        let line = format!("STATUS={line}");
+        t.wait_for(&line, Duration::from_secs(15), || {
+            seen.extend(notifications(&socket));
+            let latest = seen.iter().flat_map(|n| n.lines()).rfind(|l| l.starts_with("STATUS="));
+            Ok(latest == Some(line.as_str()))
+        })
+        .with_context(|| format!("received {seen:?}"))
+    };
+    status(&mut seen, "status ok; active ipv4: a, b")?;
+    t.carrier_down(Uplink::A)?;
+    status(&mut seen, "status ok; active ipv4: b")?;
+    t.carrier_up(Uplink::A)?;
+    status(&mut seen, "status ok; active ipv4: a, b")?;
+    // Only changes are sent.
+    let lines: Vec<&str> = seen
+        .iter()
+        .flat_map(|n| n.lines())
+        .filter(|l| l.starts_with("STATUS="))
+        .collect();
+    assert!(lines.windows(2).all(|w| w[0] != w[1]), "{lines:?}");
+    assert!(f.stop()?.success());
+    assert!(notifications(&socket).iter().any(|n| n.contains("STOPPING=1")));
     Ok(())
 }
