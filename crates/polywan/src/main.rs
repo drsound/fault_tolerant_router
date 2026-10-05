@@ -158,12 +158,12 @@ fn main() -> ExitCode {
             }
             Command::CheckConfig { config, offline } => check_config(&config, offline).await,
             Command::GenerateConfig => {
-                print!("{}", config::EXAMPLE);
+                polywan::cli::write_stdout(format_args!("{}", config::EXAMPLE), false);
                 Ok(())
             }
             Command::ExportNft { config } => {
                 let cfg = load(&config)?;
-                print!("{}", nft::ruleset(&cfg));
+                polywan::cli::write_stdout(format_args!("{}", nft::ruleset(&cfg)), false);
                 Ok(())
             }
             Command::Cleanup { config } => {
@@ -219,6 +219,6 @@ async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
             anyhow::bail!("{}", f.errors.join("\n"));
         }
     }
-    println!("{}: valid", path.display());
+    polywan::say!("{}: valid", path.display());
     Ok(())
 }

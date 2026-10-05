@@ -10,6 +10,34 @@ use serde_json::Value;
 
 use crate::api::{self, client};
 
+/// `println!` for the CLI's output: a closed standard output (`polywan
+/// status | head -1`) ends the process quietly with the status of a
+/// SIGPIPE death, where `println!` would panic (resetting SIGPIPE needs
+/// unsafe code).
+#[macro_export]
+macro_rules! say {
+    ($($arg:tt)*) => {
+        $crate::cli::write_stdout(format_args!($($arg)*), true)
+    };
+}
+
+/// See [`say!`]; `newline: false` writes the text as it is.
+pub fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let written = out
+        .write_fmt(args)
+        .and_then(|()| if newline { out.write_all(b"\n") } else { Ok(()) })
+        .and_then(|()| out.flush());
+    if let Err(e) = written {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
+        }
+        eprintln!("polywan: writing the output: {e}");
+        std::process::exit(1);
+    }
+}
+
 /// `GET` on a socket, as JSON; any status but 200 is an error with the
 /// server's message.
 async fn get(socket: &Path, path: &str, timeout: Duration) -> Result<Value> {
@@ -30,12 +58,12 @@ async fn get(socket: &Path, path: &str, timeout: Duration) -> Result<Value> {
 pub async fn status(socket: &Path, json: bool) -> Result<()> {
     let s = get(socket, "/v1/status", api::DEADLINE).await?;
     if json {
-        println!("{s}");
+        crate::say!("{s}");
         return Ok(());
     }
     let text = |v: &Value| v.as_str().unwrap_or("").to_owned();
     let uptime = s["uptime_seconds"].as_u64().unwrap_or(0);
-    println!(
+    crate::say!(
         "polywan {}, up {}h {:02}m, status {}{}",
         text(&s["version"]),
         uptime / 3600,
@@ -46,14 +74,15 @@ pub async fn status(socket: &Path, json: bool) -> Result<()> {
             _ => String::new(),
         }
     );
-    println!(
+    crate::say!(
         "generation: desired {}, applied {}",
-        s["generation"]["desired"], s["generation"]["applied"]
+        s["generation"]["desired"],
+        s["generation"]["applied"]
     );
     if let Some(active) = s["active"].as_object() {
         for (family, set) in active {
             let names: Vec<String> = set.as_array().into_iter().flatten().map(text).collect();
-            println!(
+            crate::say!(
                 "active {family}: {}",
                 if names.is_empty() {
                     "none".into()
@@ -69,7 +98,7 @@ pub async fn status(socket: &Path, json: bool) -> Result<()> {
         } else {
             ""
         };
-        println!(
+        crate::say!(
             "uplink {} (id {}, {}){drained}",
             text(&u["name"]),
             u["id"],
@@ -104,7 +133,7 @@ pub async fn status(socket: &Path, json: bool) -> Result<()> {
             if let Some(l) = st["loss"].as_f64() {
                 line += &format!(", loss {:.0}%", l * 100.0);
             }
-            println!("{line}");
+            crate::say!("{line}");
         }
     }
     Ok(())
@@ -112,7 +141,7 @@ pub async fn status(socket: &Path, json: bool) -> Result<()> {
 
 fn print_event(e: &Value) {
     let text = |k: &str| e[k].as_str().unwrap_or("");
-    println!(
+    crate::say!(
         "{} #{} {} {}",
         text("timestamp"),
         e["seq"],
@@ -143,10 +172,10 @@ pub async fn events(socket: &Path, follow: bool) -> Result<()> {
         let path = format!("/v1/events?{}", query.join("&"));
         let page = get(socket, &path, api::DEADLINE + wait).await?;
         if instance.is_some() && page["reset"].as_bool() == Some(true) {
-            println!("(the daemon restarted: events from the start of its history)");
+            crate::say!("(the daemon restarted: events from the start of its history)");
         }
         if page["truncated"].as_bool() == Some(true) {
-            println!("(older events were evicted from the history)");
+            crate::say!("(older events were evicted from the history)");
         }
         instance = page["instance"].as_str().map(str::to_owned);
         let events = page["events"].as_array().cloned().unwrap_or_default();
@@ -186,7 +215,7 @@ pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Resul
             .unwrap_or_default();
         bail!("{action} {name}: {status}: {message}{steps}");
     }
-    println!(
+    crate::say!(
         "uplink {name} {}, applied in generation {}",
         if drain { "drained" } else { "undrained" },
         v["generation"]
@@ -213,7 +242,7 @@ pub async fn reload(socket: &Path) -> Result<()> {
         }
         bail!("{message}");
     }
-    println!("configuration reloaded, applied in generation {}", v["generation"]);
+    crate::say!("configuration reloaded, applied in generation {}", v["generation"]);
     Ok(())
 }
 
@@ -241,7 +270,7 @@ pub async fn forget(socket: &Path, name: &str, config: &Path, lock: &Path) -> Re
                     v.get("error").and_then(Value::as_str).unwrap_or("request failed")
                 );
             }
-            println!("uplink {name:?} forgotten; id {} can be reused", v["id"]);
+            crate::say!("uplink {name:?} forgotten; id {} can be reused", v["id"]);
             Ok(())
         }
         Err(client::Error::Connect(e))
@@ -271,7 +300,7 @@ fn forget_offline(path: &Path, name: &str, lock: &Path) -> Result<()> {
     }
     let id = m.forget(name).map_err(|e| anyhow::anyhow!(e))?;
     dir.write_manifest(&m)?;
-    println!("uplink {name:?} forgotten; id {id} can be reused");
+    crate::say!("uplink {name:?} forgotten; id {id} can be reused");
     Ok(())
 }
 
@@ -306,12 +335,12 @@ pub fn print_reports(reports: &[crate::notifytest::Report]) -> Result<()> {
         if let Some(e) = &r.error {
             line += &format!(": {e}");
         }
-        println!("{line}");
+        crate::say!("{line}");
         for l in r.stderr.lines() {
-            println!("  stderr: {l}");
+            crate::say!("  stderr: {l}");
         }
         if r.stderr_truncated {
-            println!("  stderr: [truncated]");
+            crate::say!("  stderr: [truncated]");
         }
         if r.outcome != Outcome::Succeeded {
             failed += 1;
