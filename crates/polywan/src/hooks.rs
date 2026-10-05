@@ -60,15 +60,26 @@ pub fn spec(hook: &Hook, event: &Event, user: (u32, u32)) -> Option<Spec> {
     })
 }
 
-/// The uid and gid of the hook user, looked up on the blocking pool.
+/// The uid and gid of the hook user, looked up on the blocking pool. An
+/// account with UID 0 is refused: it would keep the daemon's capabilities
+/// (FR-HOOK-3).
 pub async fn resolve_user(name: &str) -> Result<(u32, u32), String> {
     let owned = name.to_owned();
-    tokio::task::spawn_blocking(move || crate::identity::user(&owned))
+    let (uid, gid) = tokio::task::spawn_blocking(move || crate::identity::user(&owned))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?
         .map(|u| (u.uid, u.gid))
-        .ok_or_else(|| format!("hook user {name:?} not found"))
+        .ok_or_else(|| format!("hook user {name:?} not found"))?;
+    if uid == 0 {
+        return Err(uid_zero(name));
+    }
+    Ok((uid, gid))
+}
+
+/// Why a hook user with UID 0 is refused.
+pub fn uid_zero(name: &str) -> String {
+    format!("hook user {name:?} has UID 0, which keeps capabilities; hooks run without any (FR-HOOK-3)")
 }
 
 /// Runs a hook and logs how it ended, with its output (FR-HOOK-3).
@@ -104,8 +115,8 @@ pub async fn notifier(
         if user.as_ref().is_none_or(|(name, _)| *name != notify.hook_user) {
             match resolve_user(&notify.hook_user).await {
                 Ok(ids) => user = Some((notify.hook_user.clone(), ids)),
-                Err(_) => {
-                    warn!(user = %notify.hook_user, "hook user not found: hooks not run");
+                Err(e) => {
+                    warn!(user = %notify.hook_user, "hooks not run: {e}");
                     user = None;
                     continue;
                 }

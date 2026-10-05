@@ -288,7 +288,7 @@ mod tests {
             coalesce: Duration::from_secs(30),
             email: None,
             hooks,
-            hook_user: "root".into(),
+            hook_user: "nobody".into(),
         }
     }
 

@@ -133,6 +133,10 @@ pub fn identities(config: &Config) -> Findings {
     }
     if !config.notify.hooks.is_empty() {
         match crate::identity::user(&config.notify.hook_user) {
+            Ok(Some(u)) if u.uid == 0 => f.errors.push(format!(
+                "notify.hook_user: {}",
+                crate::hooks::uid_zero(&config.notify.hook_user)
+            )),
             Ok(Some(_)) => {}
             Ok(None) => f.errors.push(format!(
                 "notify.hook_user: user {:?} does not exist",
@@ -585,6 +589,17 @@ mod tests {
         );
         let lp = |_: &Path| Ok(Some(PathBuf::from("/loop")));
         assert!(traversed(Path::new("/loop"), lp).is_err(), "a link loop ends");
+    }
+
+    #[test]
+    fn hooks_never_run_with_uid_0() {
+        let mut cfg = crate::config::parse(
+            "version = 2\n[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv4]\n[[notify.hook]]\ncommand = [\"/bin/true\"]\n",
+        )
+        .unwrap();
+        cfg.notify.hook_user = "root".into();
+        let errors = identities(&cfg).errors;
+        assert!(errors.iter().any(|e| e.contains("UID 0")), "{errors:?}");
     }
 
     #[test]

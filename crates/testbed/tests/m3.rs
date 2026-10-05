@@ -1363,15 +1363,17 @@ fn as25_notification_tests() -> Result<()> {
     let stub = Stub::new(&t, "sendmail")?;
     let out = t.exec_dir()?.join("test-hook");
     std::fs::create_dir_all(&out)?;
+    // Hooks run as nobody (FR-HOOK-3: never with UID 0).
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o777))?;
     let delay = out.join("delay");
     std::fs::write(&delay, "11")?;
     let record = format!("cat > {}/stdin", out.display());
     let sleeper = format!("sleep $(cat {})", delay.display());
-    // Filters that the tests bypass; hooks as root, to write the record.
+    // Filters that the tests bypass.
     let hooks = format!(
         "[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {record:?}]\nevents = [\"daemon_stopping\"]\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {sleeper:?}]\nevents = [\"daemon_stopping\"]\ntimeout = \"15s\"\n"
     );
-    let notify = "coalesce = \"1s\"\nhook_user = \"root\"\n";
+    let notify = "coalesce = \"1s\"\n";
     let config = with(&notify_email(&stub.path, notify, &["admin@example.com"], &hooks));
     let mut f = t.prepare_polywan(&config)?;
     f.set_env("POLYWAN_TEST_MAIL_TIMES", "500,5000");
