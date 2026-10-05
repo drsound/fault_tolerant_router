@@ -2362,7 +2362,8 @@ per_family!(as27_failure_after_each_step);
 /// connections, a router-originated connection, an inbound connection, and
 /// connections matching a balance policy to C and a block policy to A (the
 /// policy variants, whose tables and rules are steps of these orders). While
-/// the failed generation is held and after its retry, no packet is routed by
+/// the failed generation is held under new connections, balanced and
+/// matching the policies, and after its retry, no packet is routed by
 /// an operating-system route (INV-3) and no packet of a pinned or inbound
 /// connection leaves through another uplink; connections on B, which no
 /// change touches, are uninterrupted.
@@ -2501,8 +2502,16 @@ fn as27_failure_after_each_step(fam: Family) -> Result<()> {
             let injected = faults.injected();
             if injected {
                 // Hold the partial generation under new connections (with A
-                // out but still in the unchanged active set, some time out).
+                // out but still in the unchanged active set, some time out),
+                // balanced and matching the policies (servers 64 and 65).
                 t.connect_many(Node::Client, fam, 20, 40, false)?;
+                t.connect_to(
+                    Node::Client,
+                    &servers(fam, 64, 2, TCP_PORT),
+                    10,
+                    false,
+                    Duration::from_secs(2),
+                )?;
                 assert_eq!(leaks()?, 0, "INV-3, {change:?} after {k} steps");
                 assert_eq!(counter_value(&t, "wrong")?, 0, "INV-2, {change:?} after {k} steps");
                 faults.disarm()?;

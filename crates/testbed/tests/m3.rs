@@ -278,6 +278,22 @@ fn as15_block_and_balance_policies_across_a_failure(fam: Family) -> Result<()> {
     std::thread::sleep(Duration::from_millis(500));
     t.upstream_down(Uplink::A)?;
     wait_members(&t, fam, &["wanb"], Duration::from_secs(15))?;
+    // The connections opened before the failure (servers 30 to 35) keep
+    // sending through A, never through B: retransmissions while A is out,
+    // with doubling intervals, so at least one within the rest of the
+    // scenario, which lasts longer than the failure so far.
+    let ipk = ip(fam);
+    let before_servers: Vec<String> = (30..36).map(|n| testbed::plan::server(fam, n).to_string()).collect();
+    for (name, iface) in [("before_a", "wana"), ("before_b", "wanb")] {
+        counter(
+            &t,
+            name,
+            &format!(
+                "oifname \"{iface}\" ct original {ipk} daddr {{ {} }} tcp dport {TCP_PORT}",
+                before_servers.join(", ")
+            ),
+        )?;
+    }
     let r = on(TCP_PORT)?;
     assert_eq!(
         tally(&r).get(&Some(Uplink::B)),
@@ -306,6 +322,10 @@ fn as15_block_and_balance_policies_across_a_failure(fam: Family) -> Result<()> {
             "opened before the failure: {r:?}"
         );
     }
+    assert!(
+        counter_value(&t, "before_a")? > 0 && counter_value(&t, "before_b")? == 0,
+        "opened before the failure: through A, nothing through B"
+    );
     for r in during.into_iter().map(|f| f.stop()).collect::<Result<Vec<_>>>()? {
         assert!(
             r.uplink() == Some(Uplink::B) && r.continuous(Duration::from_secs(1)),
@@ -844,10 +864,11 @@ per_family!(as16_drain_and_undrain);
 
 /// AS-16 with the drain variants of AS-29 and AS-42: draining A takes it
 /// out of new connections, balance-policy ones included, while its existing
-/// flows continue, its probes keep it up and connections bound to its
-/// address still use it; the last candidate needs `force`, after which new
-/// connections are rejected; the drain survives a restart (INV-2, INV-5,
-/// INV-6, FR-SEL-3, FR-SEL-4).
+/// flows continue, connections bound to its address still use it, and its
+/// probes still leave through A (lost in its provider, they take its path
+/// down, then back up while it stays drained); the last candidate needs
+/// `force`, after which new connections are rejected; the drain survives a
+/// restart (INV-2, INV-5, INV-6, FR-SEL-3, FR-SEL-4).
 fn as16_drain_and_undrain(fam: Family) -> Result<()> {
     let t = build();
     let rules = policies(&[(
@@ -913,12 +934,16 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
         r.iter().all(|c| c.outcome == Outcome::Ok),
         "inbound on drained A: {r:?}"
     );
-    // AS-29: A's probes keep running; it stays up while drained.
-    std::thread::sleep(Duration::from_secs(4));
-    let s = f.status()?;
-    assert_eq!(polywan::path(&s, "a", fam)["state"], "up", "{s}");
-    assert_eq!(s["uplinks"][0]["drained"], true, "{s}");
     flows_on_continuous(flows, &[Uplink::A, Uplink::B])?;
+    // AS-29: A's probes keep running through A while it is drained: lost in
+    // A's provider, they take its path down, and back up once they pass.
+    t.drop_probe_echoes(Uplink::A, 1)?;
+    f.wait_path_where(&t, "a", fam, "down", Duration::from_secs(10), |p| p["state"] == "down")?;
+    t.clear_provider_rules(Uplink::A)?;
+    wait_a_eligible(&t, &f, fam)?;
+    let s = f.status()?;
+    assert_eq!(s["uplinks"][0]["drained"], true, "{s}");
+    assert_eq!(balancing_members(&t, fam)?, ["wanb"], "still drained");
     // FR-SEL-4: the last candidate.
     let out = f.drain("b", true, false)?;
     assert!(
@@ -1522,8 +1547,9 @@ fn as25_notification_tests() -> Result<()> {
 /// notifications and one suppression notice, and a notification after the
 /// window reports the suppressed ones. Notification tests, one while a
 /// batch is open and two during the suppression, are sent at once, keep a
-/// Unicode line and a lone-dot line, and neither flush the batch nor take
-/// or reset the hourly allowance (FR-MAIL-4).
+/// Unicode line and a lone-dot line, and neither flush the batch nor reset
+/// the hourly allowance; two tests between admissions take none of it
+/// (FR-MAIL-4).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
@@ -1604,6 +1630,32 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     // The rate limit: the earlier admissions leave the 12 s window first.
     std::thread::sleep(Duration::from_secs(13));
     f.reload_with(&config(3))?;
+    // Tests take none of the allowance: with three per window, one
+    // notification, two tests and two more notifications are admitted, and
+    // the next batch is suppressed with its notice; all within 10 s of the
+    // first admission.
+    let count = |k: &str| -> Result<usize> { Ok(stub.calls()?.iter().filter(|c| kind(c) == k).count()) };
+    let (notified, tested) = (count("notification")?, count("test")?);
+    for n in 1..=4 {
+        succeeded(f.drain("a", n % 2 == 1, false)?)?;
+        if n == 4 {
+            t.wait_for("the suppression notice", Duration::from_secs(5), || {
+                Ok(count("notice")? == 1)
+            })?;
+        } else {
+            t.wait_for(&format!("notification {n}"), Duration::from_secs(5), || {
+                Ok(count("notification")? == notified + n)
+            })?;
+        }
+        if n == 1 {
+            succeeded(f.notify_test()?)?;
+            succeeded(f.notify_test()?)?;
+            assert_eq!(count("test")?, tested + 2);
+        }
+    }
+    assert_eq!(count("notification")?, notified + 3, "{:#?}", stub.calls()?);
+    // The flood, once these admissions and the notice left the window.
+    std::thread::sleep(Duration::from_secs(13));
     let from = std::time::SystemTime::now();
     let mut drained = false;
     for i in 0..30 {
@@ -1769,7 +1821,8 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
 /// (0666) serves an unprivileged user (`nobody` without groups), its write
 /// paths are 404; the control socket refuses a non-member of `api.group`
 /// and serves a member; `api.status_group` restricts the status socket to
-/// its members, an empty `api.status_socket` removes it; the instance lock
+/// its members, an empty `api.status_socket` removes it, and both changes
+/// close the socket's existing connections; the instance lock
 /// is root's, mode 0600, unreadable by users; a dry run opens no socket.
 #[test]
 #[ignore = "needs root and network namespaces"]
@@ -1797,14 +1850,42 @@ fn as51_socket_access() -> Result<()> {
     assert_eq!(get(&[], &status, "POST", "/v1/uplinks/a/drain")?, Some(404));
     assert_eq!(get(&[], &control, "GET", "/v1/status")?, None, "not a member");
     assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
+    // A change of the status socket's access closes its connections, also
+    // one whose request is still arriving: it gets no answer.
+    let status_path = status.display().to_string();
+    let pending = || {
+        t.agent_child(&[
+            "hold",
+            &status_path,
+            "--count",
+            "2",
+            "--head",
+            "GET /v1/status HTTP/1.1\\r\\n",
+            "--seconds",
+            "15",
+        ])
+    };
+    let closed = |child| -> Result<()> {
+        let list: Vec<Held> = t.agent_lines(child)?;
+        assert!(
+            list.iter()
+                .all(|h| h.connected && h.received == 0 && h.closed_after.is_some_and(|s| s < 5.0)),
+            "closed by the reload, before the 10 s deadline: {list:?}"
+        );
+        Ok(())
+    };
     // Restricted to a group.
+    let held = pending()?;
     f.reload_with(&config(&format!("{open}status_group = \"sys\"\n")))?;
+    closed(held)?;
     let m = std::fs::metadata(&status)?;
     assert_eq!((m.mode() & 0o777, m.uid()), (0o660, 0));
     assert_eq!(get(&[], &status, "GET", "/v1/status")?, None);
     assert_eq!(get(&["sys"], &status, "GET", "/v1/status")?, Some(200));
     // Disabled.
+    let held = pending()?;
     f.reload_with(&config("status_socket = \"\"\n"))?;
+    closed(held)?;
     assert!(!status.exists(), "no status socket");
     assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
     // The lock.
