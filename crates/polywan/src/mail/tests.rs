@@ -244,3 +244,80 @@ fn sendmail_runs_as_root_with_explicit_recipients() {
     );
     assert_eq!((s.uid, s.gid, s.capture_stdout, s.env.len()), (0, 0, false, 0));
 }
+
+/// Email configured with a sendmail that does not exist: an attempt fails
+/// before any process runs, and is counted.
+fn notify_with_email() -> Notify {
+    Notify {
+        coalesce: Duration::from_secs(30),
+        email: Some(Email {
+            sendmail: "/nonexistent/polywan-sendmail".into(),
+            ..email()
+        }),
+        hooks: Vec::new(),
+        hook_user: "nobody".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_reload_applies_before_a_submission_ready_at_the_same_time() {
+    let notify = notify_with_email();
+    let failures = Arc::new(Failures::default());
+    let sendmail = Sendmail::default();
+    // The turn is held here (a notification test): the due message waits.
+    let held = Arc::clone(&sendmail.turn).try_acquire_owned().unwrap();
+    let mut mail = Mail::new("abc".into(), Times::default(), Arc::clone(&failures), sendmail);
+    let m = mail.message(
+        Kind::Notification,
+        "x".into(),
+        notify.email.as_ref().unwrap(),
+        Instant::now(),
+    );
+    mail.wait(m);
+    let mut bus = crate::events::Bus::new("abc".into());
+    let events = bus.add_notifier("email", QUEUE, QUEUE_BYTES);
+    let (config, config_rx) = watch::channel(Arc::new(notify));
+    let (stop, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(notifier(events, config_rx, stop_rx, mail));
+    // Long enough for the notifier to wait for the turn.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Email removed and the turn free when the notifier runs again.
+    config.send_replace(Arc::new(Notify {
+        email: None,
+        ..notify_with_email()
+    }));
+    drop(held);
+    tokio::task::yield_now().await;
+    let (done, answered) = oneshot::channel();
+    stop.send(done).unwrap();
+    answered.await.unwrap();
+    task.await.unwrap();
+    assert_eq!(failures.email.load(Ordering::Relaxed), 0, "discarded, not submitted");
+}
+
+#[tokio::test]
+async fn the_shutdown_flush_keeps_the_retry_delays() {
+    let notify = notify_with_email();
+    let email = notify.email.as_ref().unwrap();
+    let failures = Arc::new(Failures::default());
+    let mut mail = Mail::new(
+        "abc".into(),
+        Times::default(),
+        Arc::clone(&failures),
+        Sendmail::default(),
+    );
+    let now = Instant::now();
+    let m = mail.message(Kind::Notification, "due".into(), email, now);
+    mail.wait(m);
+    let mut retry = mail.message(Kind::Notification, "retry".into(), email, now);
+    retry.failures = 1;
+    retry.due = now + Duration::from_secs(300);
+    mail.wait(retry);
+    flush(&mut mail, &notify, None).await;
+    assert_eq!(
+        failures.email.load(Ordering::Relaxed),
+        1,
+        "only the due message is tried"
+    );
+    assert!(mail.waiting.is_empty());
+}

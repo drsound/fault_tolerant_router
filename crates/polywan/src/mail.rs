@@ -633,40 +633,11 @@ async fn drive(
         let close = mail.batch.as_ref().map(|b| b.deadline);
         let due = if running.is_some() { None } else { mail.next_due() };
         let turn = Arc::clone(&mail.sendmail.turn);
+        // In this order: an accepted reload applies before any submission
+        // that is ready at the same time (FR-MAIL-1), and the stop before
+        // anything else.
         tokio::select! {
-            e = events.recv() => {
-                let Some(e) = e else { return };
-                if notify.email.is_some() {
-                    mail.add(Instant::now(), notify.coalesce, &e);
-                }
-            }
-            () = at(close) => match &notify.email {
-                Some(email) => mail.close_batch(Instant::now(), email, hostname().as_deref()),
-                None => {
-                    mail.discard();
-                }
-            },
-            // The message is taken once the turn is held: one that a reload
-            // discards meanwhile is not submitted.
-            permit = async { at(due).await; turn.acquire_owned().await }, if due.is_some() => {
-                let Ok(permit) = permit else { return };
-                match &notify.email {
-                    Some(email) => {
-                        if let Some(m) = mail.take_due(Instant::now()) {
-                            running = Some(submission(m, email.clone(), mail.times.deadline, permit));
-                        }
-                    }
-                    None => {
-                        mail.discard();
-                    }
-                }
-            }
-            (m, result) = async { running.as_mut().expect("polled while running").await }, if running.is_some() => {
-                running = None;
-                // A retry needs email still configured (FR-MAIL-1).
-                let retry = notify.email.is_some();
-                finished(mail, m, result, Instant::now(), retry);
-            }
+            biased;
             changed = config.changed() => {
                 if changed.is_err() {
                     return;
@@ -691,18 +662,61 @@ async fn drive(
                 let _ = done.send(());
                 return;
             }
+            (m, result) = async { running.as_mut().expect("polled while running").await }, if running.is_some() => {
+                running = None;
+                // A retry needs email still configured (FR-MAIL-1).
+                let retry = notify.email.is_some();
+                finished(mail, m, result, Instant::now(), retry);
+            }
+            // The message is taken once the turn is held: one that a reload
+            // discards meanwhile is not submitted.
+            permit = async { at(due).await; turn.acquire_owned().await }, if due.is_some() => {
+                let Ok(permit) = permit else { return };
+                match &notify.email {
+                    Some(email) => {
+                        if let Some(m) = mail.take_due(Instant::now()) {
+                            running = Some(submission(m, email.clone(), mail.times.deadline, permit));
+                        }
+                    }
+                    None => {
+                        mail.discard();
+                    }
+                }
+            }
+            () = at(close) => match &notify.email {
+                Some(email) => mail.close_batch(Instant::now(), email, hostname().as_deref()),
+                None => {
+                    mail.discard();
+                }
+            },
+            e = events.recv() => {
+                let Some(e) = e else { return };
+                if notify.email.is_some() {
+                    mail.add(Instant::now(), notify.coalesce, &e);
+                }
+            }
         }
     }
 }
 
-/// The last submissions of a stopping daemon: the running one, then each
-/// waiting message once, retries included, within [`SHUTDOWN`]. Each takes
-/// its turn: a running notification test ends first.
+/// The last submissions of a stopping daemon, within [`SHUTDOWN`]: the
+/// running one, then each waiting message that is due, once. A retry not
+/// due yet keeps its delay (FR-MAIL-3) and is discarded. Each submission
+/// takes its turn: a running notification test ends first.
 async fn flush(mail: &mut Mail, notify: &Notify, running: Option<Running>) {
     let Some(email) = &notify.email else { return };
-    mail.close_batch(Instant::now(), email, hostname().as_deref());
+    let now = Instant::now();
+    mail.close_batch(now, email, hostname().as_deref());
     let deadline = mail.times.deadline;
-    let pending = std::mem::take(&mut mail.waiting);
+    let (pending, later): (Vec<Message>, Vec<Message>) = std::mem::take(&mut mail.waiting)
+        .into_iter()
+        .partition(|m| m.due <= now);
+    if !later.is_empty() {
+        warn!(
+            discarded = later.len(),
+            "email retries not due yet at shutdown were discarded"
+        );
+    }
     let turn = Arc::clone(&mail.sendmail.turn);
     let work = async {
         if let Some(f) = running {

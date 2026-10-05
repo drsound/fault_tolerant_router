@@ -229,7 +229,7 @@ pub fn render(status: &Status, totals: &Mutex<Totals>, failures: &Failures) -> S
     family(
         "polywan_notifications_failed_total",
         "counter",
-        "Failed notifications: sendmail submissions and hook runs.",
+        "Failed notifications: each failed sendmail submission, retries included, and each hook run that did not exit with 0; notification tests are not counted.",
         by(
             "channel",
             [
