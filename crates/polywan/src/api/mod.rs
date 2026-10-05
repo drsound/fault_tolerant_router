@@ -27,7 +27,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::events::{self, Ring};
 use crate::status::Status;
@@ -354,7 +354,12 @@ async fn manager(
                                 let applied =
                                     tokio::task::spawn_blocking(move || socket::apply_access(&path, access)).await;
                                 if !matches!(applied, Ok(Ok(()))) {
-                                    warn!(path = %e.address, "changing the access of an API socket failed");
+                                    // Never served under the old access:
+                                    // closed, and bound again by the next
+                                    // reload (FR-API-1).
+                                    error!(path = %e.address, "changing the access of an API socket failed: the socket is closed");
+                                    close(l);
+                                    continue;
                                 }
                             }
                             // The listening socket stays; its connections
