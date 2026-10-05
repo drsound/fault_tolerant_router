@@ -1015,8 +1015,11 @@ impl Daemon {
                     {
                         // A new incarnation of the interface gets its
                         // settings at once, not after the old one's backoff.
+                        // A job in flight wrote to the old incarnation: its
+                        // completion no longer counts.
                         let scope = SysctlScope::Interface(up.interface.clone());
                         self.sysctls_applied.remove(&scope);
+                        self.sysctls_flight.remove(&scope);
                         self.sysctls_pending.insert(scope);
                         self.sysctl_retries.remove(&up.interface);
                     }
