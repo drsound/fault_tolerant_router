@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use hyper::StatusCode;
 use netlink_packet_route::RouteNetlinkMessage;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, error, info, warn};
 
+use crate::api::{Action, Answer, Order};
 use crate::checks;
 use crate::config::{self, Config, FirewallMode, OnShutdown};
 use crate::discover::{self, Discovered};
@@ -137,6 +139,31 @@ struct Ownership {
     clean_reconciliations: u8,
 }
 
+/// The command of the control socket in progress (FR-API-3).
+enum Active {
+    /// The drain intent is being written (FR-SEL-3).
+    Persisting {
+        seq: u64,
+        uplink: UplinkId,
+        drain: bool,
+        reply: oneshot::Sender<Answer>,
+    },
+    /// Applied when the applied generation reaches `target`, which the pass
+    /// after the change sets (FR-REC-5).
+    Applying {
+        target: Option<u64>,
+        since: Instant,
+        /// The test hook step before the answer (AS-46).
+        step: &'static str,
+        answer: serde_json::Value,
+        reply: oneshot::Sender<Answer>,
+    },
+}
+
+/// How long a command waits for its application before it answers that
+/// it is still pending (within the API's deadline, FR-API-4).
+const COMMAND_WAIT: Duration = Duration::from_secs(8);
+
 /// The settings of one scope and whether they are managed or only checked.
 type SysctlJob = (Vec<sysctl::Setting>, bool);
 
@@ -219,6 +246,9 @@ struct Daemon {
     repairs_total: BTreeMap<&'static str, u64>,
     /// The API listener manager; none in a dry run.
     api: Option<crate::api::Api>,
+    /// Commands of the control socket, one at a time.
+    orders: VecDeque<Order>,
+    command: Option<Active>,
     layout: Layout,
     scope: Scope,
     protocol: u8,
@@ -470,6 +500,8 @@ pub async fn run(opts: Options) -> Result<()> {
         repairs: BTreeSet::new(),
         repairs_total: BTreeMap::new(),
         api: None,
+        orders: VecDeque::new(),
+        command: None,
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -510,11 +542,13 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     // The API sockets (FR-API-1), served on the I/O runtime.
     let endpoints = crate::api::endpoints(&d.cfg.api).map_err(|e| anyhow::anyhow!("api: {e}"))?;
+    let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
     let shared = crate::api::Shared {
         status: d.status.subscribe(),
         ring: d.bus.ring(),
         latest: d.bus.subscribe(),
         started: std::time::Instant::now(),
+        orders,
     };
     let runtime_dir = opts.lock.parent().unwrap_or(Path::new("/run/polywan")).to_owned();
     let Some(io) = d.io.as_ref() else {
@@ -562,7 +596,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if d.cfg.firewall.mode == FirewallMode::External {
         info!("external firewall mode: marking and NAT are the administrator's responsibility (export-nft)");
     }
-    d.event_loop(subscription, probe_rx, done_rx).await
+    d.event_loop(subscription, probe_rx, done_rx, orders_rx).await
 }
 
 /// The system checks of `check-config` without `--offline` (§9).
@@ -1144,6 +1178,176 @@ impl Daemon {
                 .map(|s| s.iter().map(|i| i.get()).collect())
                 .unwrap_or_default(),
         }
+    }
+
+    /// Starts the next command if none is in progress.
+    fn next_order(&mut self) {
+        while self.command.is_none() {
+            let Some(Order { action: request, reply }) = self.orders.pop_front() else {
+                return;
+            };
+            match request {
+                Action::Drain { uplink, force } => self.start_drain(&uplink, true, force, reply),
+                Action::Undrain { uplink } => self.start_drain(&uplink, false, false, reply),
+                Action::Forget { .. } | Action::Reload => {
+                    let _ = reply.send(Answer::error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "not implemented by this development build",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The candidates of a family (§2): eligible (a priority, not drained)
+    /// and ready.
+    fn candidates(&self, family: Family) -> Vec<UplinkId> {
+        self.cfg
+            .uplinks
+            .iter()
+            .filter(|u| u.priority.is_some() && !self.drained.contains(&u.id))
+            .filter(|u| {
+                self.paths
+                    .get(&PathKey { uplink: u.id, family })
+                    .is_some_and(|p| p.machine.is_ready())
+            })
+            .map(|u| u.id)
+            .collect()
+    }
+
+    /// FR-SEL-3, FR-SEL-4: drain or undrain, persisted before it applies.
+    fn start_drain(&mut self, name: &str, drain: bool, force: bool, reply: oneshot::Sender<Answer>) {
+        let Some(u) = self.cfg.uplinks.iter().find(|u| u.name == name) else {
+            let _ = reply.send(Answer::error(
+                StatusCode::NOT_FOUND,
+                format!("no uplink is named {name:?}"),
+            ));
+            return;
+        };
+        let id = u.id;
+        if drain && !force {
+            for family in Family::ALL {
+                if self.candidates(family) == [id] {
+                    let _ = reply.send(Answer::error(
+                        StatusCode::CONFLICT,
+                        format!("{name} is the last {family} candidate; draining it needs force (FR-SEL-4)"),
+                    ));
+                    return;
+                }
+            }
+        }
+        let mut drained = self.drained.clone();
+        if drain {
+            drained.insert(id);
+        } else {
+            drained.remove(&id);
+        }
+        let names = drained
+            .iter()
+            .filter_map(|i| self.cfg.uplink(*i))
+            .map(|u| u.name.clone());
+        let state = state::DrainState::of(names);
+        let seq = self.next_seq();
+        match self.lanes.persist(PersistJob::Drain { seq, state }) {
+            Ok(()) => {
+                self.command = Some(Active::Persisting {
+                    seq,
+                    uplink: id,
+                    drain,
+                    reply,
+                })
+            }
+            Err(Lost::Full) => {
+                let _ = reply.send(Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the state directory is busy",
+                ));
+            }
+            Err(Lost::Closed) => self.lost(),
+        }
+    }
+
+    /// The drain intent is durable: it applies now, and the command waits
+    /// for the applied generation that includes it.
+    fn drained(&mut self, seq: u64, result: std::result::Result<(), String>) {
+        let Some(Active::Persisting { seq: s, .. }) = &self.command else {
+            return;
+        };
+        if *s != seq {
+            return;
+        }
+        let Some(Active::Persisting {
+            uplink, drain, reply, ..
+        }) = self.command.take()
+        else {
+            return;
+        };
+        let name = self.cfg.uplink(uplink).map(|u| u.name.clone()).unwrap_or_default();
+        if let Err(e) = result {
+            error!(uplink = %name, "drain state not written: {e}");
+            let _ = reply.send(Answer::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the drain state could not be written; nothing changed",
+            ));
+            return self.next_order();
+        }
+        let (kind, verb) = if drain {
+            self.drained.insert(uplink);
+            ("uplink_drained", "drained")
+        } else {
+            self.drained.remove(&uplink);
+            ("uplink_undrained", "undrained")
+        };
+        info!(uplink = %name, "{kind}");
+        self.pending_events
+            .push(NewEvent::new(kind, format!("uplink {name} {verb}")).uplink(&name));
+        self.dirty = true;
+        self.command = Some(Active::Applying {
+            target: None,
+            since: Instant::now(),
+            step: if drain { "respond drain" } else { "respond undrain" },
+            answer: serde_json::json!({ "uplink": name, "drained": drain }),
+            reply,
+        });
+    }
+
+    /// Answers the command in progress once applied, or once it waited too
+    /// long.
+    fn check_command(&mut self) {
+        let Some(Active::Applying { target, since, .. }) = &self.command else {
+            return;
+        };
+        let applied = target.is_some_and(|t| self.applied_generation >= t);
+        if !applied && since.elapsed() < COMMAND_WAIT {
+            return;
+        }
+        let Some(Active::Applying {
+            target,
+            step,
+            answer,
+            reply,
+            ..
+        }) = self.command.take()
+        else {
+            return;
+        };
+        let answer = if applied {
+            // AS-46: a crash can be injected right before the answer.
+            let _ = crate::test_hooks::step(step);
+            let mut body = answer;
+            body["generation"] = target.unwrap_or_default().into();
+            Answer::new(StatusCode::OK, body)
+        } else {
+            Answer::new(
+                StatusCode::ACCEPTED,
+                serde_json::json!({
+                    "error": "not yet applied; PolyWAN keeps applying it",
+                    "generation": target,
+                }),
+            )
+        };
+        let _ = reply.send(answer);
+        self.next_order();
     }
 
     /// Emits the events of the step in order, then publishes the status.
@@ -1842,6 +2046,19 @@ impl Daemon {
         self.pending_events
             .push(failure_event(&f.op, f.kind, f.errno, f.extack.as_deref()));
         self.degrade("apply_failed");
+        // FR-REC-5: a command not yet applied reports the failed step.
+        if matches!(self.command, Some(Active::Applying { .. }))
+            && let Some(Active::Applying { reply, .. }) = self.command.take()
+        {
+            let _ = reply.send(Answer::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": "not applied: a step failed; PolyWAN keeps retrying",
+                    "failed_steps": [{ "operation": f.op, "kind": f.kind.as_str(), "errno": f.errno }],
+                }),
+            ));
+            self.next_order();
+        }
         if let Some((family, table)) = f.route {
             // The view follows a route mutation only when it succeeds, but
             // a failed one may still have changed the table: it is re-read
@@ -2100,6 +2317,7 @@ impl Daemon {
             }
             Done::Reload(outcome) => self.reload_validated(outcome),
             Done::ApiPrepared { seq, result } => self.api_prepared(seq, result),
+            Done::Drained { seq, result } => self.drained(seq, result),
         }
     }
 
@@ -2108,6 +2326,7 @@ impl Daemon {
         mut subscription: Subscription,
         mut probe_rx: mpsc::Receiver<probe::Report>,
         mut done_rx: mpsc::Receiver<Done>,
+        mut orders_rx: mpsc::Receiver<Order>,
     ) -> Result<()> {
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
@@ -2121,7 +2340,14 @@ impl Daemon {
                 self.dirty = false;
                 self.step().await;
                 self.status_dirty = true;
+                if let Some(Active::Applying {
+                    target: target @ None, ..
+                }) = &mut self.command
+                {
+                    *target = Some(self.desired_generation);
+                }
             }
+            self.check_command();
             if let Some(e) = self.fatal.take() {
                 bail!("{e}");
             }
@@ -2140,6 +2366,10 @@ impl Daemon {
                     Some((since, false)) => Some(since + gateway_warning()),
                     _ => None,
                 }))
+                .chain(match &self.command {
+                    Some(Active::Applying { since, .. }) => Some(*since + COMMAND_WAIT),
+                    _ => None,
+                })
                 .fold(next_full, Instant::min);
             let checkpoint_due = self.last_checkpoint + Duration::from_secs(30);
             tokio::select! {
@@ -2163,6 +2393,10 @@ impl Daemon {
                     }
                 }
                 r = probe_rx.recv() => if let Some(r) = r { self.probe_report(r) },
+                Some(o) = orders_rx.recv() => {
+                    self.orders.push_back(o);
+                    self.next_order();
+                }
                 d = done_rx.recv() => match d {
                     Some(d) => self.completion(d),
                     None => bail!("the I/O lanes stopped"),

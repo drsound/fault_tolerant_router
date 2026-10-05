@@ -74,7 +74,8 @@ impl std::error::Error for Injected {}
 /// injected error, until the file is removed or rewritten. While it holds
 /// `match:TEXT`, the steps whose name contains TEXT fail and the others
 /// proceed; `empty:TEXT` is the same, and the failure also removes the
-/// route ([`Injected::removes_route`]). Every step is appended to
+/// route ([`Injected::removes_route`]); `crash:TEXT` aborts the process at
+/// such a step. Every step is appended to
 /// `<file>.steps`, followed by ` failed` when it failed.
 #[cfg(feature = "test-hooks")]
 pub fn step(name: impl std::fmt::Display) -> Result<(), Injected> {
@@ -92,6 +93,18 @@ pub fn step(name: impl std::fmt::Display) -> Result<(), Injected> {
             removes_route,
         })
     };
+    // `crash:TEXT`: the process aborts at the first step whose name holds
+    // TEXT, after recording it (AS-46).
+    if let Some(text) = control.strip_prefix("crash:")
+        && name.contains(text)
+    {
+        let mut steps = path.clone().into_os_string();
+        steps.push(".steps");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(steps) {
+            let _ = writeln!(f, "{name} crashed");
+        }
+        std::process::abort();
+    }
     let selective = control
         .strip_prefix("match:")
         .map(|text| (text, false))

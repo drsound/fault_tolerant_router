@@ -72,6 +72,22 @@ enum Command {
         #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
         socket: PathBuf,
     },
+    /// Drain an uplink: no new connections through it (through the
+    /// control socket).
+    Drain {
+        name: String,
+        /// Drain even the last candidate of a family.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Undrain an uplink.
+    Undrain {
+        name: String,
+        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
+        socket: PathBuf,
+    },
     /// Release the persisted id binding of a removed uplink.
     ForgetUplink {
         name: String,
@@ -141,6 +157,8 @@ fn main() -> ExitCode {
             }
             Command::ForgetUplink { name, config } => forget(&config, &name, &cli.lock),
             Command::Status { json, socket } => polywan::cli::status(&socket, json).await,
+            Command::Drain { name, force, socket } => polywan::cli::drain(&socket, &name, true, force).await,
+            Command::Undrain { name, socket } => polywan::cli::drain(&socket, &name, false, false).await,
             Command::Events { follow, socket } => polywan::cli::events(&socket, follow).await,
         }
     });

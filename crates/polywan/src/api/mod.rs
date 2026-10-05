@@ -83,14 +83,53 @@ pub fn endpoints(api: &crate::config::Api) -> Result<Vec<Endpoint>, String> {
     Ok(v)
 }
 
-/// What the handlers read.
+/// What the handlers read, and the queue of the State task's commands.
 #[derive(Clone)]
 pub struct Shared {
     pub status: watch::Receiver<Arc<Status>>,
     pub ring: Arc<Mutex<Ring>>,
     pub latest: watch::Receiver<u64>,
     pub started: std::time::Instant,
+    pub orders: mpsc::Sender<Order>,
 }
+
+/// A command of the control socket (FR-API-3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Drain { uplink: String, force: bool },
+    Undrain { uplink: String },
+    Forget { uplink: String },
+    Reload,
+}
+
+/// The State task's answer to a command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    pub code: StatusCode,
+    pub body: serde_json::Value,
+}
+
+impl Answer {
+    pub fn new(code: StatusCode, body: serde_json::Value) -> Answer {
+        Answer { code, body }
+    }
+
+    pub fn error(code: StatusCode, message: impl Into<String>) -> Answer {
+        Answer::new(code, serde_json::json!({ "error": message.into() }))
+    }
+}
+
+/// A command and where its answer goes.
+pub struct Order {
+    pub action: Action,
+    pub reply: oneshot::Sender<Answer>,
+}
+
+/// Commands waiting for the State task (FR-API-4: bounded, a full queue is
+/// refused).
+pub const ORDER_QUEUE: usize = 8;
+/// Request bodies (FR-API-4).
+const BODY_BYTES: usize = 64 * 1024;
 
 /// Commands of the listener manager, which runs on the I/O runtime.
 pub enum Command {
@@ -469,9 +508,85 @@ async fn handle(req: Request<Incoming>, role: Role, shared: &Shared, deadline: &
             if req.method() != Method::POST {
                 return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
             }
-            error(StatusCode::NOT_IMPLEMENTED, "not implemented by this development build")
+            command(req, &path, shared).await
         }
         _ => error(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
+/// A write endpoint: the body is read within its bound, the command goes to
+/// the State task, the answer comes back before the deadline.
+async fn command(req: Request<Incoming>, path: &str, shared: &Shared) -> Reply {
+    use http_body_util::{BodyExt, Limited};
+
+    let body = match Limited::new(req.into_body(), BODY_BYTES).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+    };
+    let request = match parse_command(path, &body) {
+        Ok(Some(r)) => r,
+        Ok(None) => return error(StatusCode::NOT_IMPLEMENTED, "not implemented by this development build"),
+        Err((code, e)) => return error(code, &e),
+    };
+    let (reply, answer) = oneshot::channel();
+    if shared.orders.try_send(Order { action: request, reply }).is_err() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "too many commands in progress");
+    }
+    // The State task answers within the deadline; the margin leaves time
+    // for the response write.
+    match tokio::time::timeout(DEADLINE - Duration::from_secs(1), answer).await {
+        Ok(Ok(a)) => reply_json(a.code, &a.body),
+        Ok(Err(_)) => error(StatusCode::SERVICE_UNAVAILABLE, "the daemon is stopping"),
+        Err(_) => error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "no answer in time; the command may still complete",
+        ),
+    }
+}
+
+fn reply_json(code: StatusCode, body: &serde_json::Value) -> Reply {
+    reply(code, body.to_string())
+}
+
+/// The command of a control path and its body.
+fn parse_command(path: &str, body: &[u8]) -> Result<Option<Action>, (StatusCode, String)> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct DrainBody {
+        #[serde(default)]
+        force: bool,
+    }
+    let empty = body.iter().all(u8::is_ascii_whitespace);
+    let no_body = || {
+        if empty {
+            Ok(())
+        } else {
+            Err((StatusCode::BAD_REQUEST, "this endpoint takes no body".to_owned()))
+        }
+    };
+    match path {
+        "/v1/reload" => no_body().map(|()| Some(Action::Reload)),
+        "/v1/notify-test" => no_body().map(|()| None),
+        _ => {
+            let (name, action) = path
+                .strip_prefix("/v1/uplinks/")
+                .and_then(|r| r.split_once('/'))
+                .ok_or((StatusCode::NOT_FOUND, "not found".to_owned()))?;
+            let uplink = name.to_owned();
+            match action {
+                "drain" => {
+                    let b: DrainBody = if empty {
+                        DrainBody::default()
+                    } else {
+                        serde_json::from_slice(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("body: {e}")))?
+                    };
+                    Ok(Some(Action::Drain { uplink, force: b.force }))
+                }
+                "undrain" => no_body().map(|()| Some(Action::Undrain { uplink })),
+                "forget" => no_body().map(|()| Some(Action::Forget { uplink })),
+                _ => Err((StatusCode::NOT_FOUND, "not found".to_owned())),
+            }
+        }
     }
 }
 
@@ -577,6 +692,29 @@ mod tests {
         assert!(!control_only("/v1/uplinks//drain"));
         assert!(!control_only("/v1/uplinks/a/delete"));
         assert!(!control_only("/v1/status"));
+    }
+
+    #[test]
+    fn commands_are_parsed() {
+        assert_eq!(parse_command("/v1/reload", b""), Ok(Some(Action::Reload)));
+        assert_eq!(
+            parse_command("/v1/uplinks/a/drain", br#"{"force": true}"#),
+            Ok(Some(Action::Drain {
+                uplink: "a".into(),
+                force: true
+            }))
+        );
+        assert_eq!(
+            parse_command("/v1/uplinks/a/drain", b""),
+            Ok(Some(Action::Drain {
+                uplink: "a".into(),
+                force: false
+            }))
+        );
+        assert!(parse_command("/v1/uplinks/a/drain", br#"{"force": 1}"#).is_err());
+        assert!(parse_command("/v1/uplinks/a/drain", br#"{"other": true}"#).is_err());
+        assert!(parse_command("/v1/reload", b"x").is_err());
+        assert_eq!(parse_command("/v1/notify-test", b""), Ok(None));
     }
 
     #[test]

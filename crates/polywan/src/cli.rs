@@ -160,3 +160,36 @@ pub async fn events(socket: &Path, follow: bool) -> Result<()> {
         }
     }
 }
+
+/// `drain` and `undrain` (FR-API-3): complete only once applied.
+pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Result<()> {
+    if !crate::config::valid_uplink_name(name) {
+        bail!("{name:?} is not an uplink name");
+    }
+    let action = if drain { "drain" } else { "undrain" };
+    let body = (drain && force).then(|| r#"{"force": true}"#.to_owned());
+    let (status, body) = client::request(
+        socket,
+        Method::POST,
+        &format!("/v1/uplinks/{name}/{action}"),
+        body,
+        api::DEADLINE,
+    )
+    .await
+    .with_context(|| socket.display().to_string())?;
+    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+    let message = v.get("error").and_then(Value::as_str).unwrap_or("request failed");
+    if status != hyper::StatusCode::OK {
+        let steps = v
+            .get("failed_steps")
+            .map(|s| format!(" (failed steps: {s})"))
+            .unwrap_or_default();
+        bail!("{action} {name}: {status}: {message}{steps}");
+    }
+    println!(
+        "uplink {name} {}, applied in generation {}",
+        if drain { "drained" } else { "undrained" },
+        v["generation"]
+    );
+    Ok(())
+}

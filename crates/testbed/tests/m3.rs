@@ -785,3 +785,165 @@ fn api_socket_lifecycle() -> Result<()> {
     std::fs::remove_file(&status)?;
     Ok(())
 }
+
+per_family!(as16_drain_and_undrain);
+
+/// AS-16 with the drain variants of AS-29 and AS-42: draining A takes it
+/// out of new connections, balance-policy ones included, while its existing
+/// flows continue, its probes keep it up and connections bound to its
+/// address still use it; the last candidate needs `force`, after which new
+/// connections are rejected; the drain survives a restart (INV-2, INV-5,
+/// INV-6, FR-SEL-3, FR-SEL-4).
+fn as16_drain_and_undrain(fam: Family) -> Result<()> {
+    let t = build();
+    let rules = policies(&[(
+        "https-on-a",
+        fam,
+        "a",
+        "balance",
+        &format!("protocol = \"tcp\"\ndestination_port = {TCP_PORT_HTTPS}\n"),
+    )]);
+    let mut f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", &rules))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
+    let flows = start_flows(&t, fam, 30, 20)?;
+    std::thread::sleep(Duration::from_millis(500));
+    let out = f.drain("a", true, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert_eq!(
+        balancing_members(&t, fam)?,
+        ["wanb"],
+        "applied when the command returns"
+    );
+    f.wait_event(&t, "uplink_drained", "uplink a drained", 1, Duration::from_secs(5))?;
+    for port in [TCP_PORT, TCP_PORT_HTTPS] {
+        let r = t.connect_to(
+            Node::Client,
+            &servers(fam, 1, 20, port),
+            20,
+            false,
+            Duration::from_secs(2),
+        )?;
+        assert_eq!(tally(&r).get(&Some(Uplink::B)), Some(&20), "{port}: {:?}", tally(&r));
+    }
+    // AS-42: bound to A's address, a router connection still uses A.
+    let a = t.uplink_address(Uplink::A, fam)?.context("A's address")?;
+    let binding = testbed::agent::Binding {
+        source: Some(a),
+        device: None,
+    };
+    let r = t.connect_bound(
+        Node::Router,
+        &servers(fam, 1, 5, TCP_PORT),
+        5,
+        false,
+        Duration::from_secs(2),
+        &binding,
+    )?;
+    assert_eq!(tally(&r).get(&Some(Uplink::A)), Some(&5), "{:?}", tally(&r));
+    // AS-09: an inbound connection on A (port forwarding to the LAN host)
+    // is answered through A (INV-5).
+    let _server = serve_in(&t, Node::Client)?;
+    t.router().nft(&format!(
+        "table {ipk} admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" {ipk} daddr {a} tcp dport {TCP_PORT} dnat to {}\n  }}\n}}\n",
+        lan_client(fam),
+        ipk = ip(fam),
+    ))?;
+    let r = t.connect_to(
+        Node::Inet,
+        &[endpoint(&a.to_string(), TCP_PORT)],
+        3,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        r.iter().all(|c| c.outcome == Outcome::Ok),
+        "inbound on drained A: {r:?}"
+    );
+    // AS-29: A's probes keep running; it stays up while drained.
+    std::thread::sleep(Duration::from_secs(4));
+    let s = f.status()?;
+    let path_a = |s: &serde_json::Value| {
+        s["paths"]
+            .as_array()
+            .and_then(|p| p.iter().find(|p| p["uplink"] == "a"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(path_a(&s)["state"], "up", "{s}");
+    assert_eq!(s["uplinks"][0]["drained"], true, "{s}");
+    flows_on_continuous(flows, &[Uplink::A, Uplink::B])?;
+    // FR-SEL-4: the last candidate.
+    let out = f.drain("b", true, false)?;
+    assert!(
+        !out.status.success() && polywan::output_text(&out).contains("last"),
+        "{}",
+        polywan::output_text(&out)
+    );
+    assert_eq!(balancing_members(&t, fam)?, ["wanb"]);
+    let out = f.drain("b", true, true)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert!(balancing_members(&t, fam)?.is_empty());
+    assert_rejected(&t.connect_to(
+        Node::Client,
+        &servers(fam, 1, 5, TCP_PORT),
+        5,
+        false,
+        Duration::from_secs(2),
+    )?);
+    let out = f.drain("b", false, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert_eq!(balancing_members(&t, fam)?, ["wanb"]);
+    // The drain survives a restart.
+    f.stop()?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(balancing_members(&t, fam)?, ["wanb"], "still drained after the restart");
+    assert_eq!(f.status()?["uplinks"][0]["drained"], true);
+    let out = f.drain("a", false, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert_eq!(balancing_members(&t, fam)?, ["wana", "wanb"]);
+    f.stop()?;
+    Ok(())
+}
+
+/// AS-46: a crash between the persistence of a drain and its routes, and
+/// between the routes and the answer: after the restart the persisted
+/// intent is in force. A crash before the persistence leaves A undrained,
+/// and the command was never acknowledged.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as46_drain_survives_a_crash_at_each_step() -> Result<()> {
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let faults = f.dir.join("faults");
+    f.set_env("POLYWAN_TEST_FAULTS", &faults.display().to_string());
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    for (crash, drained) in [
+        ("persist drain", false),
+        ("replace ipv4 route of table 1000", true),
+        ("respond drain", true),
+    ] {
+        std::fs::write(&faults, format!("crash:{crash}"))?;
+        let out = f.drain("a", true, false)?;
+        assert!(!out.status.success(), "{crash}: never acknowledged");
+        f.wait_exit(&t, Duration::from_secs(10))?;
+        std::fs::remove_file(&faults)?;
+        f.start(&t)?;
+        f.wait_installed(&t)?;
+        std::thread::sleep(Duration::from_secs(2));
+        let expected: &[&str] = if drained { &["wanb"] } else { &["wana", "wanb"] };
+        wait_members(&t, Family::V4, expected, Duration::from_secs(10))?;
+        assert_eq!(f.status()?["uplinks"][0]["drained"], drained, "{crash}");
+        if drained {
+            let out = f.drain("a", false, false)?;
+            assert!(out.status.success(), "{}", polywan::output_text(&out));
+            wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+        }
+    }
+    f.stop()?;
+    Ok(())
+}

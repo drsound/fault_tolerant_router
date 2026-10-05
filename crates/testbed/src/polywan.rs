@@ -364,6 +364,17 @@ impl Polywan {
         })
     }
 
+    /// `polywan drain NAME [--force]` or `undrain NAME` on the control
+    /// socket.
+    pub fn drain(&self, name: &str, drain: bool, force: bool) -> Result<Output> {
+        let socket = self.control_socket().display().to_string();
+        let mut args = vec![if drain { "drain" } else { "undrain" }, name, "--socket", &socket];
+        if force {
+            args.push("--force");
+        }
+        self.cli(&args)
+    }
+
     /// Runs a CLI command with this run's configuration (`--config`).
     pub fn cli_config(&self, args: &[&str]) -> Result<Output> {
         let config = self.config.display().to_string();

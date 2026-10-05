@@ -127,6 +127,8 @@ pub enum PersistJob {
     },
     /// Restores the settings of families no longer managed (FR-REC-9).
     HandBack { seq: u64, families: Vec<Family> },
+    /// The drain intent, durably before it is applied (FR-SEL-3).
+    Drain { seq: u64, state: DrainState },
     /// A health checkpoint; only the latest waiting one is written.
     Checkpoint(Box<Checkpoint>),
     /// Logs the FR-SYS-3 warning about a missing IPv6 gateway, with the
@@ -167,6 +169,10 @@ pub enum Done {
         seq: u64,
         result: Result<(), String>,
         manifest: Manifest,
+    },
+    Drained {
+        seq: u64,
+        result: Result<(), String>,
     },
     Reload(ReloadOutcome),
     /// The API listeners of a reloaded configuration are bound (FR-API-1).
@@ -502,6 +508,12 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                 }),
                 Some(manifest),
             )
+        }
+        PersistJob::Drain { seq, state } => {
+            let result = crate::test_hooks::step("persist drain")
+                .map_err(|e| e.to_string())
+                .and_then(|()| dir.write_drain(&state).map_err(|e| e.to_string()));
+            (Some(Done::Drained { seq, result }), None)
         }
         PersistJob::Checkpoint(c) => {
             if let Err(e) = dir.write_checkpoint(&c) {

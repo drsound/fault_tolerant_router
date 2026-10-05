@@ -1092,7 +1092,7 @@ pub fn check_mailbox(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn valid_uplink_name(name: &str) -> bool {
+pub fn valid_uplink_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name
             .bytes()
