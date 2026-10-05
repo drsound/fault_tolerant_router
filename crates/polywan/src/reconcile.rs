@@ -22,7 +22,7 @@ use netlink_packet_route::RouteNetlinkMessage;
 use crate::model::{Family, UplinkId};
 use crate::netlink::msg::{self, ObservedRule};
 use crate::netlink::{Client, EEXIST, ENOENT, ESRCH, KernelError, Mutation};
-use crate::plan::{Desired, Layout, Route, Rule, RuleKind};
+use crate::plan::{Action, Desired, Layout, Route, Rule, RuleKind};
 use crate::system::System;
 
 /// One kernel or nftables operation.
@@ -160,11 +160,20 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
         .into_iter()
         .filter(|key| !d.before_nft.routes.contains_key(key))
         .collect();
-    let late: Vec<_> = late
+    // A path table that a desired rule still looks up (its path is no
+    // longer ready) loses its route at once, before the nftables step that
+    // a pass may wait for (INV-2, IMPL-4); the others go after the rules
+    // that use them.
+    let (withdrawn, late): (Vec<_>, Vec<_>) = late
         .into_iter()
         .filter(|key| !d.desired.routes.contains_key(key))
-        .collect();
-    for &(family, table) in &early {
+        .partition(|&(family, table)| {
+            d.desired
+                .rules
+                .iter()
+                .any(|r| r.family == family && r.action == Action::Lookup(table))
+        });
+    for &(family, table) in early.iter().chain(&withdrawn) {
         ops.push(Op::DeleteRoute { family, table });
     }
     let observed = observed_rules(system, d.layout, d.protocol);

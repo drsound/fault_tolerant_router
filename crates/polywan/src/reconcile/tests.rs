@@ -233,6 +233,20 @@ fn an_added_uplink_joins_the_balancing_route_after_its_assignments() {
 }
 
 #[test]
+fn a_path_no_longer_ready_loses_its_route_before_the_nftables_step() {
+    let cfg = config::parse(CONFIG).unwrap();
+    let mut s = System::default();
+    let two = plan::plan(&cfg, &input(&[1, 2]));
+    apply(&mut s, &cfg, &diff_for(&System::default(), &cfg, &two, &two, false));
+    // B's path is not ready while a transaction is pending: its rules stay,
+    // its path route goes before the step the pass may wait for.
+    let one = plan::plan(&cfg, &input(&[1]));
+    let v = rule_kinds(&diff_for(&s, &cfg, &one, &one, true));
+    assert!(position(&v, "-route 1002") < position(&v, "nft"), "{v:?}");
+    assert!(!v.iter().any(|x| x == "-1002"), "B's path rule stays: {v:?}");
+}
+
+#[test]
 fn a_removed_uplink_loses_rules_in_increasing_precedence_then_routes() {
     let cfg = config::parse(CONFIG).unwrap();
     let mut s = System::default();
