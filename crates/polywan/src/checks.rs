@@ -73,15 +73,36 @@ pub fn nftables(version_output: &str) -> Findings {
 /// executables (FR-CFG-5), the accounts, and no descriptor that hooks and
 /// sendmail would inherit (FR-HOOK-3; `inherited` comes from
 /// [`crate::subprocess::inherited_descriptors`]).
-pub fn runnable(config_path: &Path, config: &Config, inherited: &[i32]) -> Findings {
-    let mut f = trusted(config_path, config);
-    if f.errors.is_empty() {
-        f.extend(identities(config));
+pub fn runnable(config_path: &Path, config: &Config, inherited: &[i32]) -> Runnable {
+    let mut r = Runnable {
+        refused: trusted(config_path, config).errors,
+        failed: Vec::new(),
+    };
+    if r.refused.is_empty() {
+        (r.refused, r.failed) = accounts(config);
     }
-    if f.errors.is_empty() {
-        f.errors.extend(crate::subprocess::descriptor_errors(config, inherited));
+    if r.refused.is_empty() && r.failed.is_empty() {
+        r.failed = crate::subprocess::descriptor_errors(config, inherited);
     }
-    f
+    r
+}
+
+/// The errors of [`runnable`] by what resolves them (§9): `refused` only a
+/// change of the configuration or of what it names (FR-CFG-5, an absent or
+/// prohibited account), `failed` anything else (a failed account lookup,
+/// inherited descriptors).
+#[derive(Debug, Default)]
+pub struct Runnable {
+    pub refused: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl Runnable {
+    pub fn errors(self) -> Vec<String> {
+        let mut v = self.refused;
+        v.extend(self.failed);
+        v
+    }
 }
 
 /// FR-CFG-5 for the configuration file and the binaries PolyWAN runs as
@@ -119,11 +140,21 @@ pub fn executable(path: &Path, what: &str) -> Findings {
 /// §11.2: the groups of the API sockets and, with hooks, the hook user
 /// exist in the account databases.
 pub fn identities(config: &Config) -> Findings {
-    let mut f = Findings::default();
+    let (mut errors, failed) = accounts(config);
+    errors.extend(failed);
+    Findings {
+        errors,
+        warnings: Vec::new(),
+    }
+}
+
+/// [`identities`], absent or prohibited accounts apart from failed lookups.
+fn accounts(config: &Config) -> (Vec<String>, Vec<String>) {
+    let (mut refused, mut failed) = (Vec::new(), Vec::new());
     let mut group = |name: &str, key: &str| match crate::identity::group(name) {
         Ok(Some(_)) => {}
-        Ok(None) => f.errors.push(format!("{key}: group {name:?} does not exist")),
-        Err(e) => f.errors.push(format!("{key}: cannot look up group {name:?}: {e}")),
+        Ok(None) => refused.push(format!("{key}: group {name:?} does not exist")),
+        Err(e) => failed.push(format!("{key}: cannot look up group {name:?}: {e}")),
     };
     group(&config.api.group, "api.group");
     if config.api.status_socket.is_some()
@@ -133,19 +164,19 @@ pub fn identities(config: &Config) -> Findings {
     }
     if !config.notify.hooks.is_empty() {
         match crate::identity::user(&config.notify.hook_user) {
-            Ok(Some(u)) if u.uid == 0 => f.errors.push(format!(
+            Ok(Some(u)) if u.uid == 0 => refused.push(format!(
                 "notify.hook_user: {}",
                 crate::hooks::uid_zero(&config.notify.hook_user)
             )),
             Ok(Some(_)) => {}
-            Ok(None) => f.errors.push(format!(
+            Ok(None) => refused.push(format!(
                 "notify.hook_user: user {:?} does not exist",
                 config.notify.hook_user
             )),
-            Err(e) => f.errors.push(format!("notify.hook_user: cannot look up the user: {e}")),
+            Err(e) => failed.push(format!("notify.hook_user: cannot look up the user: {e}")),
         }
     }
-    f
+    (refused, failed)
 }
 
 /// FR-CFG-5 and `firewall.nft_path`: owned by root, not writable by group or

@@ -153,8 +153,8 @@ impl StateDir {
         write_json(&self.file(CHECKPOINT), c)
     }
 
-    /// `run --reset-state`: discards drain state and checkpoints, never the
-    /// manifest (IMPL-6).
+    /// `run --reset-state`: discards drain state and checkpoints; the daemon
+    /// also ignores a corrupt manifest, never a valid one (IMPL-6).
     pub fn reset(&self) -> Result<(), StateError> {
         for name in [DRAIN, CHECKPOINT] {
             let p = self.file(name);

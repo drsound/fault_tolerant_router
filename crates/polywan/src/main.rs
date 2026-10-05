@@ -32,7 +32,8 @@ enum Command {
         /// Compute and log every artifact change without applying it.
         #[arg(long)]
         dry_run: bool,
-        /// Discard the drain state and health checkpoints (never the manifest).
+        /// Discard the drain state and health checkpoints, and a corrupt or
+        /// unknown-version manifest (never a valid one).
         #[arg(long)]
         reset_state: bool,
     },
@@ -144,6 +145,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let run = matches!(cli.command, Command::Run { .. });
     let result = runtime.block_on(async {
         match cli.command {
             Command::Run {
@@ -202,7 +204,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
-            ExitCode::FAILURE
+            // §9: only `run` has a configuration status.
+            if run && e.downcast_ref::<daemon::ConfigRefused>().is_some() {
+                ExitCode::from(78)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

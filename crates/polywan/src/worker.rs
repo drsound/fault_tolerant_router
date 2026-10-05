@@ -314,9 +314,9 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
             ]);
         }
         // FR-CFG-5: nothing configured runs before its ownership is verified.
-        let runnable = checks::runnable(&path_owned, &new, &crate::subprocess::inherited_descriptors());
-        if !runnable.errors.is_empty() {
-            return Err(runnable.errors);
+        let errors = checks::runnable(&path_owned, &new, &crate::subprocess::inherited_descriptors()).errors();
+        if !errors.is_empty() {
+            return Err(errors);
         }
         let endpoints = crate::api::endpoints(&new).map_err(|e| vec![e])?;
         Ok((new, endpoints))

@@ -313,6 +313,22 @@ impl Polywan {
             .output()?)
     }
 
+    /// Runs `run --config` with more `run` options in the foreground until
+    /// it exits, killed after 30 s: a startup that must be refused, with
+    /// its exit status (§9) and diagnostics.
+    pub fn run_refused(&self, options: &[&str]) -> Result<Output> {
+        let config = self.config.display().to_string();
+        let mut run = vec!["run", "--config", &config];
+        run.extend_from_slice(options);
+        Ok(Ns::new(self.router_ns.as_str())
+            .command("timeout")
+            .args(["--signal=KILL", "30"])
+            .arg(&self.bin)
+            .args(self.args(&run))
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .output()?)
+    }
+
     /// This run's status socket ([`Polywan::write_config`]).
     pub fn status_socket(&self) -> PathBuf {
         self.dir.join("status.sock")

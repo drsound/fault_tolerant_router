@@ -44,6 +44,22 @@ pub struct Options {
     pub lock: PathBuf,
 }
 
+/// A startup refused by the configuration (§9): it cannot be read, parsed
+/// or validated, a configured path fails FR-CFG-5, a configured account is
+/// absent or prohibited, or it conflicts with the manifest's structural
+/// settings or uplink identities. `run` exits with status 78, which the
+/// unit does not restart (IMPL-10).
+#[derive(Debug)]
+pub struct ConfigRefused(pub String);
+
+impl std::fmt::Display for ConfigRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigRefused {}
+
 /// One configured path at runtime.
 struct PathRuntime {
     discovered: Option<Discovered>,
@@ -397,11 +413,17 @@ fn failure_event(op: &str, kind: FailureKind, errno: Option<i32>, extack: Option
 
 /// `run`: startup (FR-REC-1, FR-REC-8, IMPL-6) and the event loop.
 pub async fn run(opts: Options) -> Result<()> {
-    let cfg = config::load(&opts.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = config::load(&opts.config).map_err(|e| ConfigRefused(e.to_string()))?;
     // FR-CFG-5: nothing configured runs before its ownership is verified;
     // FR-HOOK-3: no subprocess may inherit a descriptor of ours.
     let inherited = crate::subprocess::inherited_descriptors();
-    report(&checks::runnable(&opts.config, &cfg, &inherited))?;
+    let runnable = checks::runnable(&opts.config, &cfg, &inherited);
+    if !runnable.refused.is_empty() {
+        return Err(ConfigRefused(runnable.refused.join("\n")).into());
+    }
+    if !runnable.failed.is_empty() {
+        bail!("{}", runnable.failed.join("\n"));
+    }
     if !inherited.is_empty() {
         warn!(
             ?inherited,
@@ -432,14 +454,21 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.reset_state && !opts.dry_run {
         state_dir.reset().context("--reset-state")?;
     }
-    let (manifest, without_manifest) = match state_dir.manifest().context("manifest")? {
+    // IMPL-6: a reset discards a corrupt or unknown-version manifest, never
+    // one that reads; the write-ahead below replaces it.
+    let manifest = match state_dir.manifest() {
+        Err(e @ state::StateError::Corrupt { .. }) if opts.reset_state && !opts.dry_run => {
+            warn!("--reset-state: unreadable manifest discarded ({e}); artifacts are adopted as without one");
+            None
+        }
+        m => m.context("manifest")?,
+    };
+    let (manifest, without_manifest) = match manifest {
         Some(m) => {
             let conflicts = m.check(&cfg);
             if !conflicts.is_empty() {
-                bail!(
-                    "{}",
-                    conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
-                );
+                let text = conflicts.iter().map(ToString::to_string).collect::<Vec<_>>();
+                return Err(ConfigRefused(text.join("\n")).into());
             }
             (m, false)
         }

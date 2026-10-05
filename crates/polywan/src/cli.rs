@@ -401,8 +401,8 @@ pub async fn notify_test_offline(path: &Path, lock: &Path) -> Result<()> {
         bail!("notify-test --offline needs root");
     }
     let cfg = load(path)?;
-    let f = crate::checks::runnable(path, &cfg, &crate::subprocess::inherited_descriptors());
-    if let Some(e) = f.errors.first() {
+    let errors = crate::checks::runnable(path, &cfg, &crate::subprocess::inherited_descriptors()).errors();
+    if let Some(e) = errors.first() {
         bail!("{e}");
     }
     let _lock = crate::state::InstanceLock::acquire(lock)
