@@ -135,14 +135,24 @@ async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pen
         },
     );
     let n = ops.len();
-    let text = nft::transaction(cfg);
-    let nft = nft_path();
-    reconcile::execute(&client, &mut system, &scope, cfg.routing.route_protocol, ops, || {
-        let (nft, text) = (nft.clone(), text.clone());
-        async move { nftctl::apply(&nft, &text).await }
-    })
-    .await
-    .unwrap_or_else(|f| panic!("{}: {}", f.op, f.error));
+    // The daemon's order: the operations up to the nftables step, the
+    // table, then the rest.
+    let mut ops = ops;
+    let after = match ops.iter().position(|o| matches!(o, reconcile::Op::ApplyNft)) {
+        Some(i) => ops.split_off(i + 1),
+        None => Vec::new(),
+    };
+    let protocol = cfg.routing.route_protocol;
+    let fail = |f: reconcile::Failure| panic!("{}: {}", f.op, f.error);
+    if reconcile::execute(&client, &mut system, &scope, protocol, ops)
+        .await
+        .unwrap_or_else(fail)
+    {
+        nftctl::apply(&nft_path(), &nft::transaction(cfg)).await.unwrap();
+        reconcile::execute(&client, &mut system, &scope, protocol, after)
+            .await
+            .unwrap_or_else(fail);
+    }
     // Settings: record baselines write-ahead, then apply.
     let diffs = sysctl::differences(&sysctl::desired(cfg), sysctl::read).unwrap();
     sysctl::record(manifest, &diffs);

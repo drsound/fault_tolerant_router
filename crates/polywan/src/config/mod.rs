@@ -146,7 +146,7 @@ impl Quality {
 }
 
 /// A probe target (FR-PROBE-2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Target {
     Icmp(IpAddr),
     Tcp(SocketAddr),

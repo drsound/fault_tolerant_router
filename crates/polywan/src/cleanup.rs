@@ -68,7 +68,8 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
         },
     );
     let n = ops.len();
-    reconcile::execute(&client, &mut system, &scope, protocol, ops, || async { Ok(()) })
+    // Without a pending table there is no nftables step (FR-REC-9).
+    reconcile::execute(&client, &mut system, &scope, protocol, ops)
         .await
         .map_err(|f| anyhow!("{}: {}", f.op, f.error))?;
     info!(operations = n, "removed PolyWAN's rules and routes");

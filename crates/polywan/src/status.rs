@@ -23,21 +23,6 @@ pub struct Status {
     pub paths: Vec<PathStatus>,
     /// The active set of each managed family, by uplink name.
     pub active: BTreeMap<&'static str, Vec<String>>,
-    /// For the metrics only (FR-MET-2).
-    #[serde(skip)]
-    pub counters: Counters,
-}
-
-/// The totals of FR-MET-2 that the State task keeps.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Counters {
-    /// Health transitions by uplink, family and new state.
-    pub transitions: BTreeMap<(String, &'static str, &'static str), u64>,
-    /// Probe samples by uplink, family, target and result (`ok`, `lost`).
-    pub probe_samples: BTreeMap<(String, &'static str, String, &'static str), u64>,
-    pub repairs: Vec<(&'static str, u64)>,
-    pub apply_failures: Vec<(&'static str, u64)>,
-    pub events_dropped: Vec<(&'static str, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

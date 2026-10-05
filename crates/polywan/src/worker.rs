@@ -39,7 +39,13 @@ impl Io {
         let (handle_tx, handle_rx) = std::sync::mpsc::channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let thread = std::thread::Builder::new().name("polywan-io".into()).spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            // The blocking pool's threads outlive the 30 s between health
+            // checkpoints instead of being started for each one.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .thread_keep_alive(std::time::Duration::from_secs(60))
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = handle_tx.send(Err(e));
@@ -102,7 +108,7 @@ pub enum NftJob {
     Apply {
         seq: u64,
         nft: PathBuf,
-        transaction: String,
+        transaction: Arc<str>,
     },
     /// Lists PolyWAN's table and the flowtables (FR-REC-6, FR-CT-2).
     Inspect { seq: u64, nft: PathBuf },
@@ -400,18 +406,19 @@ async fn persist_lane(
             },
         };
         let dir2 = dir.clone();
+        // A copy: a job that panics leaves the lane's manifest as it was.
         let m = manifest.clone();
         let run = tokio::task::spawn_blocking(move || persist(job, &dir2, m)).await;
-        let (report, m) = match run {
-            Ok(r) => r,
+        let report = match run {
+            Ok((report, m)) => {
+                manifest = m;
+                report
+            }
             Err(e) => {
                 warn!("persistence job failed: {e}");
                 continue;
             }
         };
-        if let Some(m) = m {
-            manifest = m;
-        }
         if let Some(report) = report
             && done.send(report).await.is_err()
         {
@@ -420,9 +427,9 @@ async fn persist_lane(
     }
 }
 
-/// Runs one job on the blocking pool; returns its report and the lane's new
-/// manifest, if the job changed it.
-fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<Done>, Option<Manifest>) {
+/// Runs one job on the blocking pool; returns its report and the lane's
+/// manifest, changed or not.
+fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<Done>, Manifest) {
     crate::test_hooks::slow_persistence();
     match job {
         PersistJob::Sysctls {
@@ -439,7 +446,7 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                     result,
                     manifest: manifest.clone(),
                 }),
-                Some(manifest),
+                manifest,
             )
         }
         PersistJob::Bind { seq, config, drain } => {
@@ -451,7 +458,7 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                         result: Err(conflicts),
                         manifest: manifest.clone(),
                     }),
-                    None,
+                    manifest,
                 );
             }
             let mut bound = manifest.clone();
@@ -461,9 +468,9 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                     Some(Done::Bound {
                         seq,
                         result: Err(vec![e.to_string()]),
-                        manifest,
+                        manifest: manifest.clone(),
                     }),
-                    None,
+                    manifest,
                 );
             }
             // The bindings are recorded (write-ahead) whatever follows.
@@ -477,7 +484,7 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                     result,
                     manifest: bound.clone(),
                 }),
-                Some(bound),
+                bound,
             )
         }
         PersistJob::HandBack { seq, families } => {
@@ -511,14 +518,14 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                     result,
                     manifest: manifest.clone(),
                 }),
-                Some(manifest),
+                manifest,
             )
         }
         PersistJob::Drain { seq, state } => {
             let result = crate::test_hooks::step("persist drain")
                 .map_err(|e| e.to_string())
                 .and_then(|()| dir.write_drain(&state).map_err(|e| e.to_string()));
-            (Some(Done::Drained { seq, result }), None)
+            (Some(Done::Drained { seq, result }), manifest)
         }
         PersistJob::Forget { seq, uplink } => {
             let mut released = manifest.clone();
@@ -527,19 +534,21 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                     .map(|()| id.get())
                     .map_err(|e| e.to_string())
             });
-            let changed = result.is_ok();
+            if result.is_ok() {
+                manifest = released;
+            }
             let report = Done::Forgotten {
                 seq,
                 result,
-                manifest: if changed { released.clone() } else { manifest },
+                manifest: manifest.clone(),
             };
-            (Some(report), changed.then_some(released))
+            (Some(report), manifest)
         }
         PersistJob::Checkpoint(c) => {
             if let Err(e) = dir.write_checkpoint(&c) {
                 warn!("health checkpoint: {e}");
             }
-            (None, None)
+            (None, manifest)
         }
         PersistJob::GatewayWarning {
             uplink,
@@ -551,7 +560,7 @@ fn persist(job: PersistJob, dir: &StateDir, mut manifest: Manifest) -> (Option<D
                 "no IPv6 default route discovered on {interface} {delay} after startup or after its link came up: {}; a static gateway avoids depending on Router Advertisements (FR-SYS-3)",
                 checks::gateway_causes(&interface, sysctl::read)
             );
-            (None, None)
+            (None, manifest)
         }
     }
 }

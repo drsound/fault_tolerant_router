@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -179,7 +179,7 @@ type SysctlJob = (Vec<sysctl::Setting>, bool);
 /// The nftables transaction being applied by the nftables lane (IMPL-4).
 struct NftFlight {
     seq: u64,
-    transaction: String,
+    transaction: Arc<str>,
     configured: BTreeSet<Assignment>,
     /// The operations of the pass that started it, for the retry of a
     /// failure (FR-REC-5).
@@ -240,9 +240,7 @@ struct Daemon {
     desired_generation: u64,
     applied_generation: u64,
     /// What the desired generation was computed from.
-    last_desired: Option<(plan::Desired, String, String)>,
-    /// Failed steps by kind, since startup.
-    apply_failures: BTreeMap<FailureKind, u64>,
+    last_desired: Option<(plan::Desired, Arc<str>, String)>,
     bus: Bus,
     /// Events of the current step, emitted in order once it ends.
     pending_events: Vec<NewEvent>,
@@ -252,15 +250,10 @@ struct Daemon {
     /// Kinds of artifacts a third party removed, reported as repaired once
     /// a pass leaves nothing to do (FR-COEX-3).
     repairs: BTreeSet<&'static str>,
-    repairs_total: BTreeMap<&'static str, u64>,
-    /// Health transitions and probe samples (FR-MET-2), by uplink name.
-    transitions_total: BTreeMap<(String, &'static str, &'static str), u64>,
-    probe_samples_total: BTreeMap<(String, &'static str, String, &'static str), u64>,
+    /// The totals of FR-MET-2, shared with the metrics' scrape.
+    totals: Arc<Mutex<crate::metrics::Totals>>,
     /// The API listener manager; none in a dry run.
     api: Option<crate::api::Api>,
-    /// A command was answered inside a reload's end: the next one starts
-    /// once the reload state is clear.
-    pending_answer: bool,
     /// The notification settings the notifiers follow (reloads change them).
     notify_config: watch::Sender<Arc<config::Notify>>,
     /// The email notifier's requests (the flush at shutdown).
@@ -280,8 +273,10 @@ struct Daemon {
     active: BTreeMap<Family, BTreeSet<UplinkId>>,
     drained: BTreeSet<UplinkId>,
     route_failed: BTreeMap<PathKey, String>,
+    /// The transaction of the configuration (a function of it alone).
+    nft_transaction: Arc<str>,
     /// The transaction last applied and the assignments it holds.
-    nft_applied: Option<(String, BTreeSet<Assignment>)>,
+    nft_applied: Option<(Arc<str>, BTreeSet<Assignment>)>,
     nft_listing: Option<serde_json::Value>,
     nft_missing: bool,
     /// Configured paths that PolyWAN's table found at startup already assigns
@@ -333,6 +328,14 @@ const RESYNC_AFTER_INTERRUPTED: Duration = Duration::from_secs(1);
 
 fn now_ms() -> u64 {
     state::boottime_ms().unwrap_or(0)
+}
+
+/// The scope a desired setting is applied in.
+fn sysctl_scope(s: &sysctl::Setting) -> SysctlScope {
+    match &s.interface {
+        Some(i) => SysctlScope::Interface(i.clone()),
+        None => SysctlScope::Global,
+    }
 }
 
 fn state_name(s: health::State) -> &'static str {
@@ -499,6 +502,8 @@ pub async fn run(opts: Options) -> Result<()> {
     }
     let io = Io::start().context("starting the I/O thread")?;
     let (lanes, done_rx) = Lanes::start(&io, state_dir.clone(), manifest.clone());
+    // The notifiers and the API run on the I/O runtime too.
+    let io_handle = io.handle().clone();
     let mut d = Daemon {
         config_path: opts.config.clone(),
         io: Some(io),
@@ -517,22 +522,18 @@ pub async fn run(opts: Options) -> Result<()> {
         desired_generation: 0,
         applied_generation: 0,
         last_desired: None,
-        apply_failures: BTreeMap::new(),
         bus: Bus::new(events::instance_id()),
         pending_events: Vec::new(),
         status: watch::channel(Arc::new(Status::default())).0,
         status_dirty: true,
         started: std::time::SystemTime::now(),
         repairs: BTreeSet::new(),
-        repairs_total: BTreeMap::new(),
-        transitions_total: BTreeMap::new(),
-        probe_samples_total: BTreeMap::new(),
+        totals: Arc::default(),
         api: None,
         notify_config: watch::channel(Arc::new(cfg.notify.clone())).0,
         mail: None,
         orders: VecDeque::new(),
         command: None,
-        pending_answer: false,
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -546,6 +547,7 @@ pub async fn run(opts: Options) -> Result<()> {
         active: BTreeMap::new(),
         drained,
         route_failed: BTreeMap::new(),
+        nft_transaction: nft::transaction(&cfg).into(),
         nft_applied: None,
         nft_listing: None,
         nft_missing: false,
@@ -575,16 +577,13 @@ pub async fn run(opts: Options) -> Result<()> {
     let endpoints = crate::api::endpoints(&d.cfg).map_err(|e| anyhow::anyhow!("api: {e}"))?;
     let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
     let runtime_dir = opts.lock.parent().unwrap_or(Path::new("/run/polywan")).to_owned();
-    let Some(io) = d.io.as_ref() else {
-        bail!("the I/O thread is not running");
-    };
     // FR-HOOK-4: the hooks read their own bounded queue of the bus.
     let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE, usize::MAX);
     // FR-MET-2: failed notifications, counted by the notifiers.
     let failures = Arc::new(crate::metrics::Failures::default());
     // FR-HOOK-3: one concurrency limit for hooks and their tests.
     let hook_slots = Arc::new(tokio::sync::Semaphore::new(crate::hooks::CONCURRENCY));
-    io.handle().spawn(crate::hooks::notifier(
+    io_handle.spawn(crate::hooks::notifier(
         hook_events,
         d.notify_config.subscribe(),
         Arc::clone(&hook_slots),
@@ -595,9 +594,10 @@ pub async fn run(opts: Options) -> Result<()> {
         .bus
         .add_notifier("email", crate::mail::QUEUE, crate::mail::QUEUE_BYTES);
     d.bus.select("email", Some(email_selection(&d.cfg)));
+    d.totals().events_dropped = d.bus.dropped();
     // A flush and a test at most (tests run one at a time).
     let (mail, mail_requests) = mpsc::channel(2);
-    io.handle().spawn(crate::mail::notifier(
+    io_handle.spawn(crate::mail::notifier(
         mail_events,
         d.notify_config.subscribe(),
         mail_requests,
@@ -618,9 +618,10 @@ pub async fn run(opts: Options) -> Result<()> {
             crate::test_hooks::mail_times(crate::mail::Times::default()),
         )),
         failures,
+        totals: Arc::clone(&d.totals),
     };
     d.mail = Some(mail);
-    let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
+    let api = crate::api::Api::start(&io_handle, endpoints, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
     d.api = Some(api);
@@ -1154,27 +1155,19 @@ impl Daemon {
                 let Some(health) = self.cfg.uplink(r.path.uplink).map(|u| &u.health) else {
                     return;
                 };
-                let (quality, capacity, min_samples) = (
-                    health.quality.clone(),
-                    usize::from(health.quality_window),
-                    health.quality_min_samples,
-                );
                 self.status_dirty = true;
-                if let Some(u) = self.cfg.uplink(r.path.uplink) {
+                {
+                    let mut totals = self.totals();
                     for sample in &r.samples {
                         let result = if sample.rtt.is_some() { "ok" } else { "lost" };
-                        let key = (u.name.clone(), r.path.family.key(), sample.target.to_string(), result);
-                        *self.probe_samples_total.entry(key).or_default() += 1;
+                        let key = (r.path.uplink, r.path.family, sample.target, result);
+                        crate::metrics::Totals::count(&mut totals.probe_samples, key);
                     }
                 }
                 let p = self.paths.get_mut(&r.path).expect("checked above");
-                p.window.push(r.samples, capacity);
+                p.window.push(r.samples, usize::from(health.quality_window));
                 p.stats = p.window.stats();
-                let violations = if quality.enabled() {
-                    quality::violations(&p.stats, &quality, min_samples)
-                } else {
-                    Vec::new()
-                };
+                let violations = quality::violations(&p.stats, &health.quality, health.quality_min_samples);
                 if violations.is_empty() == p.violating {
                     p.violating = !violations.is_empty();
                     let list: Vec<String> = violations.iter().map(ToString::to_string).collect();
@@ -1191,11 +1184,7 @@ impl Daemon {
                 };
                 debug!(uplink = r.path.uplink.get(), family = %r.path.family, passed = r.passed, reachable = r.reachable, loss = ?p.stats.loss, rtt = ?p.stats.rtt, jitter = ?p.stats.jitter, "probe round");
                 if let Some(t) = p.machine.round(round, h) {
-                    p.since_ms = now_ms();
-                    info!(uplink = r.path.uplink.get(), family = %r.path.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
-                    if let Some(u) = self.cfg.uplink(r.path.uplink) {
-                        self.pending_events.push(path_event(&u.name, r.path.family, t));
-                    }
+                    self.transitioned(r.path, t);
                     self.dirty = true;
                     self.write_checkpoint();
                 }
@@ -1370,13 +1359,10 @@ impl Daemon {
     }
 
     fn forgotten(&mut self, seq: u64, result: std::result::Result<u8, String>) {
-        let Some(Active::Forgetting { seq: s, .. }) = &self.command else {
-            return;
-        };
-        if *s != seq {
-            return;
-        }
-        let Some(Active::Forgetting { uplink, reply, .. }) = self.command.take() else {
+        let Some(Active::Forgetting { uplink, reply, .. }) = self
+            .command
+            .take_if(|c| matches!(c, Active::Forgetting { seq: s, .. } if *s == seq))
+        else {
             return;
         };
         let answer = match result {
@@ -1393,15 +1379,11 @@ impl Daemon {
     /// The drain intent is durable: it applies now, and the command waits
     /// for the applied generation that includes it.
     fn drained(&mut self, seq: u64, result: std::result::Result<(), String>) {
-        let Some(Active::Persisting { seq: s, .. }) = &self.command else {
-            return;
-        };
-        if *s != seq {
-            return;
-        }
         let Some(Active::Persisting {
             uplink, drain, reply, ..
-        }) = self.command.take()
+        }) = self
+            .command
+            .take_if(|c| matches!(c, Active::Persisting { seq: s, .. } if *s == seq))
         else {
             return;
         };
@@ -1473,20 +1455,29 @@ impl Daemon {
         self.next_order();
     }
 
+    /// A health transition of a path: its since, the log line, the event and
+    /// its total (FR-MET-2).
+    fn transitioned(&mut self, key: PathKey, t: health::Transition) {
+        if let Some(p) = self.paths.get_mut(&key) {
+            p.since_ms = now_ms();
+        }
+        info!(uplink = key.uplink.get(), family = %key.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
+        crate::metrics::Totals::count(
+            &mut self.totals().transitions,
+            (key.uplink, key.family, state_name(t.to)),
+        );
+        if let Some(u) = self.cfg.uplink(key.uplink) {
+            self.pending_events.push(path_event(&u.name, key.family, t));
+        }
+    }
+
     /// Emits the events of the step in order, then publishes the status.
     fn flush_events(&mut self) {
-        for e in std::mem::take(&mut self.pending_events) {
-            if e.kind == "path_state_changed"
-                && let (Some(uplink), Some(family)) = (&e.uplink, e.family)
-            {
-                let to = if e.new.as_ref().and_then(|v| v.as_str()) == Some("up") {
-                    "up"
-                } else {
-                    "down"
-                };
-                *self.transitions_total.entry((uplink.clone(), family, to)).or_default() += 1;
+        if !self.pending_events.is_empty() {
+            for e in std::mem::take(&mut self.pending_events) {
+                self.bus.emit(e);
             }
-            self.bus.emit(e);
+            self.totals().events_dropped = self.bus.dropped();
             self.status_dirty = true;
         }
         if std::mem::take(&mut self.status_dirty) {
@@ -1555,22 +1546,12 @@ impl Daemon {
                 })
                 .collect(),
             active,
-            counters: status::Counters {
-                transitions: self.transitions_total.clone(),
-                probe_samples: self.probe_samples_total.clone(),
-                repairs: self.repairs_total.iter().map(|(k, n)| (*k, *n)).collect(),
-                apply_failures: [
-                    FailureKind::Route,
-                    FailureKind::Rule,
-                    FailureKind::Nftables,
-                    FailureKind::Sysctl,
-                ]
-                .into_iter()
-                .map(|k| (k.as_str(), self.apply_failures.get(&k).copied().unwrap_or(0)))
-                .collect(),
-                events_dropped: self.bus.dropped(),
-            },
         }
+    }
+
+    /// The totals, held briefly: a scrape only reads them.
+    fn totals(&self) -> std::sync::MutexGuard<'_, crate::metrics::Totals> {
+        self.totals.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A lane is gone (FR-REC-7).
@@ -1681,13 +1662,7 @@ impl Daemon {
                 }
             }
             let reason = d.ready.as_ref().err().copied().unwrap_or(Reason::Startup);
-            if let Some(t) = p.machine.set_ready(d.ready.is_ok(), reason) {
-                p.since_ms = now_ms();
-                info!(uplink = key.uplink.get(), family = %key.family, from = ?t.from, to = ?t.to, reason = %t.reason, "path state changed");
-                if let Some(u) = self.cfg.uplink(key.uplink) {
-                    self.pending_events.push(path_event(&u.name, key.family, t));
-                }
-            }
+            let transition = p.machine.set_ready(d.ready.is_ok(), reason);
             p.discovered = Some(raw);
             input.paths.insert(
                 key,
@@ -1698,6 +1673,9 @@ impl Daemon {
                     drained: self.drained.contains(&key.uplink),
                 },
             );
+            if let Some(t) = transition {
+                self.transitioned(key, t);
+            }
         }
         self.prune_paths(|k| input.paths.contains_key(k));
         self.manage_probers();
@@ -1822,7 +1800,7 @@ impl Daemon {
         let Some((applied, true)) = self.sysctls_applied.get(scope) else {
             return true;
         };
-        let wanted = self.wanted_sysctls().remove(scope).map(|j| j.0).unwrap_or_default();
+        let wanted = self.wanted_sysctls_of(scope).map(|j| j.0).unwrap_or_default();
         !wanted
             .iter()
             .filter(|s| family.is_none() || s.family.is_none() || s.family == family)
@@ -1838,13 +1816,26 @@ impl Daemon {
             .map(|s| (s, (Vec::new(), manage)))
             .collect();
         for s in sysctl::desired(&self.cfg) {
-            let scope = match &s.interface {
-                Some(i) => SysctlScope::Interface(i.clone()),
-                None => SysctlScope::Global,
-            };
-            m.entry(scope).or_insert_with(|| (Vec::new(), manage)).0.push(s);
+            m.entry(sysctl_scope(&s))
+                .or_insert_with(|| (Vec::new(), manage))
+                .0
+                .push(s);
         }
         m
+    }
+
+    /// The entry of `scope` in [`Self::wanted_sysctls`], without building
+    /// the others.
+    fn wanted_sysctls_of(&self, scope: &SysctlScope) -> Option<SysctlJob> {
+        let interface = match scope {
+            SysctlScope::Global => None,
+            SysctlScope::Interface(i) => Some(i.as_str()),
+        };
+        let settings: Vec<sysctl::Setting> = sysctl::desired(&self.cfg)
+            .into_iter()
+            .filter(|s| s.interface.as_deref() == interface)
+            .collect();
+        (*scope == SysctlScope::Global || !settings.is_empty()).then_some((settings, self.cfg.routing.manage_sysctls))
     }
 
     /// Every scope of the desired settings: the global ones, then each
@@ -1881,7 +1872,7 @@ impl Daemon {
                 SysctlScope::Global if !global => continue,
                 _ => {}
             }
-            let wanted = self.wanted_sysctls().remove(&scope).unwrap_or_default();
+            let wanted = self.wanted_sysctls_of(&scope).unwrap_or_default();
             let seq = self.next_seq();
             let job = PersistJob::Sysctls {
                 seq,
@@ -1922,7 +1913,7 @@ impl Daemon {
             (Err(e), SysctlScope::Interface(i)) => {
                 let i = i.clone();
                 self.sysctls_applied.remove(&scope);
-                *self.apply_failures.entry(FailureKind::Sysctl).or_default() += 1;
+                crate::metrics::Totals::count(&mut self.totals().apply_failures, FailureKind::Sysctl);
                 error!(interface = %i, kind = "sysctl", "apply_failed: set sysctls: {e}");
                 self.pending_events.push(failure_event(
                     &format!("set sysctls of {i}"),
@@ -1991,7 +1982,7 @@ impl Daemon {
         }
         let input = self.evaluate();
         let managed = self.cfg.firewall.mode == FirewallMode::Managed;
-        let transaction = nft::transaction(&self.cfg);
+        let transaction = Arc::clone(&self.nft_transaction);
         let configured = self.assignments();
         let nft_pending =
             managed && (self.nft_missing || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
@@ -2004,10 +1995,13 @@ impl Daemon {
             BTreeSet::new()
         };
         let desired = plan::plan(&self.cfg, &input);
-        let key = (desired.clone(), transaction.clone(), self.cfg.digest.clone());
-        if self.last_desired.as_ref() != Some(&key) {
+        if self
+            .last_desired
+            .as_ref()
+            .is_none_or(|(d, t, digest)| *d != desired || *t != transaction || *digest != self.cfg.digest)
+        {
             self.desired_generation += 1;
-            self.last_desired = Some(key);
+            self.last_desired = Some((desired.clone(), Arc::clone(&transaction), self.cfg.digest.clone()));
         }
         let before = (!new_paths.is_empty()).then(|| plan::plan(&self.cfg, &plan::without(&input, &new_paths)));
         let families: Vec<Family> = Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)).collect();
@@ -2081,7 +2075,7 @@ impl Daemon {
                 self.applied_generation = self.desired_generation;
             }
             for kind in std::mem::take(&mut self.repairs) {
-                *self.repairs_total.entry(kind).or_default() += 1;
+                crate::metrics::Totals::count(&mut self.totals().repairs, kind);
                 self.pending_events.push(
                     NewEvent::new(
                         "artifact_repaired",
@@ -2104,8 +2098,7 @@ impl Daemon {
             debug!("{op}");
         }
         let count = ops.len();
-        let result =
-            reconcile::execute_until_nft(&self.client, &mut self.system, &self.scope, self.protocol, ops).await;
+        let result = reconcile::execute(&self.client, &mut self.system, &self.scope, self.protocol, ops).await;
         match result {
             Ok(nft_due) => {
                 if nft_due {
@@ -2116,7 +2109,7 @@ impl Daemon {
                     let job = NftJob::Apply {
                         seq,
                         nft: self.cfg.firewall.nft_path.clone(),
-                        transaction: transaction.clone(),
+                        transaction: Arc::clone(&transaction),
                     };
                     match self.lanes.nft(job) {
                         Ok(()) => {
@@ -2188,16 +2181,13 @@ impl Daemon {
 
     /// FR-REC-5: report, count, retry with exponential backoff (1 s to 60 s).
     fn failed(&mut self, f: Failure, attempt: String) {
-        let count = self.apply_failures.entry(f.kind).or_default();
-        *count += 1;
-        error!(operation = %f.op, kind = f.kind.as_str(), errno = ?f.errno, extack = ?f.extack, failures = *count, "apply_failed: {}", f.error);
+        let count = crate::metrics::Totals::count(&mut self.totals().apply_failures, f.kind);
+        error!(operation = %f.op, kind = f.kind.as_str(), errno = ?f.errno, extack = ?f.extack, failures = count, "apply_failed: {}", f.error);
         self.pending_events
             .push(failure_event(&f.op, f.kind, f.errno, f.extack.as_deref()));
         self.degrade("apply_failed");
         // FR-REC-5: a command not yet applied reports the failed step.
-        if matches!(self.command, Some(Active::Applying { .. }))
-            && let Some(Active::Applying { reply, .. }) = self.command.take()
-        {
+        if let Some(Active::Applying { reply, .. }) = self.command.take_if(|c| matches!(c, Active::Applying { .. })) {
             let _ = reply.send(Answer::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 serde_json::json!({
@@ -2297,9 +2287,9 @@ impl Daemon {
         }
         // A reload requested through the control socket gets the
         // diagnostics (FR-API-3, IMPL-11), unless another reload follows.
+        let mut answered = false;
         if !self.reload_again
-            && matches!(self.command, Some(Active::Reloading { .. }))
-            && let Some(Active::Reloading { reply }) = self.command.take()
+            && let Some(Active::Reloading { reply }) = self.command.take_if(|c| matches!(c, Active::Reloading { .. }))
         {
             let _ = reply.send(Answer::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2308,7 +2298,7 @@ impl Daemon {
                     "errors": errors,
                 }),
             ));
-            self.pending_answer = true;
+            answered = true;
         }
         // Diagnostics stay in the log (FR-API-2, IMPL-11).
         self.pending_events.push(NewEvent::new(
@@ -2316,15 +2306,16 @@ impl Daemon {
             "the configuration was not reloaded; the running configuration is kept",
         ));
         self.end_reload();
+        // The next command starts once the reload state is clear.
+        if answered {
+            self.next_order();
+        }
     }
 
     fn end_reload(&mut self) {
         self.reload = None;
         if std::mem::take(&mut self.reload_again) {
             self.start_reload();
-        }
-        if std::mem::take(&mut self.pending_answer) {
-            self.next_order();
         }
     }
 
@@ -2353,10 +2344,10 @@ impl Daemon {
 
     /// The API listeners are prepared: the manifest binding follows.
     fn api_prepared(&mut self, seq: u64, result: std::result::Result<(), String>) {
-        if !matches!(self.reload, Some(ReloadPhase::Preparing { seq: s, .. }) if s == seq) {
-            return;
-        }
-        let Some(ReloadPhase::Preparing { config: new, .. }) = self.reload.take() else {
+        let Some(ReloadPhase::Preparing { config: new, .. }) = self
+            .reload
+            .take_if(|r| matches!(r, ReloadPhase::Preparing { seq: s, .. } if *s == seq))
+        else {
             return;
         };
         if let Err(e) = result {
@@ -2402,13 +2393,10 @@ impl Daemon {
 
     /// The manifest and the drain intent are written: the reload commits.
     fn reload_bound(&mut self, seq: u64, result: std::result::Result<(), Vec<String>>) {
-        let Some(ReloadPhase::Binding { seq: s, .. }) = &self.reload else {
-            return;
-        };
-        if *s != seq {
-            return;
-        }
-        let Some(ReloadPhase::Binding { config, drained, .. }) = self.reload.take() else {
+        let Some(ReloadPhase::Binding { config, drained, .. }) = self
+            .reload
+            .take_if(|r| matches!(r, ReloadPhase::Binding { seq: s, .. } if *s == seq))
+        else {
             return;
         };
         if let Err(errors) = result {
@@ -2419,13 +2407,12 @@ impl Daemon {
         let new = Arc::unwrap_or_clone(config);
         self.drained = drained;
         self.cfg = new;
-        // The metrics keep the totals of configured uplinks only.
-        let names: BTreeSet<String> = self.cfg.uplinks.iter().map(|u| u.name.clone()).collect();
-        self.transitions_total.retain(|k, _| names.contains(&k.0));
-        self.probe_samples_total.retain(|k, _| names.contains(&k.0));
+        self.nft_transaction = nft::transaction(&self.cfg).into();
         // Paths exist only for configured uplinks: those of removed uplinks
-        // go at once, with their probers.
+        // go at once, with their probers, and so do their metrics' totals
+        // (an id names one uplink until it is forgotten, FR-MARK-4).
         let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();
+        self.totals().retain_uplinks(|id| configured.contains(&id));
         self.prune_paths(|k| configured.contains(&k.uplink));
         self.scope.discovery_tables = self.cfg.routing.discovery_tables.clone();
         // The settings of removed uplinks' interfaces are no longer PolyWAN's
@@ -2457,8 +2444,7 @@ impl Daemon {
             .push(NewEvent::new("config_reloaded", "the configuration was reloaded"));
         // Committed: the API's reload completes when applied.
         if !self.reload_again
-            && matches!(self.command, Some(Active::Reloading { .. }))
-            && let Some(Active::Reloading { reply }) = self.command.take()
+            && let Some(Active::Reloading { reply }) = self.command.take_if(|c| matches!(c, Active::Reloading { .. }))
         {
             self.command = Some(Active::Applying {
                 target: None,

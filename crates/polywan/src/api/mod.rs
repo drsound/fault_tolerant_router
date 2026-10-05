@@ -138,6 +138,8 @@ pub struct Shared {
     pub tester: Arc<crate::notifytest::Tester>,
     /// The notifiers' failures, for the metrics (FR-MET-2).
     pub failures: Arc<crate::metrics::Failures>,
+    /// The State task's totals, for the metrics (FR-MET-2).
+    pub totals: Arc<std::sync::Mutex<crate::metrics::Totals>>,
 }
 
 /// A command of the control socket (FR-API-3).
@@ -779,7 +781,10 @@ fn parse_body(route: &Route, body: &[u8]) -> Result<bool, String> {
 /// `GET /metrics` (FR-MET-2), in the Prometheus text format.
 fn metrics(shared: &Shared) -> Reply {
     let s = Arc::clone(&shared.status.borrow());
-    let mut r = reply(StatusCode::OK, crate::metrics::render(&s, &shared.failures));
+    let mut r = reply(
+        StatusCode::OK,
+        crate::metrics::render(&s, &shared.totals, &shared.failures),
+    );
     r.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),

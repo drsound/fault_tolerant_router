@@ -260,61 +260,19 @@ impl Failure {
 }
 
 /// Executes operations in order, stopping at the first failure: later
-/// operations may depend on it (FR-REC-5). Successful netlink mutations are
-/// applied to the view at once; their notifications are idempotent.
-pub async fn execute<F, Fut>(
-    client: &Client,
-    system: &mut System,
-    scope: &crate::system::Scope,
-    protocol: u8,
-    ops: Vec<Op>,
-    nft: F,
-) -> Result<usize, Failure>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
-    run(client, system, scope, protocol, ops, Some(nft))
-        .await
-        .map(|(done, _)| done)
-}
-
-/// Like [`execute`], but stops at the nftables step, whose test hook has
-/// passed: the caller applies the table outside the State task (IMPL-4) and
-/// runs the operations that follow it once the application succeeded.
-/// Returns whether the nftables step was reached.
-pub async fn execute_until_nft(
+/// operations may depend on it (FR-REC-5). It stops at the nftables step
+/// too, once its test hook has passed: the caller applies the table outside
+/// the State task (IMPL-4) and runs the operations that follow it once the
+/// application succeeded. Returns whether the nftables step was reached.
+/// Successful netlink mutations are applied to the view at once; their
+/// notifications are idempotent.
+pub async fn execute(
     client: &Client,
     system: &mut System,
     scope: &crate::system::Scope,
     protocol: u8,
     ops: Vec<Op>,
 ) -> Result<bool, Failure> {
-    run(
-        client,
-        system,
-        scope,
-        protocol,
-        ops,
-        None::<fn() -> std::future::Ready<Result<(), String>>>,
-    )
-    .await
-    .map(|(_, nft_due)| nft_due)
-}
-
-async fn run<F, Fut>(
-    client: &Client,
-    system: &mut System,
-    scope: &crate::system::Scope,
-    protocol: u8,
-    ops: Vec<Op>,
-    mut nft: Option<F>,
-) -> Result<(usize, bool), Failure>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
-    let mut done = 0;
     for op in ops {
         let kind = match &op {
             Op::ReplaceRoute(_) | Op::DeleteRoute { .. } => FailureKind::Route,
@@ -349,10 +307,7 @@ where
             return Err(fail(e.message));
         }
         match &op {
-            Op::ApplyNft => match nft.as_mut() {
-                Some(nft) => nft().await.map_err(fail)?,
-                None => return Ok((done, true)),
-            },
+            Op::ApplyNft => return Ok(true),
             _ => {
                 let (message, kind, tolerated) = netlink_op(&op, protocol);
                 match client.mutate(message.clone(), kind).await {
@@ -369,9 +324,8 @@ where
                 system.apply(scope, &message);
             }
         }
-        done += 1;
     }
-    Ok((done, false))
+    Ok(false)
 }
 
 /// The message of an operation, its flags and the errnos that mean the
