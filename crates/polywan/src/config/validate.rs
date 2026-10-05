@@ -1012,12 +1012,8 @@ fn api(cx: &mut Ctx, raw: Option<Spanned<raw::Api>>) -> Api {
 /// terminating NUL.
 const SUN_PATH_MAX: usize = 107;
 
-/// What the listener setup adds to a socket's directory while it prepares
-/// the socket (FR-API-1: no transiently permissive socket).
-pub const SOCKET_STAGING: &str = "/.polywan-staging-4294967295/s";
-
 /// FR-API-1: an absolute socket path within the `sun_path` limit, also
-/// while it is being set up, without `.` or `..` components, so that two
+/// while it is being set up (no transiently permissive socket), without `.` or `..` components, so that two
 /// paths are distinct exactly when their components differ.
 fn check_socket_path(path: &Path) -> Result<(), String> {
     use std::path::Component;
@@ -1033,10 +1029,11 @@ fn check_socket_path(path: &Path) -> Result<(), String> {
     }
     let len = path.as_os_str().len();
     let parent = path.parent().map_or(0, |p| p.as_os_str().len());
-    if len > SUN_PATH_MAX || parent + SOCKET_STAGING.len() > SUN_PATH_MAX {
+    let staging = crate::api::socket::STAGING_SUFFIX_MAX;
+    if len > SUN_PATH_MAX || parent + staging > SUN_PATH_MAX {
         return Err(format!(
             "is too long for a Unix socket (at most {SUN_PATH_MAX} bytes, and its directory at most {} bytes)",
-            SUN_PATH_MAX - SOCKET_STAGING.len()
+            SUN_PATH_MAX - staging
         ));
     }
     Ok(())

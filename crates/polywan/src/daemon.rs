@@ -572,7 +572,7 @@ pub async fn run(opts: Options) -> Result<()> {
         return d.dry_run();
     }
     // The API sockets (FR-API-1), served on the I/O runtime.
-    let endpoints = crate::api::endpoints(&d.cfg.api).map_err(|e| anyhow::anyhow!("api: {e}"))?;
+    let endpoints = crate::api::endpoints(&d.cfg).map_err(|e| anyhow::anyhow!("api: {e}"))?;
     let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
     let runtime_dir = opts.lock.parent().unwrap_or(Path::new("/run/polywan")).to_owned();
     let Some(io) = d.io.as_ref() else {
@@ -620,7 +620,7 @@ pub async fn run(opts: Options) -> Result<()> {
         failures,
     };
     d.mail = Some(mail);
-    let api = crate::api::Api::start(io.handle(), endpoints, d.cfg.metrics_listen, runtime_dir, shared)
+    let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
     d.api = Some(api);
@@ -2347,7 +2347,7 @@ impl Daemon {
             return self.reload_failed(&["the API is not running".to_owned()]);
         };
         let seq = self.next_seq();
-        self.lanes.prepare_api(seq, api, endpoints, new.metrics_listen);
+        self.lanes.prepare_api(seq, api, endpoints);
         self.reload = Some(ReloadPhase::Preparing { seq, config: new });
     }
 

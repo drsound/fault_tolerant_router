@@ -74,6 +74,27 @@ impl Access {
     }
 }
 
+/// The private directory a socket is staged in, next to its path, named
+/// after the process.
+const STAGING: &str = ".polywan-staging-";
+/// The socket's name in the staging directory.
+const STAGED: &str = "s";
+
+/// The most that staging adds to the path of a socket's directory: the
+/// staging directory of the largest process id and the staged socket
+/// (FR-API-1: the staged path must fit `sun_path` too).
+pub const STAGING_SUFFIX_MAX: usize = 1 + STAGING.len() + (u32::MAX.ilog10() + 1) as usize + 1 + STAGED.len();
+
+fn staging(parent: &Path) -> PathBuf {
+    parent.join(format!("{STAGING}{}", std::process::id()))
+}
+
+/// Gives a socket its owner, group and mode (FR-API-1).
+pub fn apply_access(path: &Path, access: Access) -> io::Result<()> {
+    std::os::unix::fs::chown(path, Some(0), Some(access.gid.unwrap_or(0)))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(access.mode()))
+}
+
 /// Binds the listener of `path` with `access` (FR-API-1). `known` lists the
 /// sockets this instance or the record identifies as PolyWAN's.
 pub fn bind(
@@ -105,15 +126,14 @@ pub fn bind(
             }
         }
     }
-    let staging = parent.join(format!(".polywan-staging-{}", std::process::id()));
+    let staging = staging(parent);
     // A leftover of this process id (a crash) is root's and private.
     let _ = fs::remove_dir_all(&staging);
     fs::DirBuilder::new().mode(0o700).create(&staging)?;
     let result = (|| {
-        let staged = staging.join("s");
+        let staged = staging.join(STAGED);
         let listener = std::os::unix::net::UnixListener::bind(&staged)?;
-        std::os::unix::fs::chown(&staged, Some(0), Some(access.gid.unwrap_or(0)))?;
-        fs::set_permissions(&staged, fs::Permissions::from_mode(access.mode()))?;
+        apply_access(&staged, access)?;
         fs::rename(&staged, path)?;
         let m = fs::symlink_metadata(path)?;
         Ok((
@@ -148,5 +168,13 @@ mod tests {
     fn access_modes() {
         assert_eq!(Access { gid: Some(5) }.mode(), 0o660);
         assert_eq!(Access { gid: None }.mode(), 0o666);
+    }
+
+    #[test]
+    fn staging_suffix_bound() {
+        assert_eq!(STAGING_SUFFIX_MAX, "/.polywan-staging-4294967295/s".len());
+        let parent = Path::new("/run/polywan");
+        let staged = staging(parent).join(STAGED);
+        assert!(staged.as_os_str().len() <= parent.as_os_str().len() + STAGING_SUFFIX_MAX);
     }
 }

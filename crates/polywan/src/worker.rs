@@ -260,16 +260,10 @@ impl Lanes {
     }
 
     /// Prepares the API and metrics listeners of a reloaded configuration.
-    pub fn prepare_api(
-        &self,
-        seq: u64,
-        api: crate::api::Api,
-        endpoints: Vec<crate::api::Endpoint>,
-        metrics: Option<std::net::SocketAddr>,
-    ) {
+    pub fn prepare_api(&self, seq: u64, api: crate::api::Api, endpoints: Vec<crate::api::Endpoint>) {
         let done = self.done.clone();
         self.handle.spawn(async move {
-            let result = api.prepare(endpoints, metrics).await;
+            let result = api.prepare(endpoints).await;
             let _ = done.send(Done::ApiPrepared { seq, result }).await;
         });
     }
@@ -323,7 +317,7 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
         if !descriptors.is_empty() {
             return Err(descriptors);
         }
-        let endpoints = crate::api::endpoints(&new.api).map_err(|e| vec![e])?;
+        let endpoints = crate::api::endpoints(&new).map_err(|e| vec![e])?;
         Ok((new, endpoints))
     })
     .await;

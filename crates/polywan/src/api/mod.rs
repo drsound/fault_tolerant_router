@@ -52,16 +52,46 @@ pub enum Role {
     Metrics,
 }
 
-/// One configured socket.
+/// Where a listener listens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    /// A socket of the API (FR-API-1).
+    Unix { path: PathBuf, access: Access },
+    /// `metrics.listen` (FR-MET-1).
+    Tcp(SocketAddr),
+}
+
+impl Address {
+    /// The same socket path or the same address, whatever the access.
+    fn same_place(&self, other: &Address) -> bool {
+        match (self, other) {
+            (Address::Unix { path: a, .. }, Address::Unix { path: b, .. }) => a == b,
+            (Address::Tcp(a), Address::Tcp(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Address::Unix { path, .. } => write!(f, "{}", path.display()),
+            Address::Tcp(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+/// One configured listener.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub role: Role,
-    pub path: PathBuf,
-    pub access: Access,
+    pub address: Address,
 }
 
-/// The endpoints of a configuration, with the groups resolved.
-pub fn endpoints(api: &crate::config::Api) -> Result<Vec<Endpoint>, String> {
+/// The endpoints of a configuration, with the groups resolved; the metrics
+/// listener, if any, comes last.
+pub fn endpoints(cfg: &crate::config::Config) -> Result<Vec<Endpoint>, String> {
+    let api = &cfg.api;
     let gid = |name: &str| -> Result<u32, String> {
         crate::identity::group(name)
             .map_err(|e| format!("group {name:?}: {e}"))?
@@ -69,18 +99,28 @@ pub fn endpoints(api: &crate::config::Api) -> Result<Vec<Endpoint>, String> {
     };
     let mut v = vec![Endpoint {
         role: Role::Control,
-        path: api.socket.clone(),
-        access: Access {
-            gid: Some(gid(&api.group)?),
+        address: Address::Unix {
+            path: api.socket.clone(),
+            access: Access {
+                gid: Some(gid(&api.group)?),
+            },
         },
     }];
     if let Some(path) = &api.status_socket {
         v.push(Endpoint {
             role: Role::Status,
-            path: path.clone(),
-            access: Access {
-                gid: api.status_group.as_deref().map(gid).transpose()?,
+            address: Address::Unix {
+                path: path.clone(),
+                access: Access {
+                    gid: api.status_group.as_deref().map(gid).transpose()?,
+                },
             },
+        });
+    }
+    if let Some(addr) = cfg.metrics_listen {
+        v.push(Endpoint {
+            role: Role::Metrics,
+            address: Address::Tcp(addr),
         });
     }
     Ok(v)
@@ -140,15 +180,15 @@ const BODY_BYTES: usize = 64 * 1024;
 
 /// Commands of the listener manager, which runs on the I/O runtime.
 pub enum Command {
-    /// Binds the sockets of new paths (a reload, FR-API-1); nothing changes
-    /// for clients until the commit.
+    /// Binds the sockets of new paths and addresses (a reload, FR-API-1,
+    /// FR-MET-1); nothing changes for clients until the commit.
     Prepare {
         endpoints: Vec<Endpoint>,
-        metrics: Option<SocketAddr>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Serves the prepared configuration: new sockets start, removed ones
-    /// close, changed access applies and closes the existing connections.
+    /// close with their connections, changed access applies and closes the
+    /// existing connections.
     Commit,
     /// Removes what the last preparation bound.
     Rollback,
@@ -168,32 +208,20 @@ impl Api {
     pub async fn start(
         handle: &tokio::runtime::Handle,
         endpoints: Vec<Endpoint>,
-        metrics: Option<SocketAddr>,
         runtime_dir: PathBuf,
         shared: Shared,
     ) -> Result<Api, String> {
         let (commands, rx) = mpsc::channel(8);
         let (ready, started) = oneshot::channel();
-        handle.spawn(manager(
-            rx,
-            endpoints,
-            metrics,
-            Record::new(&runtime_dir),
-            shared,
-            ready,
-        ));
+        handle.spawn(manager(rx, endpoints, Record::new(&runtime_dir), shared, ready));
         started.await.map_err(|_| "the API manager stopped".to_owned())??;
         Ok(Api { commands })
     }
 
-    pub async fn prepare(&self, endpoints: Vec<Endpoint>, metrics: Option<SocketAddr>) -> Result<(), String> {
+    pub async fn prepare(&self, endpoints: Vec<Endpoint>) -> Result<(), String> {
         let (reply, rx) = oneshot::channel();
         self.commands
-            .send(Command::Prepare {
-                endpoints,
-                metrics,
-                reply,
-            })
+            .send(Command::Prepare { endpoints, reply })
             .await
             .map_err(|_| "the API manager stopped".to_owned())?;
         rx.await.map_err(|_| "the API manager stopped".to_owned())?
@@ -211,87 +239,53 @@ impl Api {
     }
 }
 
+/// A bound listener, not served yet.
+struct Bound {
+    endpoint: Endpoint,
+    listener: Accepting,
+    /// The socket file of a Unix endpoint.
+    published: Option<Published>,
+}
+
 /// A serving listener.
 struct Listener {
     endpoint: Endpoint,
-    published: Published,
+    published: Option<Published>,
     /// Stops the listener and its connections.
     stop: watch::Sender<bool>,
     /// Advanced when the access policy changes: the connections admitted
-    /// under the old one close (FR-API-1).
+    /// under the old one close (FR-API-1). Never advanced for the metrics,
+    /// which have no access policy.
     cut: watch::Sender<u64>,
-}
-
-/// The metrics listener (FR-MET-1).
-struct MetricsListener {
-    addr: SocketAddr,
-    /// Stops the listener and its connections.
-    stop: watch::Sender<bool>,
-    /// Never advanced (no access policy), but alive: a closed channel
-    /// would end every connection at once.
-    _cut: watch::Sender<u64>,
-}
-
-async fn bind_metrics(addr: SocketAddr) -> Result<std::net::TcpListener, String> {
-    tokio::task::spawn_blocking(move || std::net::TcpListener::bind(addr))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("metrics.listen {addr}: {e}"))
-}
-
-fn serve_metrics(addr: SocketAddr, listener: std::net::TcpListener, shared: &Shared) -> MetricsListener {
-    let (stop, stopped) = watch::channel(false);
-    let (cut, cuts) = watch::channel(0);
-    let shared = shared.clone();
-    tokio::spawn(async move {
-        if let Err(e) = accept_loop(Accepting::Tcp(listener), Role::Metrics, shared, stopped, cuts).await {
-            warn!("metrics listener stopped: {e}");
-        }
-    });
-    info!(%addr, "metrics listening");
-    MetricsListener { addr, stop, _cut: cut }
 }
 
 async fn manager(
     mut rx: mpsc::Receiver<Command>,
     initial: Vec<Endpoint>,
-    initial_metrics: Option<SocketAddr>,
     record: Record,
     shared: Shared,
     ready: oneshot::Sender<Result<(), String>>,
 ) {
-    let mut metrics: Option<MetricsListener> = None;
-    // A prepared change of `metrics.listen`: the new address and its
-    // socket (none to disable, or when the address does not change).
-    let mut metrics_next: Option<(Option<SocketAddr>, Option<std::net::TcpListener>)> = None;
     let mut serving: Vec<Listener> = Vec::new();
-    let mut prepared: Vec<(Endpoint, std::os::unix::net::UnixListener, Published)> = Vec::new();
+    let mut prepared: Vec<Bound> = Vec::new();
     let mut next: Option<Vec<Endpoint>> = None;
     // At startup the record identifies the sockets of an earlier instance.
     let known = record.read();
     let mut started = Ok(());
     for e in initial {
-        match bind(&e, &known).await {
-            Ok((l, p)) => serving.push(serve(e, l, p, &shared)),
+        match bind(e, &known).await {
+            Ok(b) => serving.push(serve(b, &shared)),
             Err(err) => {
                 started = Err(err);
                 break;
             }
         }
     }
-    if started.is_ok()
-        && let Some(addr) = initial_metrics
-    {
-        match bind_metrics(addr).await {
-            Ok(l) => metrics = Some(serve_metrics(addr, l, &shared)),
-            Err(e) => started = Err(e),
-        }
-    }
-    let save = |serving: &[Listener], prepared: &[(Endpoint, std::os::unix::net::UnixListener, Published)]| {
+    let save = |serving: &[Listener], prepared: &[Bound]| {
         let list: Vec<Published> = serving
             .iter()
-            .map(|l| l.published.clone())
-            .chain(prepared.iter().map(|(_, _, p)| p.clone()))
+            .filter_map(|l| l.published.clone())
+            .chain(prepared.iter().filter_map(|b| b.published.clone()))
             .collect();
         if let Err(e) = record.write(&list) {
             warn!("recording the API sockets: {e}");
@@ -300,9 +294,6 @@ async fn manager(
     if started.is_err() {
         for l in serving.drain(..) {
             close(l);
-        }
-        if let Some(m) = metrics.take() {
-            let _ = m.stop.send(true);
         }
     }
     save(&serving, &prepared);
@@ -313,43 +304,25 @@ async fn manager(
     }
     while let Some(c) = rx.recv().await {
         match c {
-            Command::Prepare {
-                endpoints,
-                metrics: wanted_metrics,
-                reply,
-            } => {
-                for (_, _, p) in prepared.drain(..) {
-                    socket::unpublish(&p);
-                }
-                metrics_next = None;
+            Command::Prepare { endpoints, reply } => {
+                discard(&mut prepared);
                 let mut result = Ok(());
-                // FR-MET-1: a new address is bound before the commit; a
-                // bind failure rejects the reload.
-                let current = metrics.as_ref().map(|m| m.addr);
-                if wanted_metrics != current {
-                    match wanted_metrics {
-                        Some(addr) => match bind_metrics(addr).await {
-                            Ok(l) => metrics_next = Some((Some(addr), Some(l))),
-                            Err(e) => result = Err(e),
-                        },
-                        None => metrics_next = Some((None, None)),
-                    }
-                }
                 for e in &endpoints {
-                    match serving.iter().find(|l| l.endpoint.path == e.path) {
+                    match serving.iter().find(|l| l.endpoint.address.same_place(&e.address)) {
                         // FR-API-1: an existing path never changes role.
                         Some(l) if l.endpoint.role != e.role => {
                             result = Err(format!(
                                 "{} cannot change from the {:?} to the {:?} socket on reload",
-                                e.path.display(),
-                                l.endpoint.role,
-                                e.role
+                                e.address, l.endpoint.role, e.role
                             ));
                             break;
                         }
                         Some(_) => {}
-                        None => match bind(e, &[]).await {
-                            Ok((l, p)) => prepared.push((e.clone(), l, p)),
+                        // FR-MET-1: a new metrics address too is bound
+                        // before the commit; a bind failure rejects the
+                        // reload.
+                        None => match bind(e.clone(), &[]).await {
+                            Ok(b) => prepared.push(b),
                             Err(err) => {
                                 result = Err(err);
                                 break;
@@ -358,10 +331,7 @@ async fn manager(
                     }
                 }
                 if result.is_err() {
-                    for (_, _, p) in prepared.drain(..) {
-                        socket::unpublish(&p);
-                    }
-                    metrics_next = None;
+                    discard(&mut prepared);
                     next = None;
                 } else {
                     next = Some(endpoints);
@@ -373,64 +343,47 @@ async fn manager(
                 let Some(wanted) = next.take() else { continue };
                 let mut kept = Vec::new();
                 for l in serving.drain(..) {
-                    match wanted.iter().find(|e| e.path == l.endpoint.path) {
-                        Some(e) if e.access == l.endpoint.access => kept.push(l),
+                    match wanted.iter().find(|e| e.address.same_place(&l.endpoint.address)) {
+                        Some(e) if *e == l.endpoint => kept.push(l),
                         // A changed access applies to the socket file;
                         // connections admitted under the old policy close.
                         Some(e) => {
-                            let e = e.clone();
-                            let p = e.path.clone();
-                            let access = e.access;
-                            let applied = tokio::task::spawn_blocking(move || {
-                                use std::os::unix::fs::PermissionsExt;
-                                std::os::unix::fs::chown(&p, Some(0), Some(access.gid.unwrap_or(0)))?;
-                                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(access.mode()))
-                            })
-                            .await;
-                            if !matches!(applied, Ok(Ok(()))) {
-                                warn!(path = %e.path.display(), "changing the access of an API socket failed");
+                            if let Address::Unix { path, access } = e.address.clone() {
+                                let applied =
+                                    tokio::task::spawn_blocking(move || socket::apply_access(&path, access)).await;
+                                if !matches!(applied, Ok(Ok(()))) {
+                                    warn!(path = %e.address, "changing the access of an API socket failed");
+                                }
                             }
                             // The listening socket stays; its connections
                             // are cut.
                             l.cut.send_modify(|g| *g += 1);
-                            kept.push(Listener { endpoint: e, ..l });
+                            kept.push(Listener {
+                                endpoint: e.clone(),
+                                ..l
+                            });
                         }
+                        // The old metrics address and its connections
+                        // close too.
                         None => close(l),
                     }
                 }
                 serving = kept;
-                for (e, l, p) in prepared.drain(..) {
-                    serving.push(serve(e, l, p, &shared));
-                }
-                // The old metrics listener and its connections close.
-                if let Some((addr, listener)) = metrics_next.take() {
-                    if let Some(m) = metrics.take() {
-                        let _ = m.stop.send(true);
-                    }
-                    if let (Some(addr), Some(l)) = (addr, listener) {
-                        metrics = Some(serve_metrics(addr, l, &shared));
-                    }
+                for b in prepared.drain(..) {
+                    serving.push(serve(b, &shared));
                 }
                 save(&serving, &prepared);
             }
             Command::Rollback => {
                 next = None;
-                metrics_next = None;
-                for (_, _, p) in prepared.drain(..) {
-                    socket::unpublish(&p);
-                }
+                discard(&mut prepared);
                 save(&serving, &prepared);
             }
             Command::Shutdown(done) => {
                 for l in serving.drain(..) {
                     close(l);
                 }
-                if let Some(m) = metrics.take() {
-                    let _ = m.stop.send(true);
-                }
-                for (_, _, p) in prepared.drain(..) {
-                    socket::unpublish(&p);
-                }
+                discard(&mut prepared);
                 save(&serving, &prepared);
                 let _ = done.send(());
                 return;
@@ -441,34 +394,62 @@ async fn manager(
 
 fn close(l: Listener) {
     let _ = l.stop.send(true);
-    socket::unpublish(&l.published);
+    if let Some(p) = &l.published {
+        socket::unpublish(p);
+    }
 }
 
-async fn bind(e: &Endpoint, known: &[Published]) -> Result<(std::os::unix::net::UnixListener, Published), String> {
-    let e = e.clone();
+/// Removes what a preparation bound.
+fn discard(prepared: &mut Vec<Bound>) {
+    for b in prepared.drain(..) {
+        if let Some(p) = &b.published {
+            socket::unpublish(p);
+        }
+    }
+}
+
+async fn bind(endpoint: Endpoint, known: &[Published]) -> Result<Bound, String> {
+    let address = endpoint.address.clone();
     let known = known.to_vec();
-    tokio::task::spawn_blocking(move || socket::bind(&e.path, e.access, &known))
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(|err| err.to_string())
+    let (listener, published) = tokio::task::spawn_blocking(move || match address {
+        Address::Unix { path, access } => socket::bind(&path, access, &known)
+            .map(|(l, p)| (Accepting::Unix(l), Some(p)))
+            .map_err(|err| err.to_string()),
+        Address::Tcp(addr) => std::net::TcpListener::bind(addr)
+            .map(|l| (Accepting::Tcp(l), None))
+            .map_err(|e| format!("metrics.listen {addr}: {e}")),
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    Ok(Bound {
+        endpoint,
+        listener,
+        published,
+    })
 }
 
-fn serve(
-    endpoint: Endpoint,
-    listener: std::os::unix::net::UnixListener,
-    published: Published,
-    shared: &Shared,
-) -> Listener {
+fn serve(b: Bound, shared: &Shared) -> Listener {
+    let Bound {
+        endpoint,
+        listener,
+        published,
+    } = b;
     let (stop, stopped) = watch::channel(false);
     let (cut, cuts) = watch::channel(0);
     let role = endpoint.role;
     let shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(e) = accept_loop(Accepting::Unix(listener), role, shared, stopped, cuts).await {
-            warn!("API listener stopped: {e}");
+        if let Err(e) = accept_loop(listener, role, shared, stopped, cuts).await {
+            match role {
+                Role::Metrics => warn!("metrics listener stopped: {e}"),
+                Role::Control | Role::Status => warn!("API listener stopped: {e}"),
+            }
         }
     });
-    info!(path = %endpoint.path.display(), role = ?role, "API socket listening");
+    match &endpoint.address {
+        Address::Unix { path, .. } => info!(path = %path.display(), role = ?role, "API socket listening"),
+        Address::Tcp(addr) => info!(%addr, "metrics listening"),
+    }
     Listener {
         endpoint,
         published,
@@ -617,57 +598,117 @@ fn error(code: StatusCode, message: &str) -> Reply {
     reply(code, serde_json::json!({ "error": message }).to_string())
 }
 
-/// The paths of the control socket's write endpoints (FR-API-3).
-fn control_only(path: &str) -> bool {
-    matches!(path, "/v1/reload" | "/v1/notify-test")
-        || path
-            .strip_prefix("/v1/uplinks/")
-            .and_then(|r| r.split_once('/'))
-            .is_some_and(|(name, action)| !name.is_empty() && matches!(action, "drain" | "undrain" | "forget"))
+/// A command on an uplink (FR-API-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Drain,
+    Undrain,
+    Forget,
+}
+
+/// The endpoints of the API and of the metrics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Route {
+    Status,
+    Events,
+    Metrics,
+    Reload,
+    NotifyTest,
+    Uplink { name: String, op: Op },
+}
+
+impl Route {
+    fn parse(path: &str) -> Option<Route> {
+        Some(match path {
+            "/v1/status" => Route::Status,
+            "/v1/events" => Route::Events,
+            "/metrics" => Route::Metrics,
+            "/v1/reload" => Route::Reload,
+            "/v1/notify-test" => Route::NotifyTest,
+            _ => {
+                let (name, op) = path.strip_prefix("/v1/uplinks/")?.split_once('/')?;
+                let op = match op {
+                    "drain" => Op::Drain,
+                    "undrain" => Op::Undrain,
+                    "forget" => Op::Forget,
+                    _ => return None,
+                };
+                if name.is_empty() {
+                    return None;
+                }
+                Route::Uplink {
+                    name: name.to_owned(),
+                    op,
+                }
+            }
+        })
+    }
+
+    /// The listeners that expose the route, and its method (IMPL-11,
+    /// FR-API-3, FR-MET-1).
+    fn rule(&self) -> (&'static [Role], Method) {
+        match self {
+            Route::Status | Route::Events => (&[Role::Control, Role::Status], Method::GET),
+            Route::Metrics => (&[Role::Metrics], Method::GET),
+            Route::Reload | Route::NotifyTest | Route::Uplink { .. } => (&[Role::Control], Method::POST),
+        }
+    }
 }
 
 async fn handle(req: Request<Incoming>, role: Role, shared: &Shared, deadline: &watch::Sender<Instant>) -> Reply {
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-    if role == Role::Metrics {
-        // FR-MET-1: `GET /metrics` and nothing else.
-        return match (path.as_str(), req.method() == Method::GET) {
-            ("/metrics", true) => metrics(shared),
-            ("/metrics", false) => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
-            _ => error(StatusCode::NOT_FOUND, "not found"),
-        };
+    let Some(route) = Route::parse(req.uri().path()) else {
+        return error(StatusCode::NOT_FOUND, "not found");
+    };
+    let (roles, method) = route.rule();
+    if !roles.contains(&role) {
+        return error(StatusCode::NOT_FOUND, "not found");
     }
-    match path.as_str() {
-        "/v1/status" if req.method() == Method::GET => status(shared),
-        "/v1/events" if req.method() == Method::GET => events(&query, shared, deadline).await,
-        "/v1/status" | "/v1/events" => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
-        p if role == Role::Control && control_only(p) => {
-            if req.method() != Method::POST {
-                return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-            }
-            command(req, &path, shared, deadline).await
+    if req.method() != method {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    let query = req.uri().query().unwrap_or("").to_owned();
+    // A write endpoint's body is read within its bound.
+    let force = if method == Method::POST {
+        match read_body(req, &route).await {
+            Ok(force) => force,
+            Err((code, e)) => return error(code, &e),
         }
-        _ => error(StatusCode::NOT_FOUND, "not found"),
+    } else {
+        false
+    };
+    match route {
+        Route::Status => status(shared),
+        Route::Events => events(&query, shared, deadline).await,
+        Route::Metrics => metrics(shared),
+        Route::NotifyTest => notify_test(shared, deadline).await,
+        Route::Reload => command(Action::Reload, shared).await,
+        Route::Uplink { name: uplink, op } => {
+            let action = match op {
+                Op::Drain => Action::Drain { uplink, force },
+                Op::Undrain => Action::Undrain { uplink },
+                Op::Forget => Action::Forget { uplink },
+            };
+            command(action, shared).await
+        }
     }
 }
 
-/// A write endpoint: the body is read within its bound, the command goes to
-/// the State task, the answer comes back before the deadline; a
-/// notification test runs on this runtime.
-async fn command(req: Request<Incoming>, path: &str, shared: &Shared, deadline: &watch::Sender<Instant>) -> Reply {
+/// The body of a write endpoint, within its bound; `force` for a drain.
+async fn read_body(req: Request<Incoming>, route: &Route) -> Result<bool, (StatusCode, String)> {
     use http_body_util::{BodyExt, Limited};
 
     let body = match Limited::new(req.into_body(), BODY_BYTES).collect().await {
         Ok(b) => b.to_bytes(),
-        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Err(_) => return Err((StatusCode::PAYLOAD_TOO_LARGE, "request body too large".to_owned())),
     };
-    let request = match parse_command(path, &body) {
-        Ok(Some(r)) => r,
-        Ok(None) => return notify_test(shared, deadline).await,
-        Err((code, e)) => return error(code, &e),
-    };
+    parse_body(route, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+/// A command goes to the State task, the answer comes back before the
+/// deadline.
+async fn command(action: Action, shared: &Shared) -> Reply {
     let (reply, answer) = oneshot::channel();
-    if shared.orders.try_send(Order { action: request, reply }).is_err() {
+    if shared.orders.try_send(Order { action, reply }).is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "too many commands in progress");
     }
     // The State task answers within the deadline; the margin leaves time
@@ -716,47 +757,23 @@ fn reply_json(code: StatusCode, body: &serde_json::Value) -> Reply {
     reply(code, body.to_string())
 }
 
-/// The command of a control path and its body; `None` for a notification
-/// test, which is not a command of the State task.
-fn parse_command(path: &str, body: &[u8]) -> Result<Option<Action>, (StatusCode, String)> {
-    #[derive(serde::Deserialize, Default)]
+/// The body of a write endpoint: only a drain takes one, `{"force": bool}`;
+/// whitespace is no body.
+fn parse_body(route: &Route, body: &[u8]) -> Result<bool, String> {
+    #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct DrainBody {
         #[serde(default)]
         force: bool,
     }
-    let empty = body.iter().all(u8::is_ascii_whitespace);
-    let no_body = || {
-        if empty {
-            Ok(())
-        } else {
-            Err((StatusCode::BAD_REQUEST, "this endpoint takes no body".to_owned()))
-        }
-    };
-    match path {
-        "/v1/reload" => no_body().map(|()| Some(Action::Reload)),
-        "/v1/notify-test" => no_body().map(|()| None),
-        _ => {
-            let (name, action) = path
-                .strip_prefix("/v1/uplinks/")
-                .and_then(|r| r.split_once('/'))
-                .ok_or((StatusCode::NOT_FOUND, "not found".to_owned()))?;
-            let uplink = name.to_owned();
-            match action {
-                "drain" => {
-                    let b: DrainBody = if empty {
-                        DrainBody::default()
-                    } else {
-                        serde_json::from_slice(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("body: {e}")))?
-                    };
-                    Ok(Some(Action::Drain { uplink, force: b.force }))
-                }
-                "undrain" => no_body().map(|()| Some(Action::Undrain { uplink })),
-                "forget" => no_body().map(|()| Some(Action::Forget { uplink })),
-                _ => Err((StatusCode::NOT_FOUND, "not found".to_owned())),
-            }
-        }
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
     }
+    if !matches!(route, Route::Uplink { op: Op::Drain, .. }) {
+        return Err("this endpoint takes no body".to_owned());
+    }
+    let b: DrainBody = serde_json::from_slice(body).map_err(|e| format!("body: {e}"))?;
+    Ok(b.force)
 }
 
 /// `GET /metrics` (FR-MET-2), in the Prometheus text format.
@@ -864,37 +881,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_paths_are_recognised() {
-        assert!(control_only("/v1/reload"));
-        assert!(control_only("/v1/notify-test"));
-        assert!(control_only("/v1/uplinks/a/drain"));
-        assert!(control_only("/v1/uplinks/fiber/forget"));
-        assert!(!control_only("/v1/uplinks//drain"));
-        assert!(!control_only("/v1/uplinks/a/delete"));
-        assert!(!control_only("/v1/status"));
+    fn routes_are_recognised() {
+        let control = |path: &str| Route::parse(path).is_some_and(|r| r.rule().0 == [Role::Control]);
+        assert!(control("/v1/reload"));
+        assert!(control("/v1/notify-test"));
+        assert!(control("/v1/uplinks/a/drain"));
+        assert!(control("/v1/uplinks/fiber/forget"));
+        assert!(!control("/v1/uplinks//drain"));
+        assert!(!control("/v1/uplinks/a/delete"));
+        assert!(!control("/v1/uplinks/a/b/drain"));
+        assert!(!control("/v1/status"));
+        assert_eq!(
+            Route::parse("/v1/uplinks/fiber/undrain"),
+            Some(Route::Uplink {
+                name: "fiber".into(),
+                op: Op::Undrain
+            })
+        );
+        assert_eq!(
+            Route::parse("/v1/status").unwrap().rule(),
+            (&[Role::Control, Role::Status][..], Method::GET)
+        );
+        assert_eq!(
+            Route::parse("/metrics").unwrap().rule(),
+            (&[Role::Metrics][..], Method::GET)
+        );
+        assert_eq!(Route::parse("/v1/nothing"), None);
     }
 
     #[test]
-    fn commands_are_parsed() {
-        assert_eq!(parse_command("/v1/reload", b""), Ok(Some(Action::Reload)));
-        assert_eq!(
-            parse_command("/v1/uplinks/a/drain", br#"{"force": true}"#),
-            Ok(Some(Action::Drain {
-                uplink: "a".into(),
-                force: true
-            }))
-        );
-        assert_eq!(
-            parse_command("/v1/uplinks/a/drain", b""),
-            Ok(Some(Action::Drain {
-                uplink: "a".into(),
-                force: false
-            }))
-        );
-        assert!(parse_command("/v1/uplinks/a/drain", br#"{"force": 1}"#).is_err());
-        assert!(parse_command("/v1/uplinks/a/drain", br#"{"other": true}"#).is_err());
-        assert!(parse_command("/v1/reload", b"x").is_err());
-        assert_eq!(parse_command("/v1/notify-test", b""), Ok(None));
+    fn bodies_are_parsed() {
+        let drain = Route::Uplink {
+            name: "a".into(),
+            op: Op::Drain,
+        };
+        assert_eq!(parse_body(&drain, br#"{"force": true}"#), Ok(true));
+        assert_eq!(parse_body(&drain, b""), Ok(false));
+        assert!(parse_body(&drain, br#"{"force": 1}"#).is_err());
+        assert!(parse_body(&drain, br#"{"other": true}"#).is_err());
+        assert!(parse_body(&Route::Reload, b"x").is_err());
+        assert_eq!(parse_body(&Route::Reload, b" \n"), Ok(false));
+        assert!(parse_body(&Route::NotifyTest, br#"{"force": true}"#).is_err());
     }
 
     #[test]

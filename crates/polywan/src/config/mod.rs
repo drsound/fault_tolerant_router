@@ -15,7 +15,7 @@ use ipnet::IpNet;
 use crate::model::{Family, FwMask, UplinkId};
 
 pub use raw::{AllDownPolicy, Fallback, FirewallMode, Nat, OnShutdown, Protocol};
-pub use validate::{DEFAULT_API_SOCKET, DEFAULT_STATUS_SOCKET, check_mailbox, parse_target, valid_uplink_name};
+pub use validate::{DEFAULT_API_SOCKET, DEFAULT_STATUS_SOCKET, parse_target, valid_uplink_name};
 
 /// Default location of the configuration file (FR-CFG-1).
 pub const DEFAULT_PATH: &str = "/etc/polywan/config.toml";
