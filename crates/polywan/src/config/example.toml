@@ -1,5 +1,6 @@
-# PolyWAN configuration. Every key and its default is described
-# in the configuration reference; durations are written like "5s" or "500ms".
+# PolyWAN configuration: two uplinks. Every key and its default is described
+# in the configuration reference, whose recipes show more uplinks, several
+# downlinks and policies; durations are written like "5s" or "500ms".
 
 [routing]
 # What to do when no uplink passes its health checks: "ready" uses the best
@@ -14,9 +15,6 @@ all_down_policy = "ready"
 # Internal networks whose traffic is routed through the uplinks.
 [[downlink]]
 interface = "lan0"
-
-[[downlink]]
-interface = "dmz0"
 
 # Each uplink has a stable id (1-63) that must never be reused for another
 # uplink; lower priority numbers are preferred, weights split new connections.
@@ -51,16 +49,6 @@ nat = "masquerade"
 [uplink.ipv6]
 nat = "masquerade"
 
-[[uplink]]
-id = 3
-name = "metered"
-description = "Metered LTE, last resort"
-interface = "ppp0"
-priority = 2
-
-[uplink.ipv4]
-nat = "masquerade"
-
 [health]
 interval = "5s"
 timeout = "1s"
@@ -72,15 +60,6 @@ targets = ["icmp:1.1.1.1", "icmp:8.8.8.8", "icmp:9.9.9.9", "icmp:208.67.222.222"
 
 [health.ipv6]
 targets = ["icmp:2606:4700:4700::1111", "icmp:2001:4860:4860::8888", "icmp:2620:fe::fe"]
-
-[[policy]]
-name = "smtp-via-fiber"
-family = "ipv4"
-source = "192.168.1.25/32"
-protocol = "tcp"
-destination_port = 25
-uplink = "fiber"
-fallback = "block"
 
 # Email goes through the system's sendmail interface (for example msmtp),
 # configured separately; test it through the running daemon with

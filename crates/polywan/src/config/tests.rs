@@ -141,7 +141,7 @@ fn digest_is_the_sha256_of_the_text() {
 #[test]
 fn generated_example_is_valid() {
     let c = parse(EXAMPLE).unwrap();
-    assert_eq!(c.uplinks.len(), 3);
+    assert_eq!(c.uplinks.len(), 2);
     assert!(c.manages(Family::V6));
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
 }
