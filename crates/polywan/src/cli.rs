@@ -128,12 +128,21 @@ pub async fn status(socket: &Path, json: bool) -> Result<()> {
             .flatten()
             .filter(|p| p["uplink"] == u["name"])
         {
+            let family = text(&p["family"]);
+            let active = s["active"][&family]
+                .as_array()
+                .is_some_and(|set| set.iter().any(|n| *n == u["name"]));
             let mut line = format!(
-                "  {}: {} ({}) since {}",
-                text(&p["family"]),
+                "  {family}: {} ({}) since {}, {}, {}",
                 text(&p["state"]),
                 text(&p["reason"]),
-                text(&p["since"])
+                text(&p["since"]),
+                if p["ready"].as_bool() == Some(true) {
+                    "ready"
+                } else {
+                    "not ready"
+                },
+                if active { "active" } else { "not active" }
             );
             if let Some(src) = p["source"].as_str() {
                 line += &format!(", source {src}");
@@ -168,7 +177,10 @@ fn print_event(e: &Value) {
     );
 }
 
-pub async fn events(socket: &Path, follow: bool) -> Result<()> {
+/// `events`: the history, then with `follow` each new event; with `json`,
+/// one JSON object per line: the events as the API returns them, and a
+/// `notice` record for a restart (`reset`) or evicted events (`truncated`).
+pub async fn events(socket: &Path, follow: bool, json: bool) -> Result<()> {
     let mut instance: Option<String> = None;
     let mut after: Option<u64> = None;
     loop {
@@ -189,16 +201,27 @@ pub async fn events(socket: &Path, follow: bool) -> Result<()> {
         }
         let path = format!("/v1/events?{}", query.join("&"));
         let page = get(socket, &path, api::DEADLINE + wait).await?;
+        let notice = |kind: &str, text: &str| {
+            if json {
+                crate::say!("{}", serde_json::json!({"notice": kind, "instance": page["instance"]}));
+            } else {
+                crate::say!("({text})");
+            }
+        };
         if instance.is_some() && page["reset"].as_bool() == Some(true) {
-            crate::say!("(the daemon restarted: events from the start of its history)");
+            notice("reset", "the daemon restarted: events from the start of its history");
         }
         if page["truncated"].as_bool() == Some(true) {
-            crate::say!("(older events were evicted from the history)");
+            notice("truncated", "older events were evicted from the history");
         }
         instance = page["instance"].as_str().map(str::to_owned);
         let events = page["events"].as_array().cloned().unwrap_or_default();
         for e in &events {
-            print_event(e);
+            if json {
+                crate::say!("{e}");
+            } else {
+                print_event(e);
+            }
             after = e["seq"].as_u64().or(after);
         }
         // A full page may have more behind it.
@@ -235,9 +258,16 @@ pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Resul
 
 /// `reload` (FR-API-3): the validation errors, or the applied generation.
 pub async fn reload(socket: &Path) -> Result<()> {
-    let (status, v) = post(socket, "/v1/reload", None, api::DEADLINE)
-        .await
-        .with_context(|| socket.display().to_string())?;
+    let (status, v) = match post(socket, "/v1/reload", None, api::DEADLINE).await {
+        Ok(answer) => answer,
+        // A reload that changes the control socket's path or access closes
+        // this connection when it commits, before the answer (IMPL-10).
+        Err(client::Error::Exchange(e)) => bail!(
+            "{}: no answer ({e}): the outcome of the reload is unknown; a change of the control socket's path or access closes the connection that requested it, and `polywan events` shows config_reloaded or reload_failed",
+            socket.display()
+        ),
+        Err(e) => return Err(e).with_context(|| socket.display().to_string()),
+    };
     if status != StatusCode::OK {
         let mut message = format!("reload: {status}: {}", error_text(&v));
         for e in v.get("errors").and_then(Value::as_array).into_iter().flatten() {

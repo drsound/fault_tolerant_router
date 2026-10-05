@@ -69,6 +69,9 @@ enum Command {
         /// Keep waiting for new events.
         #[arg(long)]
         follow: bool,
+        /// One JSON object per line.
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
         socket: PathBuf,
     },
@@ -192,7 +195,7 @@ fn main() -> ExitCode {
             Command::Status { json, socket } => polywan::cli::status(&socket, json).await,
             Command::Drain { name, force, socket } => polywan::cli::drain(&socket, &name, true, force).await,
             Command::Undrain { name, socket } => polywan::cli::drain(&socket, &name, false, false).await,
-            Command::Events { follow, socket } => polywan::cli::events(&socket, follow).await,
+            Command::Events { follow, json, socket } => polywan::cli::events(&socket, follow, json).await,
         }
     });
     match result {

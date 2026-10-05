@@ -704,7 +704,8 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
 /// FR-API-1, FR-API-2, IMPL-6: the status and control sockets exist with
 /// their modes (status 0666, control 0660 with its group), the lock is a
 /// 0600 file; `status` reports the paths and active sets, `events` the
-/// history with sequence numbers, and a carrier loss appears in both; the
+/// history with sequence numbers, and a carrier loss appears in both, also
+/// in the CLI's human status and JSON events; the
 /// status socket refuses the control endpoints (404) and other methods
 /// (405), the control socket serves the status too; the sockets are removed
 /// at shutdown.
@@ -765,6 +766,25 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
     f.wait_path_where(&t, "b", Family::V4, "down and not ready", Duration::from_secs(5), |p| {
         p["state"] == "down" && p["ready"] == false
     })?;
+    // The human status shows readiness and active-set membership, `events
+    // --json` the API's event objects, one per line (§9).
+    let socket = f.status_socket().display().to_string();
+    let text = polywan::output_text(&succeeded(f.cli(&["status", "--socket", &socket])?)?);
+    assert!(
+        text.contains(", ready, active") && text.contains(", not ready, not active"),
+        "{text}"
+    );
+    let out = succeeded(f.cli(&["events", "--json", "--socket", &socket])?)?;
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert!(
+        lines
+            .iter()
+            .any(|e| e["type"] == "active_set_changed" && e["seq"].is_u64()),
+        "{lines:?}"
+    );
     t.carrier_up(Uplink::B)?;
     // Allowlists (IMPL-11).
     let code = |socket: &std::path::Path, method: &str, path: &str| t.http(socket, method, path).map(|r| r.0);
