@@ -476,9 +476,12 @@ fn as06_deterministic_loss_violates_the_loss_gate(fam: Family) -> Result<()> {
     f.write_config(&polywan::config(&ab(), &[fam], &health, "", ""))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
+    // Events before the gate (a startup flap) are not the scenario's.
+    let gated = f.latest_event()?;
     t.drop_probe_echoes(Uplink::A, 3)?;
     let change = |change: &str| format!("uplink a {fam}: {change}");
     f.wait_event(
+        gated,
         "path_state_changed",
         &change("up -> down (degraded)"),
         1,
@@ -491,12 +494,13 @@ fn as06_deterministic_loss_violates_the_loss_gate(fam: Family) -> Result<()> {
     assert!(
         !events
             .iter()
-            .any(|(_, k, l)| k == "path_state_changed" && l.contains("(probe_failed)")),
+            .any(|(seq, k, l)| *seq > gated && k == "path_state_changed" && l.contains("(probe_failed)")),
         "reachability kept passing: {events:?}"
     );
     t.clear_provider_rules(Uplink::A)?;
     let cleared = Instant::now();
     f.wait_event(
+        gated,
         "path_state_changed",
         &change("down -> up (probes_recovered)"),
         1,
@@ -555,8 +559,11 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
         "{log}"
     );
     f.write_config(&config("5ms"))?;
+    // Events before this gate (a startup flap) are not the scenario's.
+    let gated = f.latest_event()?;
     f.reload()?;
     f.wait_event(
+        gated,
         "path_state_changed",
         &format!("uplink a {fam}: up -> down (degraded)"),
         1,
@@ -570,11 +577,15 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
     f.write_config(&config("100ms"))?;
     f.reload()?;
     f.wait_event(
+        gated,
         "path_state_changed",
         &format!("uplink a {fam}: down -> up (probes_recovered)"),
         1,
         Duration::from_secs(8),
     )?;
+    f.wait_path_where(&t, "a", fam, "up and ready", Duration::from_secs(2), |p| {
+        p["state"] == "up" && p["ready"] == true
+    })?;
     t.clear_target_delays(Uplink::A)?;
     f.stop()?;
     Ok(())
@@ -711,8 +722,10 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
         events.windows(2).all(|w| w[1].0 == w[0].0 + 1),
         "consecutive sequence numbers: {events:?}"
     );
+    let before = f.latest_event()?;
     t.carrier_down(Uplink::B)?;
     f.wait_event(
+        before,
         "path_state_changed",
         // The reason is the first readiness loss observed (carrier,
         // address), which depends on the kernel.
@@ -721,18 +734,17 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
         Duration::from_secs(5),
     )?;
     f.wait_event(
+        before,
         "active_set_changed",
         "ipv4 active set: [a, b] -> [a]",
         1,
         Duration::from_secs(5),
     )?;
-    let s = f.status()?;
-    let b = polywan::path(&s, "b", Family::V4);
-    assert_eq!(
-        (b["state"].as_str(), b["ready"].as_bool()),
-        (Some("down"), Some(false)),
-        "{s}"
-    );
+    // A probe lost under load can report the path down before the
+    // carrier loss is observed: wait for the readiness loss too.
+    f.wait_path_where(&t, "b", Family::V4, "down and not ready", Duration::from_secs(5), |p| {
+        p["state"] == "down" && p["ready"] == false
+    })?;
     t.carrier_up(Uplink::B)?;
     // Allowlists (IMPL-11).
     let code = |socket: &std::path::Path, method: &str, path: &str| t.http(socket, method, path).map(|r| r.0);
@@ -856,7 +868,7 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
         ["wanb"],
         "applied when the command returns"
     );
-    f.wait_event("uplink_drained", "uplink a drained", 1, Duration::from_secs(5))?;
+    f.wait_event(0, "uplink_drained", "uplink a drained", 1, Duration::from_secs(5))?;
     for port in [TCP_PORT, TCP_PORT_HTTPS] {
         let r = t.connect_to(
             Node::Client,
@@ -1074,7 +1086,7 @@ fn api_reload_and_forget() -> Result<()> {
     let out = f.reload_cli()?;
     let text = polywan::output_text(&out);
     assert!(!out.status.success() && text.contains("bogus_key"), "{text}");
-    f.wait_event("reload_failed", "was not reloaded", 1, Duration::from_secs(5))?;
+    f.wait_event(0, "reload_failed", "was not reloaded", 1, Duration::from_secs(5))?;
     assert!(
         !f.events()?.iter().any(|(_, _, l)| l.contains("bogus_key")),
         "no configuration excerpt in events"
@@ -1223,11 +1235,6 @@ fn wait_mailed(t: &Topology, f: &polywan::Polywan, stub: &Stub, after: u64, kind
     .map(|_| ())
 }
 
-/// The sequence number of the latest event.
-fn latest(f: &polywan::Polywan) -> Result<u64> {
-    Ok(f.events()?.last().map_or(0, |e| e.0))
-}
-
 /// AS-25, sendmail (FR-MAIL-1, FR-MAIL-3), with the minute of the retries
 /// shortened to 500 ms and the deadline to 2 s: sendmail runs as
 /// `-i -f FROM RECIPIENT...` in its own process group; a failing one is
@@ -1317,7 +1324,7 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
     for mode in [Mode::Hang, Mode::NoRead] {
         stub.script(&[mode])?;
         let before = stub.calls()?.len();
-        let since = latest(&f)?;
+        let since = f.latest_event()?;
         let timeouts = f.log().matches("timed out").count();
         toggle(&f)?;
         let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
@@ -1534,7 +1541,7 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     stub.wait_calls(&t, 1, Duration::from_secs(10))?;
-    let start = latest(&f)?;
+    let start = f.latest_event()?;
     for i in 0..15 {
         t.carrier_down(Uplink::B)?;
         if i == 0 {
@@ -1710,6 +1717,18 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     })?;
     assert_eq!(get("127.0.0.1:9750", "POST", "/metrics")?.0, 405);
     assert_eq!(get("127.0.0.1:9750", "GET", "/v1/status")?.0, 404);
+    // B's transitions to down so far: a probe lost under load may have
+    // added one before the carrier loss.
+    let downs = |text: &str| -> u64 {
+        let name = "polywan_path_transitions_total{uplink=\"b\",family=\"ipv4\",to=\"down\"} ";
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.parse().ok())
+            .unwrap_or(0)
+    };
+    f.wait_path_where(&t, "b", Family::V4, "up", Duration::from_secs(10), |p| {
+        p["state"] == "up"
+    })?;
+    let before = downs(&get("127.0.0.1:9750", "GET", "/metrics")?.1);
     t.carrier_down(Uplink::B)?;
     wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
     t.wait_for("B down in the metrics", Duration::from_secs(5), || {
@@ -1718,10 +1737,10 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
             "polywan_path_up{uplink=\"b\",family=\"ipv4\"} 0",
             "polywan_path_ready{uplink=\"b\",family=\"ipv4\"} 0",
             "polywan_path_active{uplink=\"b\",family=\"ipv4\"} 0",
-            "polywan_path_transitions_total{uplink=\"b\",family=\"ipv4\",to=\"down\"} 1",
         ]
         .iter()
-        .all(|l| metric(&text, l)))
+        .all(|l| metric(&text, l))
+            && downs(&text) > before)
     })?;
     t.carrier_up(Uplink::B)?;
     // Moved: the old address closes.
@@ -1900,7 +1919,7 @@ fn as51_floods_and_slow_clients() -> Result<()> {
     // Long polls fill the status socket until an event.
     let s = f.status()?;
     let instance = s["instance"].as_str().context("instance")?.to_owned();
-    let latest = latest(&f)?;
+    let latest = f.latest_event()?;
     let head = format!("GET /v1/events?instance={instance}&after={latest}&wait=30 HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n");
     let polls = t.agent_child(&["hold", &status, "--count", "16", "--head", &head, "--seconds", "40"])?;
     // Pending for a while before an event answers them.

@@ -413,12 +413,27 @@ impl Polywan {
             .collect())
     }
 
+    /// The sequence number of the latest event, a cursor for
+    /// [`Polywan::wait_event`].
+    pub fn latest_event(&self) -> Result<u64> {
+        Ok(self.events()?.last().map_or(0, |e| e.0))
+    }
+
     /// Waits until `count` events of type `kind` whose message contains
-    /// `needle` exist, through long polls of `/v1/events` (FR-API-2) that
-    /// the next event answers.
-    pub fn wait_event(&self, kind: &str, needle: &str, count: usize, timeout: Duration) -> Result<Duration> {
+    /// `needle` exist after sequence number `after` (0: all of them; a
+    /// cursor from [`Polywan::latest_event`] keeps an earlier event, a
+    /// startup flap for example, from satisfying the wait), through long
+    /// polls of `/v1/events` (FR-API-2) that the next event answers.
+    pub fn wait_event(
+        &self,
+        after: u64,
+        kind: &str,
+        needle: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Duration> {
         let start = std::time::Instant::now();
-        let (mut instance, mut after, mut found) = (None::<String>, None::<u64>, 0);
+        let (mut instance, mut after, mut found) = (None::<String>, Some(after).filter(|a| *a > 0), 0);
         loop {
             let mut query = Vec::new();
             if let Some(i) = &instance {
