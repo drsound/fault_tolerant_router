@@ -2011,13 +2011,22 @@ impl Daemon {
         let managed = self.cfg.firewall.mode == FirewallMode::Managed;
         let transaction = Arc::clone(&self.nft_transaction);
         let configured = self.assignments();
-        let nft_pending =
-            managed && (self.nft_missing || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
+        // A transaction in flight keeps the nftables step as the barrier
+        // until its outcome is known, also when the configuration went back
+        // to the applied one meanwhile (FR-REC-3, FR-REC-9).
+        let nft_pending = managed
+            && (self.nft_missing
+                || self.nft_flight.is_some()
+                || self.nft_applied.as_ref().map(|(t, _)| t) != Some(&transaction));
         let new_paths = if managed {
-            unassigned(
-                &configured,
-                self.nft_applied.as_ref().map(|(_, a)| a).or(self.nft_adopted.as_ref()),
-            )
+            let installed = self.nft_applied.as_ref().map(|(_, a)| a).or(self.nft_adopted.as_ref());
+            // Only the assignments that the transaction in flight keeps are
+            // counted on.
+            let surviving: Option<BTreeSet<Assignment>> = match (installed, &self.nft_flight) {
+                (Some(i), Some(f)) => Some(i.intersection(&f.configured).cloned().collect()),
+                (i, _) => i.cloned(),
+            };
+            unassigned(&configured, surviving.as_ref())
         } else {
             BTreeSet::new()
         };
