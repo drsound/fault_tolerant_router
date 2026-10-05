@@ -1636,13 +1636,15 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     ] {
         assert!(metric(&text, line), "{line}\n{text}");
     }
-    assert!(
-        text.lines().any(
-            |l| l.starts_with("polywan_probe_samples_total{uplink=\"a\",family=\"ipv4\",target=")
+    // Paths start up before their first probe round: the first sample can
+    // come after the members are installed.
+    t.wait_for("a probe sample of A in the metrics", Duration::from_secs(10), || {
+        let (_, text) = get("127.0.0.1:9750", "GET", "/metrics")?;
+        Ok(text.lines().any(|l| {
+            l.starts_with("polywan_probe_samples_total{uplink=\"a\",family=\"ipv4\",target=")
                 && l.contains("result=\"ok\"}")
-        ),
-        "{text}"
-    );
+        }))
+    })?;
     assert_eq!(get("127.0.0.1:9750", "POST", "/metrics")?.0, 405);
     assert_eq!(get("127.0.0.1:9750", "GET", "/v1/status")?.0, 404);
     t.carrier_down(Uplink::B)?;
