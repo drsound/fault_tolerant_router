@@ -47,6 +47,10 @@ pub struct Spec {
     /// ends at the child's exit and its descendants are left alone (a mail
     /// system delivering in the background).
     pub supervise_descendants: bool,
+    /// The child may exit without reading its input: a hook also gets the
+    /// event in its environment (FR-HOOK-2). For sendmail an unread
+    /// message is a failed submission.
+    pub input_may_go_unread: bool,
     pub timeout: Duration,
 }
 
@@ -196,7 +200,10 @@ pub async fn run(spec: &Spec) -> Outcome {
                 // How the child ended comes first; a failed input write
                 // matters only for a child that exited with 0 (a dead
                 // child's pipe breaks).
-                exit_end(status, written)
+                exit_end(
+                    status,
+                    written.or_else(|e| if spec.input_may_go_unread { Ok(()) } else { Err(e) }),
+                )
             }
         }
         Err(_) => {
@@ -317,6 +324,7 @@ mod tests {
             input: b"hello".to_vec(),
             capture_stdout: true,
             supervise_descendants: false,
+            input_may_go_unread: false,
             timeout: Duration::from_millis(timeout_ms),
         }
     }
@@ -366,7 +374,7 @@ mod tests {
         // child's exit with 0 counts, with what it wrote, well before the
         // deadline (FR-MAIL-3: an accepted message is not retried).
         let started = std::time::Instant::now();
-        let o = run(&sh("sleep 5 & echo out; echo diag >&2; exit 0", 4000)).await;
+        let o = run(&sh("cat >/dev/null; sleep 5 & echo out; echo diag >&2; exit 0", 4000)).await;
         assert_eq!(o.end, End::Exited(0));
         assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
         assert_eq!(
@@ -401,9 +409,19 @@ mod tests {
         std::thread::sleep(Duration::from_secs(3));
         assert!(!mark.exists(), "the worker died with the group");
         // Without a worker, the hook ends with its exit.
-        spec.args[1] = "echo done".into();
+        spec.args[1] = "cat >/dev/null; echo done".into();
         assert_eq!(run(&spec).await.end, End::Exited(0));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unread_input_fails_sendmail_but_not_a_hook() {
+        // More than a pipe holds: the write always breaks.
+        let mut spec = sh("exit 0", 5000);
+        spec.input = vec![b'x'; 1 << 20];
+        assert!(matches!(run(&spec).await.end, End::InputFailed(_)));
+        spec.input_may_go_unread = true;
+        assert_eq!(run(&spec).await.end, End::Exited(0));
     }
 
     #[tokio::test]
@@ -425,7 +443,10 @@ mod tests {
         if !nix::unistd::geteuid().is_root() {
             return;
         }
-        let mut spec = sh("id -u; id -G; grep -E '^Cap(Eff|Prm):' /proc/self/status", 5000);
+        let mut spec = sh(
+            "cat >/dev/null; id -u; id -G; grep -E '^Cap(Eff|Prm):' /proc/self/status",
+            5000,
+        );
         (spec.uid, spec.gid) = (65534, 65534);
         let o = run(&spec).await;
         assert_eq!(o.end, End::Exited(0), "{}", o.stderr.escaped());
