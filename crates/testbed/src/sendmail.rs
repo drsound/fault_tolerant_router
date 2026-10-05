@@ -31,7 +31,8 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn word(self) -> String {
+    /// The control file's word; a call records it with `-` for spaces.
+    pub fn word(self) -> String {
         match self {
             Mode::Accept => "accept".into(),
             Mode::Exit(n) => format!("exit {n}"),
@@ -49,6 +50,8 @@ pub struct Call {
     pub at: SystemTime,
     pub pid: u32,
     pub pgid: u32,
+    /// Its mode ([`Mode::word`] with `-` for spaces).
+    pub mode: String,
     /// Whether its mode reads the message.
     pub reads: bool,
     pub args: Vec<String>,
@@ -135,12 +138,10 @@ impl Stub {
             format!(
                 r#"#!/bin/sh
 d={d}
-# The mode first: a recorded call has its mode, and whether it reads.
+# The mode first: a recorded call has its mode.
 mode=$(cat $d/mode 2>/dev/null)
-reads=1
-[ "$mode" = noread ] && reads=0
 n=$(date +%s%N)
-echo "$n $$ $(cut -d' ' -f5 /proc/$$/stat) $reads $*" >> $d/calls
+echo "$n $$ $(cut -d' ' -f5 /proc/$$/stat) $(echo $mode | tr ' ' -) $*" >> $d/calls
 # Complete messages only: written aside, then renamed.
 read_message() {{ cat > $d/$n.tmp && mv $d/$n.tmp $d/$n.msg; }}
 case $mode in
@@ -179,7 +180,8 @@ esac
             let ns: u64 = n.parse()?;
             let pid = w.next().context("pid")?.parse()?;
             let pgid = w.next().context("pgid")?.parse()?;
-            let reads = w.next() == Some("1");
+            let mode = w.next().context("mode")?.to_owned();
+            let reads = mode != "noread";
             // None while the message is still being read.
             let message = fs::read_to_string(self.dir.join(format!("{n}.msg")))
                 .ok()
@@ -189,6 +191,7 @@ esac
                 at: UNIX_EPOCH + Duration::from_nanos(ns),
                 pid,
                 pgid,
+                mode,
                 reads,
                 args: w.map(str::to_owned).collect(),
                 message,
@@ -204,6 +207,19 @@ esac
             .into_iter()
             .filter(|c| c.message.as_ref().and_then(|m| m.header("Message-ID")) == Some(id))
             .collect())
+    }
+
+    /// Waits until no call has come for `quiet` (no retry pending).
+    pub fn wait_quiet(&self, t: &Topology, quiet: Duration, timeout: Duration) -> Result<()> {
+        let mut last = (self.calls()?.len(), std::time::Instant::now());
+        t.wait_for("sendmail to be quiet", timeout, || {
+            let n = self.calls()?.len();
+            if n != last.0 {
+                last = (n, std::time::Instant::now());
+            }
+            Ok(last.1.elapsed() >= quiet)
+        })
+        .map(|_| ())
     }
 
     /// Waits until the stub has been called `count` times or more, and

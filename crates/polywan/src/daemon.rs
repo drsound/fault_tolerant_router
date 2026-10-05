@@ -253,6 +253,9 @@ struct Daemon {
     /// a pass leaves nothing to do (FR-COEX-3).
     repairs: BTreeSet<&'static str>,
     repairs_total: BTreeMap<&'static str, u64>,
+    /// Health transitions and probe samples (FR-MET-2), by uplink name.
+    transitions_total: BTreeMap<(String, &'static str, &'static str), u64>,
+    probe_samples_total: BTreeMap<(String, &'static str, String, &'static str), u64>,
     /// The API listener manager; none in a dry run.
     api: Option<crate::api::Api>,
     /// A command was answered inside a reload's end: the next one starts
@@ -526,6 +529,8 @@ pub async fn run(opts: Options) -> Result<()> {
         started: std::time::SystemTime::now(),
         repairs: BTreeSet::new(),
         repairs_total: BTreeMap::new(),
+        transitions_total: BTreeMap::new(),
+        probe_samples_total: BTreeMap::new(),
         api: None,
         notify_config: watch::channel(Arc::new(cfg.notify.clone())).0,
         mail: None,
@@ -579,12 +584,15 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     // FR-HOOK-4: the hooks read their own bounded queue of the bus.
     let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE, usize::MAX);
+    // FR-MET-2: failed notifications, counted by the notifiers.
+    let failures = Arc::new(crate::metrics::Failures::default());
     // FR-HOOK-3: one concurrency limit for hooks and their tests.
     let hook_slots = Arc::new(tokio::sync::Semaphore::new(crate::hooks::CONCURRENCY));
     io.handle().spawn(crate::hooks::notifier(
         hook_events,
         d.notify_config.subscribe(),
         Arc::clone(&hook_slots),
+        Arc::clone(&failures),
     ));
     // FR-MAIL-2: the email queue receives the selected types only.
     let mail_events = d
@@ -598,6 +606,7 @@ pub async fn run(opts: Options) -> Result<()> {
         d.notify_config.subscribe(),
         mail_requests,
         d.bus.instance().to_owned(),
+        Arc::clone(&failures),
     ));
     let shared = crate::api::Shared {
         status: d.status.subscribe(),
@@ -612,9 +621,10 @@ pub async fn run(opts: Options) -> Result<()> {
             d.bus.instance().to_owned(),
             crate::test_hooks::mail_times(crate::mail::Times::default()),
         )),
+        failures,
     };
     d.mail = Some(mail);
-    let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
+    let api = crate::api::Api::start(io.handle(), endpoints, d.cfg.metrics_listen, runtime_dir, shared)
         .await
         .map_err(|e| anyhow::anyhow!("api: {e}"))?;
     d.api = Some(api);
@@ -1154,6 +1164,13 @@ impl Daemon {
                     health.quality_min_samples,
                 );
                 self.status_dirty = true;
+                if let Some(u) = self.cfg.uplink(r.path.uplink) {
+                    for sample in &r.samples {
+                        let result = if sample.rtt.is_some() { "ok" } else { "lost" };
+                        let key = (u.name.clone(), r.path.family.key(), sample.target.to_string(), result);
+                        *self.probe_samples_total.entry(key).or_default() += 1;
+                    }
+                }
                 let p = self.paths.get_mut(&r.path).expect("checked above");
                 p.window.push(r.samples, capacity);
                 p.stats = p.window.stats();
@@ -1463,6 +1480,16 @@ impl Daemon {
     /// Emits the events of the step in order, then publishes the status.
     fn flush_events(&mut self) {
         for e in std::mem::take(&mut self.pending_events) {
+            if e.kind == "path_state_changed"
+                && let (Some(uplink), Some(family)) = (&e.uplink, e.family)
+            {
+                let to = if e.new.as_ref().and_then(|v| v.as_str()) == Some("up") {
+                    "up"
+                } else {
+                    "down"
+                };
+                *self.transitions_total.entry((uplink.clone(), family, to)).or_default() += 1;
+            }
             self.bus.emit(e);
             self.status_dirty = true;
         }
@@ -1532,6 +1559,21 @@ impl Daemon {
                 })
                 .collect(),
             active,
+            counters: status::Counters {
+                transitions: self.transitions_total.clone(),
+                probe_samples: self.probe_samples_total.clone(),
+                repairs: self.repairs_total.iter().map(|(k, n)| (*k, *n)).collect(),
+                apply_failures: [
+                    FailureKind::Route,
+                    FailureKind::Rule,
+                    FailureKind::Nftables,
+                    FailureKind::Sysctl,
+                ]
+                .into_iter()
+                .map(|k| (k.as_str(), self.apply_failures.get(&k).copied().unwrap_or(0)))
+                .collect(),
+                events_dropped: self.bus.dropped(),
+            },
         }
     }
 
@@ -2304,12 +2346,12 @@ impl Daemon {
             Ok((new, endpoints)) => (Arc::new(*new), endpoints),
             Err(errors) => return self.reload_failed(&errors),
         };
-        // FR-API-1: the listeners are prepared before the commit.
+        // FR-API-1, FR-MET-1: the listeners are prepared before the commit.
         let Some(api) = self.api.clone() else {
             return self.reload_failed(&["the API is not running".to_owned()]);
         };
         let seq = self.next_seq();
-        self.lanes.prepare_api(seq, api, endpoints);
+        self.lanes.prepare_api(seq, api, endpoints, new.metrics_listen);
         self.reload = Some(ReloadPhase::Preparing { seq, config: new });
     }
 
@@ -2381,6 +2423,10 @@ impl Daemon {
         let new = Arc::unwrap_or_clone(config);
         self.drained = drained;
         self.cfg = new;
+        // The metrics keep the totals of configured uplinks only.
+        let names: BTreeSet<String> = self.cfg.uplinks.iter().map(|u| u.name.clone()).collect();
+        self.transitions_total.retain(|k, _| names.contains(&k.0));
+        self.probe_samples_total.retain(|k, _| names.contains(&k.0));
         // Paths exist only for configured uplinks: those of removed uplinks
         // go at once, with their probers.
         let configured: BTreeSet<UplinkId> = self.cfg.uplinks.iter().map(|u| u.id).collect();

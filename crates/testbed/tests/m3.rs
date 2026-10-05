@@ -1209,12 +1209,16 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
     // Hanging with a child (A undrained by the toggle), then never reading:
     // killed at the deadline, and routing meets its deadlines meanwhile.
     for mode in [Mode::Hang, Mode::NoRead] {
+        // A retry of the previous phase must not take this phase's mode.
+        stub.wait_quiet(&t, Duration::from_secs(2), Duration::from_secs(20))?;
         stub.set(mode)?;
         let before = stub.calls()?.len();
         let timeouts = f.log().matches("timed out").count();
         toggle(&f)?;
         let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
-        let pid = calls[before].pid;
+        let call = calls[before].clone();
+        assert_eq!(call.mode, mode.word());
+        let pid = call.pid;
         if mode == Mode::Hang {
             t.wait_for("the stub's child", Duration::from_secs(5), || {
                 Ok(stub.child().is_some())
@@ -1233,22 +1237,19 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
         stub.set(Mode::Accept)?;
         t.wait_for("the timeout", Duration::from_secs(5), || {
             Ok(f.log().matches("timed out").count() > timeouts)
-        })?;
+        })
+        .with_context(|| format!("{mode:?}: {}", f.log()))?;
         t.wait_for("the group killed", Duration::from_secs(5), || {
             Ok(gone(pid) && stub.child().is_none_or(gone))
         })?;
-        // The retry (after the batch of B's carrier loss, due first), with
-        // the same Message-ID when the first attempt read it.
-        let calls = stub.wait_calls(&t, before + 2, Duration::from_secs(10))?;
-        if let Some(id) = message_id(&calls[before]) {
-            t.wait_for("the retry", Duration::from_secs(10), || {
-                Ok(stub.calls()?[before + 1..]
-                    .iter()
-                    .any(|c| message_id(c).as_ref() == Some(&id)))
-            })?;
-        } else {
-            assert!(calls[before + 1].message.is_some(), "the retry was accepted");
-        }
+        // The retry is accepted (after the batch of B's carrier loss, due
+        // first), with the same Message-ID when the first attempt read it.
+        let id = message_id(&call);
+        t.wait_for("the accepted retry", Duration::from_secs(10), || {
+            Ok(stub.calls()?[before + 1..]
+                .iter()
+                .any(|c| c.mode == "accept" && c.message.is_some() && (id.is_none() || message_id(c) == id)))
+        })?;
     }
     Ok(())
 }
@@ -1599,4 +1600,86 @@ fn timestamp(s: &str) -> Result<std::time::SystemTime> {
     let days = era * 146_097 + doe - 719_468;
     let secs = days * 86_400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?;
     Ok(std::time::UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(n(20..23)?))
+}
+
+/// FR-MET-1 and FR-MET-2: `metrics.listen` serves `GET /metrics` only, with
+/// the families of FR-MET-2 following the paths (B's carrier loss: down,
+/// not ready, not active, a transition counted, probe samples counted); a
+/// reload that moves the listener closes the old address, one whose
+/// address cannot be bound is rejected and keeps the running listener, and
+/// one without `metrics.listen` disables it.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn metrics_follow_the_paths_and_reloads() -> Result<()> {
+    let t = build();
+    let config = |listen: &str| {
+        if listen.is_empty() {
+            polywan::ipv4(&ab())
+        } else {
+            with(&format!("[metrics]\nlisten = \"{listen}\"\n"))
+        }
+    };
+    let get = |addr: &str, method: &str, path: &str| t.http(std::path::Path::new(&format!("tcp:{addr}")), method, path);
+    let f = t.start_polywan(&config("127.0.0.1:9750"))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let metric = |text: &str, line: &str| text.lines().any(|l| l == line);
+    let (code, text) = get("127.0.0.1:9750", "GET", "/metrics")?;
+    assert_eq!(code, 200, "{text}");
+    for line in [
+        "polywan_status_degraded 0",
+        "polywan_path_up{uplink=\"b\",family=\"ipv4\"} 1",
+        "polywan_path_active{uplink=\"b\",family=\"ipv4\"} 1",
+        "polywan_uplink_drained{uplink=\"a\"} 0",
+        "polywan_notifications_failed_total{channel=\"email\"} 0",
+    ] {
+        assert!(metric(&text, line), "{line}\n{text}");
+    }
+    assert!(
+        text.lines().any(
+            |l| l.starts_with("polywan_probe_samples_total{uplink=\"a\",family=\"ipv4\",target=")
+                && l.contains("result=\"ok\"}")
+        ),
+        "{text}"
+    );
+    assert_eq!(get("127.0.0.1:9750", "POST", "/metrics")?.0, 405);
+    assert_eq!(get("127.0.0.1:9750", "GET", "/v1/status")?.0, 404);
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
+    t.wait_for("B down in the metrics", Duration::from_secs(5), || {
+        let (_, text) = get("127.0.0.1:9750", "GET", "/metrics")?;
+        Ok([
+            "polywan_path_up{uplink=\"b\",family=\"ipv4\"} 0",
+            "polywan_path_ready{uplink=\"b\",family=\"ipv4\"} 0",
+            "polywan_path_active{uplink=\"b\",family=\"ipv4\"} 0",
+            "polywan_path_transitions_total{uplink=\"b\",family=\"ipv4\",to=\"down\"} 1",
+        ]
+        .iter()
+        .all(|l| metric(&text, l)))
+    })?;
+    t.carrier_up(Uplink::B)?;
+    // Moved: the old address closes.
+    f.write_config(&config("127.0.0.1:9751"))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert_eq!(get("127.0.0.1:9751", "GET", "/metrics")?.0, 200);
+    assert!(
+        get("127.0.0.1:9750", "GET", "/metrics").is_err(),
+        "the old address is closed"
+    );
+    // An address the router does not have: rejected, the listener stays.
+    f.write_config(&config("192.0.2.99:9752"))?;
+    let out = f.reload_cli()?;
+    let text = polywan::output_text(&out);
+    assert!(
+        !out.status.success() && text.contains("metrics.listen 192.0.2.99:9752"),
+        "{text}"
+    );
+    assert_eq!(get("127.0.0.1:9751", "GET", "/metrics")?.0, 200);
+    // Disabled.
+    f.write_config(&config(""))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert!(get("127.0.0.1:9751", "GET", "/metrics").is_err(), "metrics disabled");
+    Ok(())
 }

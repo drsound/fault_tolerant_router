@@ -15,6 +15,7 @@ pub mod client;
 pub mod socket;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,6 +48,8 @@ const HEAD_FIELDS: usize = 64;
 pub enum Role {
     Control,
     Status,
+    /// `GET /metrics` on `metrics.listen` (FR-MET-1).
+    Metrics,
 }
 
 /// One configured socket.
@@ -93,6 +96,8 @@ pub struct Shared {
     pub orders: mpsc::Sender<Order>,
     /// Notification tests (FR-MAIL-4), outside the State task.
     pub tester: Arc<crate::notifytest::Tester>,
+    /// The notifiers' failures, for the metrics (FR-MET-2).
+    pub failures: Arc<crate::metrics::Failures>,
 }
 
 /// A command of the control socket (FR-API-3).
@@ -139,6 +144,7 @@ pub enum Command {
     /// for clients until the commit.
     Prepare {
         endpoints: Vec<Endpoint>,
+        metrics: Option<SocketAddr>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Serves the prepared configuration: new sockets start, removed ones
@@ -162,20 +168,32 @@ impl Api {
     pub async fn start(
         handle: &tokio::runtime::Handle,
         endpoints: Vec<Endpoint>,
+        metrics: Option<SocketAddr>,
         runtime_dir: PathBuf,
         shared: Shared,
     ) -> Result<Api, String> {
         let (commands, rx) = mpsc::channel(8);
         let (ready, started) = oneshot::channel();
-        handle.spawn(manager(rx, endpoints, Record::new(&runtime_dir), shared, ready));
+        handle.spawn(manager(
+            rx,
+            endpoints,
+            metrics,
+            Record::new(&runtime_dir),
+            shared,
+            ready,
+        ));
         started.await.map_err(|_| "the API manager stopped".to_owned())??;
         Ok(Api { commands })
     }
 
-    pub async fn prepare(&self, endpoints: Vec<Endpoint>) -> Result<(), String> {
+    pub async fn prepare(&self, endpoints: Vec<Endpoint>, metrics: Option<SocketAddr>) -> Result<(), String> {
         let (reply, rx) = oneshot::channel();
         self.commands
-            .send(Command::Prepare { endpoints, reply })
+            .send(Command::Prepare {
+                endpoints,
+                metrics,
+                reply,
+            })
             .await
             .map_err(|_| "the API manager stopped".to_owned())?;
         rx.await.map_err(|_| "the API manager stopped".to_owned())?
@@ -204,13 +222,48 @@ struct Listener {
     cut: watch::Sender<u64>,
 }
 
+/// The metrics listener (FR-MET-1).
+struct MetricsListener {
+    addr: SocketAddr,
+    /// Stops the listener and its connections.
+    stop: watch::Sender<bool>,
+    /// Never advanced (no access policy), but alive: a closed channel
+    /// would end every connection at once.
+    _cut: watch::Sender<u64>,
+}
+
+async fn bind_metrics(addr: SocketAddr) -> Result<std::net::TcpListener, String> {
+    tokio::task::spawn_blocking(move || std::net::TcpListener::bind(addr))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("metrics.listen {addr}: {e}"))
+}
+
+fn serve_metrics(addr: SocketAddr, listener: std::net::TcpListener, shared: &Shared) -> MetricsListener {
+    let (stop, stopped) = watch::channel(false);
+    let (cut, cuts) = watch::channel(0);
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        if let Err(e) = accept_loop(Accepting::Tcp(listener), Role::Metrics, shared, stopped, cuts).await {
+            warn!("metrics listener stopped: {e}");
+        }
+    });
+    info!(%addr, "metrics listening");
+    MetricsListener { addr, stop, _cut: cut }
+}
+
 async fn manager(
     mut rx: mpsc::Receiver<Command>,
     initial: Vec<Endpoint>,
+    initial_metrics: Option<SocketAddr>,
     record: Record,
     shared: Shared,
     ready: oneshot::Sender<Result<(), String>>,
 ) {
+    let mut metrics: Option<MetricsListener> = None;
+    // A prepared change of `metrics.listen`: the new address and its
+    // socket (none to disable, or when the address does not change).
+    let mut metrics_next: Option<(Option<SocketAddr>, Option<std::net::TcpListener>)> = None;
     let mut serving: Vec<Listener> = Vec::new();
     let mut prepared: Vec<(Endpoint, std::os::unix::net::UnixListener, Published)> = Vec::new();
     let mut next: Option<Vec<Endpoint>> = None;
@@ -224,6 +277,14 @@ async fn manager(
                 started = Err(err);
                 break;
             }
+        }
+    }
+    if started.is_ok()
+        && let Some(addr) = initial_metrics
+    {
+        match bind_metrics(addr).await {
+            Ok(l) => metrics = Some(serve_metrics(addr, l, &shared)),
+            Err(e) => started = Err(e),
         }
     }
     let save = |serving: &[Listener], prepared: &[(Endpoint, std::os::unix::net::UnixListener, Published)]| {
@@ -240,6 +301,9 @@ async fn manager(
         for l in serving.drain(..) {
             close(l);
         }
+        if let Some(m) = metrics.take() {
+            let _ = m.stop.send(true);
+        }
     }
     save(&serving, &prepared);
     let failed = started.is_err();
@@ -249,11 +313,28 @@ async fn manager(
     }
     while let Some(c) = rx.recv().await {
         match c {
-            Command::Prepare { endpoints, reply } => {
+            Command::Prepare {
+                endpoints,
+                metrics: wanted_metrics,
+                reply,
+            } => {
                 for (_, _, p) in prepared.drain(..) {
                     socket::unpublish(&p);
                 }
+                metrics_next = None;
                 let mut result = Ok(());
+                // FR-MET-1: a new address is bound before the commit; a
+                // bind failure rejects the reload.
+                let current = metrics.as_ref().map(|m| m.addr);
+                if wanted_metrics != current {
+                    match wanted_metrics {
+                        Some(addr) => match bind_metrics(addr).await {
+                            Ok(l) => metrics_next = Some((Some(addr), Some(l))),
+                            Err(e) => result = Err(e),
+                        },
+                        None => metrics_next = Some((None, None)),
+                    }
+                }
                 for e in &endpoints {
                     match serving.iter().find(|l| l.endpoint.path == e.path) {
                         // FR-API-1: an existing path never changes role.
@@ -280,6 +361,7 @@ async fn manager(
                     for (_, _, p) in prepared.drain(..) {
                         socket::unpublish(&p);
                     }
+                    metrics_next = None;
                     next = None;
                 } else {
                     next = Some(endpoints);
@@ -320,10 +402,20 @@ async fn manager(
                 for (e, l, p) in prepared.drain(..) {
                     serving.push(serve(e, l, p, &shared));
                 }
+                // The old metrics listener and its connections close.
+                if let Some((addr, listener)) = metrics_next.take() {
+                    if let Some(m) = metrics.take() {
+                        let _ = m.stop.send(true);
+                    }
+                    if let (Some(addr), Some(l)) = (addr, listener) {
+                        metrics = Some(serve_metrics(addr, l, &shared));
+                    }
+                }
                 save(&serving, &prepared);
             }
             Command::Rollback => {
                 next = None;
+                metrics_next = None;
                 for (_, _, p) in prepared.drain(..) {
                     socket::unpublish(&p);
                 }
@@ -332,6 +424,9 @@ async fn manager(
             Command::Shutdown(done) => {
                 for l in serving.drain(..) {
                     close(l);
+                }
+                if let Some(m) = metrics.take() {
+                    let _ = m.stop.send(true);
                 }
                 for (_, _, p) in prepared.drain(..) {
                     socket::unpublish(&p);
@@ -369,7 +464,7 @@ fn serve(
     let role = endpoint.role;
     let shared = shared.clone();
     tokio::spawn(async move {
-        if let Err(e) = accept_loop(listener, role, shared, stopped, cuts).await {
+        if let Err(e) = accept_loop(Accepting::Unix(listener), role, shared, stopped, cuts).await {
             warn!("API listener stopped: {e}");
         }
     });
@@ -382,22 +477,54 @@ fn serve(
     }
 }
 
+/// A listening socket of the API or of the metrics.
+enum Accepting {
+    Unix(std::os::unix::net::UnixListener),
+    Tcp(std::net::TcpListener),
+}
+
+/// A connection's stream.
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+enum Listening {
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+impl Listening {
+    async fn accept(&self) -> std::io::Result<Box<dyn Stream>> {
+        Ok(match self {
+            Listening::Unix(l) => Box::new(l.accept().await?.0),
+            Listening::Tcp(l) => Box::new(l.accept().await?.0),
+        })
+    }
+}
+
 async fn accept_loop(
-    listener: std::os::unix::net::UnixListener,
+    listener: Accepting,
     role: Role,
     shared: Shared,
     mut stopped: watch::Receiver<bool>,
     cuts: watch::Receiver<u64>,
 ) -> std::io::Result<()> {
-    listener.set_nonblocking(true)?;
-    let listener = tokio::net::UnixListener::from_std(listener)?;
+    let listener = match listener {
+        Accepting::Unix(l) => {
+            l.set_nonblocking(true)?;
+            Listening::Unix(tokio::net::UnixListener::from_std(l)?)
+        }
+        Accepting::Tcp(l) => {
+            l.set_nonblocking(true)?;
+            Listening::Tcp(tokio::net::TcpListener::from_std(l)?)
+        }
+    };
     let admitted = Arc::new(Semaphore::new(CONNECTIONS));
     let mut refused = Diagnostics::default();
     loop {
         tokio::select! {
             _ = stopped.changed() => return Ok(()),
             r = listener.accept() => {
-                let Ok((stream, _)) = r else { continue };
+                let Ok(stream) = r else { continue };
                 // FR-API-4: beyond the limit, closed at once; no task, no
                 // queue.
                 let Ok(permit) = Arc::clone(&admitted).try_acquire_owned() else {
@@ -439,7 +566,7 @@ impl Diagnostics {
 }
 
 async fn connection(
-    stream: tokio::net::UnixStream,
+    stream: Box<dyn Stream>,
     role: Role,
     shared: Shared,
     mut stopped: watch::Receiver<bool>,
@@ -502,6 +629,14 @@ fn control_only(path: &str) -> bool {
 async fn handle(req: Request<Incoming>, role: Role, shared: &Shared, deadline: &watch::Sender<Instant>) -> Reply {
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
+    if role == Role::Metrics {
+        // FR-MET-1: `GET /metrics` and nothing else.
+        return match (path.as_str(), req.method() == Method::GET) {
+            ("/metrics", true) => metrics(shared),
+            ("/metrics", false) => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+            _ => error(StatusCode::NOT_FOUND, "not found"),
+        };
+    }
     match path.as_str() {
         "/v1/status" if req.method() == Method::GET => status(shared),
         "/v1/events" if req.method() == Method::GET => events(&query, shared, deadline).await,
@@ -622,6 +757,17 @@ fn parse_command(path: &str, body: &[u8]) -> Result<Option<Action>, (StatusCode,
             }
         }
     }
+}
+
+/// `GET /metrics` (FR-MET-2), in the Prometheus text format.
+fn metrics(shared: &Shared) -> Reply {
+    let s = Arc::clone(&shared.status.borrow());
+    let mut r = reply(StatusCode::OK, crate::metrics::render(&s, &shared.failures));
+    r.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    r
 }
 
 #[derive(Serialize)]

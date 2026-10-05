@@ -246,11 +246,7 @@ impl Config {
     /// Features that this build does not implement yet. The daemon refuses
     /// to run a configuration that uses them rather than ignore them.
     pub fn unsupported_features(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        if self.metrics_listen.is_some() {
-            v.push("metrics (metrics.listen)");
-        }
-        v
+        Vec::new()
     }
 }
 

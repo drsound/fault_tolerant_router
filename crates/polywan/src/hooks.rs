@@ -75,7 +75,13 @@ pub async fn run_logged(spec: Spec, kind: &str) -> End {
 /// The hooks notifier: `events` from the bus, the notification settings
 /// from `config` (changed by reloads).
 /// `slots` is the concurrency limit, shared with notification tests.
-pub async fn notifier(mut events: Queue, mut config: watch::Receiver<Arc<Notify>>, slots: Arc<Semaphore>) {
+/// Failed runs count in `failures`.
+pub async fn notifier(
+    mut events: Queue,
+    mut config: watch::Receiver<Arc<Notify>>,
+    slots: Arc<Semaphore>,
+    failures: Arc<crate::metrics::Failures>,
+) {
     let mut user: Option<(String, (u32, u32))> = None;
     while let Some(event) = events.recv().await {
         let notify = Arc::clone(&config.borrow_and_update());
@@ -109,8 +115,11 @@ pub async fn notifier(mut events: Queue, mut config: watch::Receiver<Arc<Notify>
                 return;
             };
             let kind = event.kind;
+            let failures = Arc::clone(&failures);
             tokio::spawn(async move {
-                run_logged(spec, kind).await;
+                if !run_logged(spec, kind).await.success() {
+                    crate::metrics::Failures::add(&failures.hook);
+                }
                 drop(permit);
             });
         }

@@ -526,8 +526,19 @@ pub fn send_ra(device: &str, ra: &Advertisement, count: u32, interval: Duration)
 pub fn http(socket: &Path, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
     use std::io::{Read, Write};
 
-    let mut s = std::os::unix::net::UnixStream::connect(socket).with_context(|| socket.display().to_string())?;
-    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    // `tcp:ADDRESS:PORT` for the metrics listener, a Unix socket otherwise.
+    let mut s: Box<dyn ReadWrite> = match socket.to_str().and_then(|s| s.strip_prefix("tcp:")) {
+        Some(addr) => {
+            let s = std::net::TcpStream::connect(addr).with_context(|| addr.to_owned())?;
+            s.set_read_timeout(Some(Duration::from_secs(15)))?;
+            Box::new(s)
+        }
+        None => {
+            let s = std::os::unix::net::UnixStream::connect(socket).with_context(|| socket.display().to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(15)))?;
+            Box::new(s)
+        }
+    };
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: polywan\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -543,3 +554,6 @@ pub fn http(socket: &Path, method: &str, path: &str, body: &str) -> Result<(u16,
     let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
     Ok((code, body))
 }
+
+trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}

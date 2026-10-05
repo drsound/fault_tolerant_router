@@ -129,7 +129,7 @@ fn spec_example_is_valid() {
     assert_eq!(email.sendmail, PathBuf::from("/usr/sbin/sendmail"));
     assert_eq!(c.metrics_listen.unwrap().port(), 9750);
     assert!(c.manages(Family::V6));
-    assert_eq!(c.unsupported_features(), ["metrics (metrics.listen)"]);
+    assert!(c.unsupported_features().is_empty());
     let gates = parse(&format!("{MINIMAL}[health.quality]\nmax_loss = 0.1\n")).unwrap();
     assert!(gates.unsupported_features().is_empty(), "quality gates are supported");
 }

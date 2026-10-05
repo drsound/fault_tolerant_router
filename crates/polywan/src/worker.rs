@@ -259,11 +259,17 @@ impl Lanes {
         self.persist.try_send(job).map_err(Lost::from)
     }
 
-    /// Prepares the API listeners of a reloaded configuration.
-    pub fn prepare_api(&self, seq: u64, api: crate::api::Api, endpoints: Vec<crate::api::Endpoint>) {
+    /// Prepares the API and metrics listeners of a reloaded configuration.
+    pub fn prepare_api(
+        &self,
+        seq: u64,
+        api: crate::api::Api,
+        endpoints: Vec<crate::api::Endpoint>,
+        metrics: Option<std::net::SocketAddr>,
+    ) {
         let done = self.done.clone();
         self.handle.spawn(async move {
-            let result = api.prepare(endpoints).await;
+            let result = api.prepare(endpoints, metrics).await;
             let _ = done.send(Done::ApiPrepared { seq, result }).await;
         });
     }

@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::config::{Email, Notify};
 use crate::events::{Event, Queue};
+use crate::metrics::Failures;
 use crate::subprocess::{self, Spec};
 
 /// The email event queue (FR-MAIL-2).
@@ -365,6 +366,8 @@ pub fn spec(email: &Email, input: Vec<u8>, deadline: Duration) -> Spec {
 /// The decisions of the email notifier.
 pub struct Mail {
     pub times: Times,
+    /// `polywan_notifications_failed_total{channel="email"}`.
+    pub failures: Arc<Failures>,
     instance: String,
     next_id: u64,
     pub batch: Option<Batch>,
@@ -377,6 +380,7 @@ impl Mail {
     pub fn new(instance: String, times: Times) -> Mail {
         Mail {
             times,
+            failures: Arc::default(),
             instance,
             next_id: 0,
             batch: None,
@@ -555,8 +559,11 @@ pub enum Request {
     },
 }
 
-/// Logs a submission's end and applies FR-MAIL-3.
+/// Logs a submission's end, counts a failure and applies FR-MAIL-3.
 fn finished(mail: &mut Mail, m: Message, result: Submitted, now: Instant, retry: bool) {
+    if result != Submitted::Accepted {
+        Failures::add(&mail.failures.email);
+    }
     match result {
         Submitted::Accepted => info!(message_id = %m.id, "email submitted"),
         Submitted::Unbuildable(e) => warn!(message_id = %m.id, error = %e, "email not submitted"),
@@ -589,8 +596,10 @@ pub async fn notifier(
     mut config: watch::Receiver<Arc<Notify>>,
     mut requests: mpsc::Receiver<Request>,
     instance: String,
+    failures: Arc<Failures>,
 ) {
     let mut mail = Mail::new(instance, crate::test_hooks::mail_times(Times::default()));
+    mail.failures = failures;
     let mut notify = Arc::clone(&config.borrow_and_update());
     // The running submission, with the message it submits.
     let mut running: Option<Running> = None;
