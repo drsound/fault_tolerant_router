@@ -320,6 +320,10 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
                 unsupported.join(", ")
             )]);
         }
+        let descriptors = crate::subprocess::descriptor_errors(&new, &crate::subprocess::inherited_descriptors());
+        if !descriptors.is_empty() {
+            return Err(descriptors);
+        }
         let endpoints = crate::api::endpoints(&new.api).map_err(|e| vec![e])?;
         Ok((new, endpoints))
     })

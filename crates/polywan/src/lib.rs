@@ -28,6 +28,7 @@ pub mod reconcile;
 pub mod select;
 pub mod state;
 pub mod status;
+pub mod subprocess;
 pub mod sysctl;
 pub mod system;
 pub mod test_hooks;

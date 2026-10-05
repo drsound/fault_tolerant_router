@@ -385,6 +385,17 @@ pub async fn run(opts: Options) -> Result<()> {
     // FR-CFG-5: nothing configured runs before its ownership is verified.
     report(&checks::trusted(&opts.config, &cfg))?;
     report(&checks::identities(&cfg))?;
+    // FR-HOOK-3: no subprocess may inherit a descriptor of ours.
+    let inherited = crate::subprocess::inherited_descriptors();
+    if let Some(e) = crate::subprocess::descriptor_errors(&cfg, &inherited).first() {
+        bail!("{e}");
+    }
+    if !inherited.is_empty() {
+        warn!(
+            ?inherited,
+            "descriptors inherited without close-on-exec: hooks and sendmail stay refused while they are open"
+        );
+    }
     let unsupported = cfg.unsupported_features();
     if !unsupported.is_empty() {
         bail!("not supported by this development build: {}", unsupported.join(", "));

@@ -12,7 +12,6 @@ use tokio::process::Command;
 use crate::nft::TABLE;
 
 pub const DEADLINE: Duration = Duration::from_secs(10);
-const CAPTURE: usize = 64 * 1024;
 
 /// Runs `nft` with arguments and optional standard input; returns stdout.
 /// The binary's trust is verified right before each execution (FR-CFG-5).
@@ -45,10 +44,10 @@ pub async fn run(nft: &Path, args: &[&str], input: Option<&str>) -> Result<Strin
                 let _ = o.read_to_end(&mut out).await;
             }
         };
+        // Drained to its end, the first 64 KiB kept: a verbose nft never
+        // blocks on a full pipe until the deadline.
         let read_err = async {
-            if let Some(e) = stderr.as_mut() {
-                let _ = e.take(CAPTURE as u64).read_to_end(&mut err).await;
-            }
+            err = crate::subprocess::drain(stderr.take()).await.data;
         };
         tokio::join!(read_out, read_err);
         let status = child.wait().await.map_err(|e| format!("waiting for nft: {e}"))?;
