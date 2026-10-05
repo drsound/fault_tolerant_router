@@ -74,8 +74,8 @@ pub async fn run_logged(spec: Spec, kind: &str) -> End {
 
 /// The hooks notifier: `events` from the bus, the notification settings
 /// from `config` (changed by reloads).
-pub async fn notifier(mut events: Queue, mut config: watch::Receiver<Arc<Notify>>) {
-    let slots = Arc::new(Semaphore::new(CONCURRENCY));
+/// `slots` is the concurrency limit, shared with notification tests.
+pub async fn notifier(mut events: Queue, mut config: watch::Receiver<Arc<Notify>>, slots: Arc<Semaphore>) {
     let mut user: Option<(String, (u32, u32))> = None;
     while let Some(event) = events.recv().await {
         let notify = Arc::clone(&config.borrow_and_update());

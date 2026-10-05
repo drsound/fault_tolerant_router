@@ -93,6 +93,17 @@ enum Command {
         #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
         socket: PathBuf,
     },
+    /// Test every configured notification channel through the daemon;
+    /// --offline tests them here, as root, outside the service's sandbox.
+    NotifyTest {
+        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET, conflicts_with = "offline")]
+        socket: PathBuf,
+        /// Test locally while the daemon is stopped (holds the instance lock).
+        #[arg(long)]
+        offline: bool,
+        #[arg(long, default_value = config::DEFAULT_PATH, requires = "offline")]
+        config: PathBuf,
+    },
     /// Release the persisted id binding of a removed uplink: through the
     /// control socket while the daemon runs, offline otherwise.
     ForgetUplink {
@@ -167,6 +178,17 @@ fn main() -> ExitCode {
                 polywan::cli::forget(&socket, &name, &config, &cli.lock).await
             }
             Command::Reload { socket } => polywan::cli::reload(&socket).await,
+            Command::NotifyTest {
+                socket,
+                offline,
+                config,
+            } => {
+                if offline {
+                    polywan::cli::notify_test_offline(&config, &cli.lock).await
+                } else {
+                    polywan::cli::notify_test(&socket).await
+                }
+            }
             Command::Status { json, socket } => polywan::cli::status(&socket, json).await,
             Command::Drain { name, force, socket } => polywan::cli::drain(&socket, &name, true, force).await,
             Command::Undrain { name, socket } => polywan::cli::drain(&socket, &name, false, false).await,

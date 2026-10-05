@@ -274,3 +274,105 @@ fn forget_offline(path: &Path, name: &str, lock: &Path) -> Result<()> {
     println!("uplink {name:?} forgotten; id {id} can be reused");
     Ok(())
 }
+
+/// Prints a test's reports; an error if a channel did not succeed or none
+/// is configured (FR-MAIL-4).
+pub fn print_reports(reports: &[crate::notifytest::Report]) -> Result<()> {
+    use crate::notifytest::Outcome;
+    if reports.is_empty() {
+        bail!("no notification channel is configured");
+    }
+    let mut failed = 0;
+    for r in reports {
+        let name = match &r.program {
+            Some(p) => format!("{} {p}", r.channel),
+            None => r.channel.clone(),
+        };
+        let mut line = format!(
+            "{name}: {}",
+            match r.outcome {
+                Outcome::Succeeded => "succeeded",
+                Outcome::Failed => "failed",
+                Outcome::TimedOut => "timed out",
+                Outcome::NotStarted => "not started",
+            }
+        );
+        if let Some(c) = r.exit_status.filter(|c| *c != 0) {
+            line += &format!(", exit status {c}");
+        }
+        if let Some(s) = r.signal {
+            line += &format!(", killed by signal {s}");
+        }
+        if let Some(e) = &r.error {
+            line += &format!(": {e}");
+        }
+        println!("{line}");
+        for l in r.stderr.lines() {
+            println!("  stderr: {l}");
+        }
+        if r.stderr_truncated {
+            println!("  stderr: [truncated]");
+        }
+        if r.outcome != Outcome::Succeeded {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} channels failed", reports.len());
+    }
+    Ok(())
+}
+
+/// How long `notify-test` waits: the daemon bounds the test by its budget
+/// (60 s plus the hooks' timeouts), which the client cannot know without
+/// reading the configuration.
+const NOTIFY_TEST_WAIT: Duration = Duration::from_secs(3600);
+
+/// `notify-test` (FR-MAIL-4), through the control socket.
+pub async fn notify_test(socket: &Path) -> Result<()> {
+    let (status, body) = client::request(socket, Method::POST, "/v1/notify-test", None, NOTIFY_TEST_WAIT)
+        .await
+        .with_context(|| socket.display().to_string())?;
+    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+    if status != hyper::StatusCode::OK {
+        bail!(
+            "notify-test: {status}: {}",
+            v.get("error").and_then(Value::as_str).unwrap_or("request failed")
+        );
+    }
+    let reports: Vec<crate::notifytest::Report> =
+        serde_json::from_value(v["channels"].clone()).context("the response has no channel reports")?;
+    print_reports(&reports)
+}
+
+/// `notify-test --offline` (FR-MAIL-4): as root, with trusted executables
+/// and the instance lock, outside the service's sandbox.
+pub async fn notify_test_offline(path: &Path, lock: &Path) -> Result<()> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("notify-test --offline needs root");
+    }
+    let cfg = crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut f = crate::checks::trusted(path, &cfg);
+    f.extend(crate::checks::identities(&cfg));
+    if let Some(e) = f.errors.first() {
+        bail!("{e}");
+    }
+    if let Some(e) = crate::subprocess::descriptor_errors(&cfg, &crate::subprocess::inherited_descriptors()).first() {
+        bail!("{e}");
+    }
+    let _lock = crate::state::InstanceLock::acquire(lock)
+        .map_err(|e| anyhow::anyhow!("{e}; while the daemon runs, use notify-test without --offline"))?;
+    eprintln!(
+        "WARNING: offline test: the service's sandbox was not exercised; only `polywan notify-test` through the daemon tests it"
+    );
+    let reports = crate::notifytest::run(crate::notifytest::Channels {
+        notify: std::sync::Arc::new(cfg.notify.clone()),
+        mail: None,
+        slots: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::hooks::CONCURRENCY)),
+        instance: crate::events::instance_id(),
+        times: crate::test_hooks::mail_times(crate::mail::Times::default()),
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    print_reports(&reports)
+}

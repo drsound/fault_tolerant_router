@@ -21,6 +21,7 @@ pub mod model;
 pub mod netlink;
 pub mod nft;
 pub mod nftctl;
+pub mod notifytest;
 pub mod observer;
 pub mod plan;
 pub mod probe;

@@ -573,33 +573,46 @@ pub async fn run(opts: Options) -> Result<()> {
     // The API sockets (FR-API-1), served on the I/O runtime.
     let endpoints = crate::api::endpoints(&d.cfg.api).map_err(|e| anyhow::anyhow!("api: {e}"))?;
     let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
-    let shared = crate::api::Shared {
-        status: d.status.subscribe(),
-        ring: d.bus.ring(),
-        latest: d.bus.subscribe(),
-        started: std::time::Instant::now(),
-        orders,
-    };
     let runtime_dir = opts.lock.parent().unwrap_or(Path::new("/run/polywan")).to_owned();
     let Some(io) = d.io.as_ref() else {
         bail!("the I/O thread is not running");
     };
     // FR-HOOK-4: the hooks read their own bounded queue of the bus.
     let hook_events = d.bus.add_notifier("hooks", crate::hooks::QUEUE, usize::MAX);
-    io.handle()
-        .spawn(crate::hooks::notifier(hook_events, d.notify_config.subscribe()));
+    // FR-HOOK-3: one concurrency limit for hooks and their tests.
+    let hook_slots = Arc::new(tokio::sync::Semaphore::new(crate::hooks::CONCURRENCY));
+    io.handle().spawn(crate::hooks::notifier(
+        hook_events,
+        d.notify_config.subscribe(),
+        Arc::clone(&hook_slots),
+    ));
     // FR-MAIL-2: the email queue receives the selected types only.
     let mail_events = d
         .bus
         .add_notifier("email", crate::mail::QUEUE, crate::mail::QUEUE_BYTES);
     d.bus.select("email", Some(email_selection(&d.cfg)));
-    let (mail, mail_requests) = mpsc::channel(1);
+    // A flush and a test at most (tests run one at a time).
+    let (mail, mail_requests) = mpsc::channel(2);
     io.handle().spawn(crate::mail::notifier(
         mail_events,
         d.notify_config.subscribe(),
         mail_requests,
         d.bus.instance().to_owned(),
     ));
+    let shared = crate::api::Shared {
+        status: d.status.subscribe(),
+        ring: d.bus.ring(),
+        latest: d.bus.subscribe(),
+        started: std::time::Instant::now(),
+        orders,
+        tester: Arc::new(crate::notifytest::Tester::new(
+            d.notify_config.subscribe(),
+            mail.clone(),
+            hook_slots,
+            d.bus.instance().to_owned(),
+            crate::test_hooks::mail_times(crate::mail::Times::default()),
+        )),
+    };
     d.mail = Some(mail);
     let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
         .await

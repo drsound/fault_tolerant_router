@@ -1066,7 +1066,9 @@ fn as25_hooks_run_bounded_and_detached() -> Result<()> {
         read("caps")
     );
     // Listed first, without a redirection (the shell saves descriptors
-    // around redirections), to the captured standard output.
+    // around redirections), to the captured standard output, logged once
+    // the hook has exited (after its record).
+    f.wait_log(&t, "hook finished", 1, Duration::from_secs(5))?;
     assert!(f.log().contains("stdout=0\\n1\\n2\\n stderr="), "only 0–2: {}", f.log());
     assert_eq!(read("pgid").trim(), read("pid").trim(), "its own process group");
     let vars: Vec<String> = read("vars")
@@ -1317,6 +1319,104 @@ fn as25_sendmail_retries_follow_reloads() -> Result<()> {
     Ok(())
 }
 
+/// AS-25, notification tests (FR-MAIL-4, FR-API-3, FR-API-4): `notify-test`
+/// tries email and every hook once, bypassing their filters; a hook that
+/// takes 11 s makes the test outlast the ordinary 10 s deadline, and a
+/// second test meanwhile is refused (429). Hooks get the synthetic
+/// `notify_test` event, which never enters the event history. A failing
+/// sendmail is reported with its exit status and not retried. Offline,
+/// the test is refused while the daemon holds the lock, and runs once it
+/// has stopped, warning that the sandbox was not exercised.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as25_notification_tests() -> Result<()> {
+    let t = build();
+    let stub = Stub::new(&t, "sendmail")?;
+    let out = t.exec_dir()?.join("test-hook");
+    std::fs::create_dir_all(&out)?;
+    let delay = out.join("delay");
+    std::fs::write(&delay, "11")?;
+    let record = format!("cat > {}/stdin", out.display());
+    let sleeper = format!("sleep $(cat {})", delay.display());
+    // Filters that the tests bypass; hooks as root, to write the record.
+    let config = with(&format!(
+        "[notify]\ncoalesce = \"1s\"\nhook_user = \"root\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\nsendmail = \"{}\"\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {record:?}]\nevents = [\"daemon_stopping\"]\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {sleeper:?}]\nevents = [\"daemon_stopping\"]\ntimeout = \"15s\"\n",
+        stub.path.display()
+    ));
+    let mut f = t.prepare_polywan(&config)?;
+    f.set_env("POLYWAN_TEST_MAIL_TIMES", "500,5000");
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    stub.wait_calls(&t, 1, Duration::from_secs(10))?;
+    // A test outlasting the ordinary deadline, and a second one meanwhile.
+    let socket = f.control_socket().display().to_string();
+    let bin = polywan::daemon_bin()?;
+    let started = Instant::now();
+    let (long, second) = std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            std::process::Command::new(&bin)
+                .args(["notify-test", "--socket", &socket])
+                .output()
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        let second = std::process::Command::new(&bin)
+            .args(["notify-test", "--socket", &socket])
+            .output();
+        (h.join().expect("the long test"), second)
+    });
+    let (long, second) = (long?, second?);
+    let elapsed = started.elapsed();
+    let text = polywan::output_text(&long);
+    assert!(long.status.success(), "{text}");
+    assert!(
+        elapsed > Duration::from_secs(10) && elapsed < Duration::from_secs(20),
+        "{elapsed:?}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.ends_with(": succeeded")).count(),
+        3,
+        "email and both hooks: {text}"
+    );
+    let refused = polywan::output_text(&second);
+    assert!(!second.status.success() && refused.contains("429"), "{refused}");
+    // The synthetic event, outside the history.
+    let event: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("stdin"))?)?;
+    assert_eq!(
+        (event["type"].as_str(), event["test"].as_bool()),
+        (Some("notify_test"), Some(true))
+    );
+    assert!(!f.events()?.iter().any(|(_, k, _)| k == "notify_test"));
+    let calls = stub.calls()?;
+    assert_eq!(calls.iter().filter(|c| kind(c) == "test").count(), 1);
+    // A failing sendmail: reported, not retried.
+    std::fs::write(&delay, "0")?;
+    stub.set(Mode::Exit(75))?;
+    let before = stub.calls()?.len();
+    let failed = f.notify_test()?;
+    let text = polywan::output_text(&failed);
+    assert!(!failed.status.success(), "{text}");
+    assert!(text.contains("email: failed, exit status 75"), "{text}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(stub.calls()?.len(), before + 1, "tests are not retried");
+    // Offline: refused while the daemon holds the lock, then run.
+    stub.set(Mode::Accept)?;
+    let refused = f.cli_config(&["notify-test", "--offline"])?;
+    let text = polywan::output_text(&refused);
+    assert!(
+        !refused.status.success() && text.contains("without --offline"),
+        "{text}"
+    );
+    f.stop()?;
+    let before = stub.calls()?.len();
+    let offline = f.cli_config(&["notify-test", "--offline"])?;
+    let text = polywan::output_text(&offline);
+    assert!(offline.status.success(), "{text}");
+    assert!(text.contains("sandbox was not exercised"), "{text}");
+    let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(5))?;
+    assert_eq!(kind(&calls[before]), "test");
+    Ok(())
+}
+
 /// AS-07 (FR-HEALTH-2, FR-HEALTH-3, FR-MAIL-2), with the hour of the rate
 /// limit shortened to 12 s: while B's carrier flaps every 2 s for 60 s, B
 /// goes down once (with `rise = 5`, 2 s of carrier never bring it back) and
@@ -1324,7 +1424,10 @@ fn as25_sendmail_retries_follow_reloads() -> Result<()> {
 /// coalescing window, with their headers. Then, with `max_per_hour = 3`
 /// and events every second, every 12 s window holds at most three
 /// notifications and one suppression notice, and a notification after the
-/// window reports the suppressed ones.
+/// window reports the suppressed ones. Notification tests, one while a
+/// batch is open and two during the suppression, are sent at once, keep a
+/// Unicode line and a lone-dot line, and neither flush the batch nor take
+/// or reset the hourly allowance (FR-MAIL-4).
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
@@ -1352,8 +1455,13 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     stub.wait_calls(&t, 1, Duration::from_secs(10))?;
     let start = f.events()?.last().map_or(0, |e| e.0);
-    for _ in 0..15 {
+    for i in 0..15 {
         t.carrier_down(Uplink::B)?;
+        if i == 0 {
+            // B's loss opened a batch: the test goes out at once.
+            let out = f.notify_test()?;
+            assert!(out.status.success(), "{}", polywan::output_text(&out));
+        }
         std::thread::sleep(Duration::from_secs(2));
         t.carrier_up(Uplink::B)?;
         std::thread::sleep(Duration::from_secs(2));
@@ -1379,7 +1487,17 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
             .filter(|(seq, kind, _)| *seq > start && selected.contains(&kind.as_str()))
             .all(|(_, kind, l)| bodies.contains(&format!("{} {kind}", l.split(' ').next().unwrap_or("")))))
     })?;
-    for c in stub.calls()? {
+    let calls = stub.calls()?;
+    let tests: Vec<&Call> = calls.iter().filter(|c| kind(c) == "test").collect();
+    assert_eq!(tests.len(), 1);
+    let m = tests[0].message.as_ref().context("message")?;
+    assert!(
+        m.body.contains("\nPolyWAN — prova ✓\n.\nEnd of the test.\n"),
+        "{}",
+        m.body
+    );
+    assert_eq!(tests[0].args, ["-i", "-f", "router@example.com", "admin@example.com"]);
+    for c in calls.iter().filter(|c| kind(c) != "test") {
         let m = c.message.as_ref().context("message")?;
         for h in [
             "Date",
@@ -1415,9 +1533,14 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     assert!(out.status.success(), "{}", polywan::output_text(&out));
     let from = std::time::SystemTime::now();
     let mut drained = false;
-    while from.elapsed()? < Duration::from_secs(30) {
+    for i in 0..30 {
         drained = !drained;
         f.drain("a", drained, false)?;
+        if i == 12 || i == 22 {
+            // During the suppression.
+            let out = f.notify_test()?;
+            assert!(out.status.success(), "{}", polywan::output_text(&out));
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
     std::thread::sleep(Duration::from_secs(4));
@@ -1426,14 +1549,9 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
         .into_iter()
         .filter(|c| c.at >= from - Duration::from_secs(1))
         .collect();
-    let notices: Vec<&Call> = calls
-        .iter()
-        .filter(|c| subject(c).starts_with("PolyWAN notifications suppressed"))
-        .collect();
-    let notes: Vec<&Call> = calls
-        .iter()
-        .filter(|c| !subject(c).starts_with("PolyWAN notifications suppressed"))
-        .collect();
+    let notices: Vec<&Call> = calls.iter().filter(|c| kind(c) == "notice").collect();
+    let notes: Vec<&Call> = calls.iter().filter(|c| kind(c) == "notification").collect();
+    assert_eq!(calls.iter().filter(|c| kind(c) == "test").count(), 2);
     let window = Duration::from_millis(12_000 - 300);
     for c in &notes {
         let within = notes
@@ -1454,6 +1572,18 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
         "a notification after the window reports the suppressed ones"
     );
     Ok(())
+}
+
+/// What a recorded message is, by its Subject.
+fn kind(c: &Call) -> &'static str {
+    let s = subject(c);
+    if s.starts_with("PolyWAN notification test") {
+        "test"
+    } else if s.starts_with("PolyWAN notifications suppressed") {
+        "notice"
+    } else {
+        "notification"
+    }
 }
 
 /// An RFC 3339 UTC timestamp with milliseconds (event times).

@@ -391,11 +391,17 @@ impl Mail {
         self.batch.get_or_insert_with(|| Batch::new(now + coalesce)).add(e);
     }
 
-    pub fn message(&mut self, kind: Kind, body: String, email: &Email, now: Instant) -> Message {
+    /// The number of the next Message-ID.
+    fn next(&mut self) -> u64 {
         self.next_id += 1;
+        self.next_id
+    }
+
+    pub fn message(&mut self, kind: Kind, body: String, email: &Email, now: Instant) -> Message {
+        let n = self.next();
         Message {
             kind,
-            id: message_id(&self.instance, self.next_id, &email.from),
+            id: message_id(&self.instance, n, &email.from),
             date: SystemTime::now(),
             body,
             failures: 0,
@@ -482,27 +488,71 @@ pub enum Submitted {
 /// Submits a message with the configuration it starts with; the
 /// executable's trust is checked first (FR-CFG-5).
 pub async fn submit(m: &Message, email: &Email, deadline: Duration) -> Submitted {
-    let input = match render(m, email, hostname().as_deref()) {
-        Ok(i) => i,
-        Err(e) => return Submitted::Unbuildable(e),
-    };
-    let trust = crate::checks::executable(&email.sendmail, "notify.email.sendmail");
-    if !trust.errors.is_empty() {
-        return Submitted::Failed(trust.errors.join("; "));
-    }
-    let o = subprocess::run(&spec(email, input, deadline)).await;
-    if o.end.success() {
-        Submitted::Accepted
-    } else {
-        Submitted::Failed(format!("{}, stderr: {}", o.end, o.stderr.escaped()))
+    match attempt(m, email, deadline).await {
+        Err(Before::Unbuildable(e)) => Submitted::Unbuildable(e),
+        Err(Before::Untrusted(e)) => Submitted::Failed(e),
+        Ok(o) if o.end.success() => Submitted::Accepted,
+        Ok(o) => Submitted::Failed(format!("{}, stderr: {}", o.end, o.stderr.escaped())),
     }
 }
+
+/// Why an attempt ran no process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Before {
+    Unbuildable(String),
+    Untrusted(String),
+}
+
+impl std::fmt::Display for Before {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Before::Unbuildable(e) | Before::Untrusted(e) => f.write_str(e),
+        }
+    }
+}
+
+/// One run of sendmail for a message, its executable's trust checked first
+/// (FR-CFG-5).
+pub async fn attempt(m: &Message, email: &Email, deadline: Duration) -> Result<subprocess::Outcome, Before> {
+    let input = render(m, email, hostname().as_deref()).map_err(Before::Unbuildable)?;
+    let trust = crate::checks::executable(&email.sendmail, "notify.email.sendmail");
+    if !trust.errors.is_empty() {
+        return Err(Before::Untrusted(trust.errors.join("; ")));
+    }
+    Ok(subprocess::run(&spec(email, input, deadline)).await)
+}
+
+/// A notification test's message (FR-MAIL-4), outside the rate limit.
+pub fn test_message(instance: &str, n: u64, email: &Email) -> Message {
+    Message {
+        kind: Kind::Test,
+        id: message_id(instance, n, &email.from),
+        date: SystemTime::now(),
+        body: crate::notifytest::body(hostname().as_deref()),
+        failures: 0,
+        due: Instant::now(),
+    }
+}
+
+/// The answer to a notification test's email channel.
+pub type TestRun = Result<subprocess::Outcome, String>;
+
+/// Called when a test's process is about to run.
+pub type Started = Box<dyn FnOnce() + Send>;
 
 /// Requests to the email notifier.
 pub enum Request {
     /// The daemon stops: close the batch, try what waits once, within
     /// [`SHUTDOWN`], then answer and end.
     Flush(oneshot::Sender<()>),
+    /// A notification test (FR-MAIL-4): it waits for a running submission
+    /// (one at a time), goes before waiting messages, is never retried, and
+    /// is cancelled when its answer is no longer awaited. `started` is
+    /// called when its process is about to run.
+    Test {
+        reply: oneshot::Sender<TestRun>,
+        started: Started,
+    },
 }
 
 /// Logs a submission's end and applies FR-MAIL-3.
@@ -519,8 +569,11 @@ fn finished(mail: &mut Mail, m: Message, result: Submitted, now: Instant, retry:
     }
 }
 
-/// The running submission and the message it submits.
-type Running = (Message, std::pin::Pin<Box<dyn Future<Output = Submitted> + Send>>);
+/// The running submission and the message it submits (none for a test).
+type Running = (
+    Option<Message>,
+    std::pin::Pin<Box<dyn Future<Output = Submitted> + Send>>,
+);
 
 async fn at(t: Option<Instant>) {
     match t {
@@ -541,9 +594,14 @@ pub async fn notifier(
     let mut notify = Arc::clone(&config.borrow_and_update());
     // The running submission, with the message it submits.
     let mut running: Option<Running> = None;
+    let mut test: Option<(oneshot::Sender<TestRun>, Started)> = None;
     loop {
         let close = mail.batch.as_ref().map(|b| b.deadline);
-        let due = if running.is_none() { mail.next_due() } else { None };
+        let due = match (&running, &test) {
+            (Some(_), _) => None,
+            (None, Some(_)) => Some(Instant::now()),
+            (None, None) => mail.next_due(),
+        };
         tokio::select! {
             e = events.recv() => {
                 let Some(e) = e else { return };
@@ -558,22 +616,44 @@ pub async fn notifier(
                 }
             },
             () = at(due) => match &notify.email {
+                Some(email) if test.is_some() => {
+                    let (mut reply, started) = test.take().expect("a test");
+                    let n = mail.next();
+                    let m = test_message(&mail.instance, n, email);
+                    let (email, deadline) = (email.clone(), mail.times.deadline);
+                    started();
+                    running = Some((None, Box::pin(async move {
+                        let r = tokio::select! {
+                            r = attempt(&m, &email, deadline) => Some(r.map_err(|e| e.to_string())),
+                            () = reply.closed() => None,
+                        };
+                        if let Some(r) = r {
+                            let _ = reply.send(r);
+                        }
+                        Submitted::Accepted
+                    })));
+                }
                 Some(email) => {
                     if let Some(m) = mail.take_due(Instant::now()) {
                         let (email, deadline) = (email.clone(), mail.times.deadline);
                         let message = m.clone();
-                        running = Some((m, Box::pin(async move { submit(&message, &email, deadline).await })));
+                        running = Some((Some(m), Box::pin(async move { submit(&message, &email, deadline).await })));
                     }
                 }
                 None => {
                     mail.discard();
+                    if let Some((reply, _)) = test.take() {
+                        let _ = reply.send(Err("email is not configured".into()));
+                    }
                 }
             },
             result = async { running.as_mut().expect("polled while running").1.as_mut().await }, if running.is_some() => {
-                let (m, _) = running.take().expect("running");
-                // A retry needs email still configured (FR-MAIL-1).
-                let retry = notify.email.is_some();
-                finished(&mut mail, m, result, Instant::now(), retry);
+                // A test answered by itself.
+                if let (Some(m), _) = running.take().expect("running") {
+                    // A retry needs email still configured (FR-MAIL-1).
+                    let retry = notify.email.is_some();
+                    finished(&mut mail, m, result, Instant::now(), retry);
+                }
             }
             changed = config.changed() => {
                 if changed.is_err() {
@@ -589,7 +669,18 @@ pub async fn notifier(
                 notify = next;
             }
             request = requests.recv() => {
-                let Some(Request::Flush(done)) = request else { return };
+                let done = match request {
+                    None => return,
+                    Some(Request::Test { reply, started }) => {
+                        if test.is_some() {
+                            let _ = reply.send(Err("another test is running".into()));
+                        } else {
+                            test = Some((reply, started));
+                        }
+                        continue;
+                    }
+                    Some(Request::Flush(done)) => done,
+                };
                 while let Some(e) = events.try_recv() {
                     if notify.email.is_some() {
                         mail.add(Instant::now(), notify.coalesce, &e);
@@ -611,7 +702,8 @@ async fn flush(mail: &mut Mail, notify: &Notify, running: Option<Running>) {
     let deadline = mail.times.deadline;
     let pending = std::mem::take(&mut mail.waiting);
     let work = async {
-        if let Some((m, f)) = running {
+        // A running test is cancelled (dropped).
+        if let Some((Some(m), f)) = running {
             let r = f.await;
             finished(mail, m, r, Instant::now(), false);
         }

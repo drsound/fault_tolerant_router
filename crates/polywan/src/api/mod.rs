@@ -91,6 +91,8 @@ pub struct Shared {
     pub latest: watch::Receiver<u64>,
     pub started: std::time::Instant,
     pub orders: mpsc::Sender<Order>,
+    /// Notification tests (FR-MAIL-4), outside the State task.
+    pub tester: Arc<crate::notifytest::Tester>,
 }
 
 /// A command of the control socket (FR-API-3).
@@ -508,15 +510,16 @@ async fn handle(req: Request<Incoming>, role: Role, shared: &Shared, deadline: &
             if req.method() != Method::POST {
                 return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
             }
-            command(req, &path, shared).await
+            command(req, &path, shared, deadline).await
         }
         _ => error(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
 /// A write endpoint: the body is read within its bound, the command goes to
-/// the State task, the answer comes back before the deadline.
-async fn command(req: Request<Incoming>, path: &str, shared: &Shared) -> Reply {
+/// the State task, the answer comes back before the deadline; a
+/// notification test runs on this runtime.
+async fn command(req: Request<Incoming>, path: &str, shared: &Shared, deadline: &watch::Sender<Instant>) -> Reply {
     use http_body_util::{BodyExt, Limited};
 
     let body = match Limited::new(req.into_body(), BODY_BYTES).collect().await {
@@ -525,7 +528,7 @@ async fn command(req: Request<Incoming>, path: &str, shared: &Shared) -> Reply {
     };
     let request = match parse_command(path, &body) {
         Ok(Some(r)) => r,
-        Ok(None) => return error(StatusCode::NOT_IMPLEMENTED, "not implemented by this development build"),
+        Ok(None) => return notify_test(shared, deadline).await,
         Err((code, e)) => return error(code, &e),
     };
     let (reply, answer) = oneshot::channel();
@@ -544,11 +547,42 @@ async fn command(req: Request<Incoming>, path: &str, shared: &Shared) -> Reply {
     }
 }
 
+/// `POST /v1/notify-test` (FR-MAIL-4): one test at a time (429), refused
+/// before any channel starts when the email notifier cannot take it (503);
+/// its budget extends the deadline, the response write keeps its own. A
+/// disconnected client cancels nothing: the test runs to its end once.
+async fn notify_test(shared: &Shared, deadline: &watch::Sender<Instant>) -> Reply {
+    use crate::notifytest::Refusal;
+
+    let tester = Arc::clone(&shared.tester);
+    let Ok(running) = tester.begin() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "a notification test is running");
+    };
+    let _ = deadline.send(Instant::now() + tester.budget() + DEADLINE);
+    let task = tokio::spawn(async move {
+        let r = tester.run().await;
+        drop(running);
+        r
+    });
+    let r = task.await;
+    let _ = deadline.send(Instant::now() + DEADLINE);
+    match r {
+        Ok(Ok(reports)) => reply_json(StatusCode::OK, &serde_json::json!({ "channels": reports })),
+        Ok(Err(Refusal::Busy)) => error(StatusCode::TOO_MANY_REQUESTS, "a notification test is running"),
+        Ok(Err(Refusal::Unavailable)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the email notifier cannot take a test now",
+        ),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "the test did not complete"),
+    }
+}
+
 fn reply_json(code: StatusCode, body: &serde_json::Value) -> Reply {
     reply(code, body.to_string())
 }
 
-/// The command of a control path and its body.
+/// The command of a control path and its body; `None` for a notification
+/// test, which is not a command of the State task.
 fn parse_command(path: &str, body: &[u8]) -> Result<Option<Action>, (StatusCode, String)> {
     #[derive(serde::Deserialize, Default)]
     #[serde(deny_unknown_fields)]
