@@ -9,9 +9,6 @@ use toml::Spanned;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    // Checked before deserialization (super::check_version).
-    #[allow(dead_code)]
-    pub version: toml::Value,
     pub routing: Option<Spanned<Routing>>,
     pub firewall: Option<Spanned<Firewall>>,
     #[serde(default)]

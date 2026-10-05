@@ -1,5 +1,3 @@
-version = 2
-
 # PolyWAN configuration. Every key and its default is described
 # in the configuration reference; durations are written like "5s" or "500ms".
 

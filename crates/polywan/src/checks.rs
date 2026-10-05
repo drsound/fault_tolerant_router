@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn hooks_never_run_with_uid_0() {
         let mut cfg = crate::config::parse(
-            "version = 2\n[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv4]\n[[notify.hook]]\ncommand = [\"/bin/true\"]\n",
+            "[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv4]\n[[notify.hook]]\ncommand = [\"/bin/true\"]\n",
         )
         .unwrap();
         cfg.notify.hook_user = "root".into();
@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn flowtables_on_uplinks_are_refused() {
         let cfg = crate::config::parse(
-            "version = 2\n[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv4]\n",
+            "[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv4]\n",
         )
         .unwrap();
         let r: Value = serde_json::from_str(
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn accept_ra_one_with_forwarding_is_reported() {
-        let text = "version = 2\n[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv6]\nnat = \"masquerade\"\n[[uplink]]\nid = 2\nname = \"b\"\ninterface = \"wanb\"\n[uplink.ipv6]\nnat = \"masquerade\"\ngateway = \"fe80::1\"\n";
+        let text = "[[downlink]]\ninterface = \"lan\"\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\n[uplink.ipv6]\nnat = \"masquerade\"\n[[uplink]]\nid = 2\nname = \"b\"\ninterface = \"wanb\"\n[uplink.ipv6]\nnat = \"masquerade\"\ngateway = \"fe80::1\"\n";
         let cfg = crate::config::parse(text).unwrap();
         let values = |accept_ra: &'static str, forwarding: &'static str| {
             move |k: &str| -> std::io::Result<String> {

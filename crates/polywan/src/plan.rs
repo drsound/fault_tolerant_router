@@ -378,8 +378,7 @@ mod tests {
 
     fn two_uplinks() -> Config {
         config::parse(
-            r#"version = 2
-[[downlink]]
+            r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1

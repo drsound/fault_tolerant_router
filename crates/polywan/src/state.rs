@@ -505,8 +505,7 @@ mod tests {
     use super::*;
     use crate::config;
 
-    const CONFIG: &str = r#"version = 2
-[[downlink]]
+    const CONFIG: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1
@@ -605,7 +604,7 @@ interface = "wanb"
                 .all(|c| !matches!(c, ManifestConflict::IdReused { .. }))
         );
         // Structural changes are refused.
-        let moved = config::parse(&format!("version = 2\n[routing]\ntable_base = 2000\n{}", &CONFIG[12..])).unwrap();
+        let moved = config::parse(&format!("[routing]\ntable_base = 2000\n{}", CONFIG)).unwrap();
         assert!(matches!(m.check(&moved)[0], ManifestConflict::Structure { .. }));
     }
 

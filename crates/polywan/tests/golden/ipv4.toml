@@ -1,4 +1,3 @@
-version = 2
 [firewall]
 nat_priority = 110
 [[downlink]]

@@ -248,8 +248,7 @@ mod tests {
     use super::*;
     use crate::config;
 
-    const CONFIG: &str = r#"version = 2
-[[downlink]]
+    const CONFIG: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1

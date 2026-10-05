@@ -3,8 +3,7 @@ use std::time::Duration;
 use super::*;
 
 /// The example of SPEC.md §11.3, with every feature enabled.
-const SPEC_EXAMPLE: &str = r#"version = 2
-
+const SPEC_EXAMPLE: &str = r#"
 [routing]
 all_down_policy = "ready"
 
@@ -93,8 +92,7 @@ events = ["path_state_changed", "active_set_changed"]
 listen = "127.0.0.1:9750"
 "#;
 
-const MINIMAL: &str = r#"version = 2
-[[downlink]]
+const MINIMAL: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1
@@ -190,13 +188,10 @@ fn defaults_follow_the_schema() {
 }
 
 #[test]
-fn version_must_come_first_and_be_two() {
-    let d = errors("[[downlink]]\ninterface = \"lan\"\nversion = 2\n");
-    assert_eq!((d[0].line, d[0].key.as_str()), (Some(1), "version"));
-    let d = errors("# comment\n\nversion = 1\n");
-    assert_eq!(d[0].line, Some(3));
-    assert!(d[0].message.contains("unsupported configuration version 1"));
-    assert!(parse("version = 2 # comment\n[[downlink]]\ninterface=\"l\"\n").is_err_and(|d| d[0].key != "version"));
+fn there_is_no_version_key() {
+    // FR-CFG-1: an unknown key like any other.
+    let d = errors(&format!("version = 2\n{MINIMAL}"));
+    assert!(d[0].message.contains("unknown field `version`"), "{d:?}");
 }
 
 #[test]
@@ -204,7 +199,7 @@ fn unknown_keys_are_reported_with_their_line() {
     let text = MINIMAL.replace("priority = 1", "priority = 1\nwieght = 3");
     let d = errors(&text);
     assert_eq!(d.len(), 1);
-    assert_eq!(d[0].line, Some(9));
+    assert_eq!(d[0].line, Some(8));
     assert!(d[0].message.contains("wieght"), "{}", d[0].message);
 }
 
@@ -223,7 +218,7 @@ fn errors_are_formatted_with_file_line_and_key() {
 
 #[test]
 fn structural_ranges_are_checked() {
-    let with = |s: &str| errors(&format!("version = 2\n[routing]\n{s}\n{}", &MINIMAL[12..]));
+    let with = |s: &str| errors(&format!("[routing]\n{s}\n{}", MINIMAL));
     assert!(has(
         &with("table_base = 100"),
         "routing.table_base",
@@ -258,8 +253,8 @@ fn structural_ranges_are_checked() {
     ));
     assert!(has(&with("all_down_policy = \"never\""), "", "unknown variant"));
     let c = parse(&format!(
-        "version = 2\n[routing]\nfwmark_mask = 0xff000000\ntable_base = 256\nrule_priority_base = 31066\n{}",
-        &MINIMAL[12..]
+        "[routing]\nfwmark_mask = 0xff000000\ntable_base = 256\nrule_priority_base = 31066\n{}",
+        MINIMAL
     ))
     .unwrap();
     assert_eq!(c.routing.fwmark_mask.shift(), 24);
@@ -424,7 +419,7 @@ fn policies_are_checked() {
 
 #[test]
 fn interfaces_and_downlinks_are_checked() {
-    let d = errors("version = 2\n[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wan a\"\n[uplink.ipv4]\n");
+    let d = errors("[[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wan a\"\n[uplink.ipv4]\n");
     assert!(has(&d, "downlink", "at least one"));
     assert!(has(&d, "uplink[0].interface", "not a valid interface name"));
     let d = errors(&MINIMAL.replace("interface = \"lan\"", "interface = \"a-very-long-interface\""));

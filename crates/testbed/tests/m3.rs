@@ -1107,7 +1107,7 @@ fn api_reload_and_forget() -> Result<()> {
     assert!(text.contains("configuration reloaded"), "{text}");
     assert!(f.status()?["generation"]["applied"].as_u64().unwrap_or(0) > before);
     // Validation errors go to the client, not to the public event.
-    f.write_config(&polywan::ipv4(&ab()).replace("version = 2\n", "version = 2\nbogus_key = 1\n"))?;
+    f.write_config(&format!("bogus_key = 1\n{}", polywan::ipv4(&ab())))?;
     let out = f.reload_cli()?;
     let text = polywan::output_text(&out);
     assert!(!out.status.success() && text.contains("bogus_key"), "{text}");

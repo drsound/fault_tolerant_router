@@ -193,8 +193,7 @@ async fn baseline() -> System {
     full(&faithful(), &scope()).await.unwrap().system
 }
 
-const CONFIG: &str = r#"version = 2
-[[downlink]]
+const CONFIG: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1

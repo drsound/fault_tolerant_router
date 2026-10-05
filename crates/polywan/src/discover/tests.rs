@@ -9,8 +9,7 @@ use crate::model::UplinkId;
 use crate::netlink::NexthopMessage;
 use crate::netlink::msg::{ObservedHop, ObservedLink};
 
-const CONFIG: &str = r#"version = 2
-[routing]
+const CONFIG: &str = r#"[routing]
 discovery_tables = ["main", 200]
 [[downlink]]
 interface = "lan"
@@ -367,8 +366,7 @@ fn static_source_on_another_interface_and_conflicts() {
     assert_eq!(d[&key(2)].ready, Err(Reason::AddressConflict));
 }
 
-const CONFIG_V6: &str = r#"version = 2
-[[downlink]]
+const CONFIG_V6: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1

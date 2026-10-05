@@ -31,8 +31,7 @@ fn nft_path() -> PathBuf {
         .expect("nft")
 }
 
-const DUAL: &str = r#"version = 2
-[[downlink]]
+const DUAL: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1

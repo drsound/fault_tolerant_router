@@ -56,7 +56,7 @@ done
 
 config=$dir/config.toml
 {
-  printf 'version = 2\nstate_dir = "%s/state"\n\n[[downlink]]\ninterface = "lan"\n' "$dir"
+  printf 'state_dir = "%s/state"\n\n[[downlink]]\ninterface = "lan"\n' "$dir"
   for i in 1 2 3 4; do
     printf '\n[[uplink]]\nid = %d\nname = "isp%d"\ninterface = "wan%d"\n[uplink.ipv4]\n[uplink.ipv6]\nnat = "masquerade"\n' "$i" "$i" "$i"
   done

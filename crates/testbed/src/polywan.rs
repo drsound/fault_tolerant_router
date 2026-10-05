@@ -157,7 +157,7 @@ pub fn dual(uplinks: &[UplinkSpec]) -> String {
 /// goes into the `[routing]` table; `extra` is appended verbatim (other
 /// tables).
 pub fn config(uplinks: &[UplinkSpec], families: &[Family], health: &HealthSpec, routing: &str, extra: &str) -> String {
-    let mut s = String::from("version = 2\n");
+    let mut s = String::new();
     let mut routing = routing.to_owned();
     if mask() != 0x00ff_0000 {
         routing = format!("fwmark_mask = {:#x}\n{routing}", mask());
@@ -258,11 +258,8 @@ impl Polywan {
     /// (`/run/polywan`, group `polywan`) unless the configuration has its own
     /// `[api]` table: parallel runs must not share sockets.
     pub fn write_config(&self, config: &str) -> Result<()> {
-        let mut text = config.replacen(
-            "version = 2\n",
-            &format!("version = 2\nstate_dir = \"{}\"\n", self.state.display()),
-            1,
-        );
+        // The run's state directory, a top-level key: before any table.
+        let mut text = format!("state_dir = \"{}\"\n{config}", self.state.display());
         if !text.contains("\n[api]") {
             let _ = write!(
                 text,

@@ -244,7 +244,7 @@ fn as20_invalid_reload_keeps_the_running_configuration(fam: Family) -> Result<()
     f.wait_installed(&t)?;
     // For IPv6, an IPv6 section without its required `nat` (FR-NAT-1).
     let (invalid, reason) = match fam {
-        Family::V4 => ("version = 2\n[[bogus]]\n".to_owned(), "bogus"),
+        Family::V4 => ("[[bogus]]\n".to_owned(), "bogus"),
         Family::V6 => (
             stack(
                 fam,

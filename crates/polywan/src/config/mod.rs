@@ -299,7 +299,6 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
 /// Validates configuration text.
 pub fn parse(text: &str) -> Result<Config, Vec<Diagnostic>> {
-    check_version(text)?;
     let raw: raw::Config = toml::from_str(text).map_err(|e| {
         vec![Diagnostic {
             line: e.span().map(|s| line_of(text, s.start)),
@@ -319,39 +318,6 @@ pub fn digest(text: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// FR-CFG-1: the file starts with `version = 2`.
-fn check_version(text: &str) -> Result<(), Vec<Diagnostic>> {
-    let first = text
-        .lines()
-        .enumerate()
-        .map(|(i, l)| (i + 1, l.trim()))
-        .find(|(_, l)| !l.is_empty() && !l.starts_with('#'));
-    let fail = |line, message: String| {
-        Err(vec![Diagnostic {
-            line,
-            key: "version".into(),
-            message,
-        }])
-    };
-    let Some((line, first)) = first else {
-        return fail(None, "the file must start with `version = 2`".into());
-    };
-    let Some((key, value)) = first.split_once('=') else {
-        return fail(Some(line), "the file must start with `version = 2`".into());
-    };
-    if key.trim() != "version" {
-        return fail(Some(line), "the file must start with `version = 2`".into());
-    }
-    let value = value.split('#').next().unwrap_or("").trim();
-    if value != "2" {
-        return fail(
-            Some(line),
-            format!("unsupported configuration version {value} (this release reads version 2)"),
-        );
-    }
-    Ok(())
 }
 
 pub(crate) fn line_of(text: &str, offset: usize) -> usize {

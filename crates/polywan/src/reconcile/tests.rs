@@ -6,8 +6,7 @@ use crate::model::PathKey;
 use crate::plan::{self, Input, PathInput, ReadyPath};
 use crate::system::Scope;
 
-const CONFIG: &str = r#"version = 2
-[[downlink]]
+const CONFIG: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1
@@ -358,8 +357,7 @@ fn classification_by_offset() {
     assert_eq!(classify(l, 999), None);
 }
 
-const DUAL: &str = r#"version = 2
-[[downlink]]
+const DUAL: &str = r#"[[downlink]]
 interface = "lan"
 [[uplink]]
 id = 1
