@@ -364,18 +364,22 @@ pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
     Ok(())
 }
 
-/// An `nft` wrapper for `firewall.nft_path` whose invocations containing one
-/// of `failing` (for example `list flowtables`) fail while the returned flag
-/// file exists.
-pub fn nft_wrapper(t: &Topology, f: &polywan::Polywan, failing: &[&str]) -> Result<(PathBuf, PathBuf)> {
+/// The [`nft_wrapper`] action that makes an invocation fail.
+pub const NFT_FAILS: &str = "echo 'injected nft failure' >&2; exit 1";
+
+/// An `nft` wrapper for `firewall.nft_path` that, while the returned flag
+/// file exists, runs the shell commands `action` (for example [`NFT_FAILS`])
+/// before its invocations containing one of `matching` (for example
+/// `list flowtables`).
+pub fn nft_wrapper(t: &Topology, f: &polywan::Polywan, matching: &[&str], action: &str) -> Result<(PathBuf, PathBuf)> {
     let nft = t.router().sh("command -v nft")?.trim().to_owned();
-    let flag = f.dir.join("nft-fails");
+    let flag = f.dir.join("nft-armed");
     let wrapper = t.exec_dir()?.join("nft");
-    let patterns: Vec<String> = failing.iter().map(|p| format!("*\" {p} \"*")).collect();
+    let patterns: Vec<String> = matching.iter().map(|p| format!("*\" {p} \"*")).collect();
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in {}) echo 'injected nft failure' >&2; exit 1 ;; esac\nfi\nexec {nft} \"$@\"\n",
+            "#!/bin/sh\nif [ -e {flag} ]; then\n  case \" $* \" in {}) {action} ;; esac\nfi\nexec {nft} \"$@\"\n",
             patterns.join("|"),
             flag = flag.display()
         ),

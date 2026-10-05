@@ -665,7 +665,7 @@ fn as33_flowtable_inspection_and_external_mode() -> Result<()> {
         )
     };
     let mut f = t.prepare_polywan(&only_a(""))?;
-    let (wrapper, flag) = nft_wrapper(&t, &f, &["list ruleset", "list flowtables"])?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["list ruleset", "list flowtables"], NFT_FAILS)?;
     let managed = only_a(&format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display()));
     f.write_config(&managed)?;
     f.start(&t)?;
@@ -2055,7 +2055,7 @@ per_family!(as47_warm_restart_adding_an_uplink);
 fn as47_warm_restart_adding_an_uplink(fam: Family) -> Result<()> {
     let t = build();
     let mut f = t.prepare_polywan(&stack(fam, &ab()))?;
-    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"], NFT_FAILS)?;
     let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
     f.write_config(&polywan::config(
         &ab(),

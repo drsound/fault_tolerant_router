@@ -9,11 +9,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use testbed::Outcome;
+use testbed::agent::Held;
+use testbed::netns::exited;
 use testbed::plan::{Family, Node, TCP_PORT, TCP_PORT_HTTPS, Uplink};
-use testbed::polywan::{self, HealthSpec};
+use testbed::polywan::{self, HealthSpec, succeeded};
 use testbed::sendmail::{Call, Mode, Stub};
 use testbed::traffic::tally;
+use testbed::{Outcome, Topology};
 
 #[macro_use]
 mod common;
@@ -22,6 +24,20 @@ use common::*;
 /// An IPv4 configuration over A and B with `extra` appended.
 fn with(extra: &str) -> String {
     polywan::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", extra)
+}
+
+/// A `[notify.email]` table from `from` to `to`, with `more` keys.
+fn email(from: &str, to: &[&str], more: &str) -> String {
+    let to: Vec<String> = to.iter().map(|a| format!("\"{a}\"")).collect();
+    format!("[notify.email]\nfrom = \"{from}\"\nto = [{}]\n{more}", to.join(", "))
+}
+
+/// `[notify]` with the `notify` keys, and email from router@example.com to
+/// `to` through `sendmail` with `more` (keys of `[notify.email]`, then
+/// other tables).
+fn notify_email(sendmail: &std::path::Path, notify: &str, to: &[&str], more: &str) -> String {
+    let more = format!("sendmail = \"{}\"\n{more}", sendmail.display());
+    format!("[notify]\n{notify}{}", email("router@example.com", to, &more))
 }
 
 /// AS-20, email variants: the SMTP keys of earlier drafts, malformed
@@ -35,8 +51,7 @@ fn as20_invalid_email_settings_are_refused() -> Result<()> {
     let mut f = t.start_polywan(&polywan::ipv4(&ab()))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
-    let email =
-        |from: &str, to: &str, more: &str| with(&format!("[notify.email]\nfrom = \"{from}\"\nto = [\"{to}\"]\n{more}"));
+    let email = |from: &str, to: &str, more: &str| with(&email(from, &[to], more));
     let cases = [
         (
             email(
@@ -104,10 +119,8 @@ fn as20_an_untrusted_sendmail_never_runs() -> Result<()> {
     let link = f.dir.join("sendmail");
     std::os::unix::fs::symlink(&sendmail, &link)?;
     let email = |path: &std::path::Path| {
-        with(&format!(
-            "[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\nsendmail = \"{}\"\n",
-            path.display()
-        ))
+        let sendmail = format!("sendmail = \"{}\"\n", path.display());
+        with(&email("router@example.com", &["admin@example.com"], &sendmail))
     };
     let refusal = format!("{} is writable by group or others", open.display());
     let plain = t.exec_dir()?.join("sendmail");
@@ -419,9 +432,31 @@ fn as48_policy_marked_traffic_from_a_router_address_is_balanced(fam: Family) -> 
 /// Fast health settings with the quality gates `gates` (TOML keys of
 /// `[health.quality]`).
 fn with_gates(gates: &str) -> HealthSpec {
-    HealthSpec {
-        text: format!("{}[health.quality]\n{gates}", HealthSpec::fast().text),
+    HealthSpec::fast().with(&format!("[health.quality]\n{gates}"))
+}
+
+/// The default `health.quality_window`, in rounds.
+const QUALITY_WINDOW: u64 = 6;
+
+/// Waits until A's and B's paths of `fam` forward steadily, before quality
+/// gates are enabled: the first echoes after startup can be lost while
+/// neighbours are resolved. Steady: a window of samples (a round has one
+/// or more) without loss.
+fn wait_steady(t: &Topology, f: &polywan::Polywan, fam: Family) -> Result<()> {
+    for uplink in ["a", "b"] {
+        f.wait_path_where(
+            t,
+            uplink,
+            fam,
+            "a window of samples without loss",
+            Duration::from_secs(30),
+            |p| {
+                let s = &p["statistics"];
+                s["samples"].as_u64().is_some_and(|n| n >= QUALITY_WINDOW) && s["loss"].as_f64() == Some(0.0)
+            },
+        )?;
     }
+    Ok(())
 }
 
 per_family!(as06_deterministic_loss_violates_the_loss_gate);
@@ -433,30 +468,37 @@ per_family!(as06_deterministic_loss_violates_the_loss_gate);
 fn as06_deterministic_loss_violates_the_loss_gate(fam: Family) -> Result<()> {
     let t = build();
     // The gate is enabled once the topology forwards steadily (as AS-39).
-    let f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", ""))?;
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
-    std::thread::sleep(Duration::from_secs(2));
+    wait_steady(&t, &f, fam)?;
     let health = with_gates("max_loss = 0.2\n");
     f.write_config(&polywan::config(&ab(), &[fam], &health, "", ""))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
     t.drop_probe_echoes(Uplink::A, 3)?;
-    f.wait_log(
-        &t,
-        &format!("uplink=1 family={fam} from=Up to=Down reason=degraded"),
+    let change = |change: &str| format!("uplink a {fam}: {change}");
+    f.wait_event(
+        "path_state_changed",
+        &change("up -> down (degraded)"),
         1,
         Duration::from_secs(20),
     )?;
     wait_members(&t, fam, &["wanb"], Duration::from_secs(2))?;
     let log = f.log();
     assert!(log.contains(&format!("uplink=1 family={fam} violations=loss")), "{log}");
-    assert!(!log.contains("reason=probe_failed"), "reachability kept passing: {log}");
+    let events = f.events()?;
+    assert!(
+        !events
+            .iter()
+            .any(|(_, k, l)| k == "path_state_changed" && l.contains("(probe_failed)")),
+        "reachability kept passing: {events:?}"
+    );
     t.clear_provider_rules(Uplink::A)?;
     let cleared = Instant::now();
-    f.wait_log(
-        &t,
-        &format!("uplink=1 family={fam} from=Down to=Up reason=probes_recovered"),
+    f.wait_event(
+        "path_state_changed",
+        &change("down -> up (probes_recovered)"),
         1,
         Duration::from_secs(15),
     )?;
@@ -493,15 +535,19 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
     // Gates are enabled once the topology forwards steadily: the first
     // echoes after startup can be lost while neighbours are resolved. The
     // reload changes the sampling mode, so the window starts empty.
-    let mut f = t.start_polywan(&polywan::config(&ab(), &[fam], &HealthSpec::fast(), "", ""))?;
+    let mut f = t.start_polywan(&polywan::family(&ab(), fam))?;
     f.wait_installed(&t)?;
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
-    std::thread::sleep(Duration::from_secs(2));
+    wait_steady(&t, &f, fam)?;
     f.write_config(&config("100ms"))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
-    // More than quality_min_samples samples and five RTTs and differences.
-    std::thread::sleep(Duration::from_secs(10));
+    // Full windows: rounds run to completion, a sample per target, more
+    // than quality_min_samples samples and five RTTs and differences.
+    let full = QUALITY_WINDOW * targets.len() as u64;
+    for uplink in ["a", "b"] {
+        f.wait_samples(&t, uplink, fam, full, Duration::from_secs(30))?;
+    }
     let log = f.log();
     let gated = log.split("config_reloaded").nth(1).unwrap_or_default();
     assert!(
@@ -510,9 +556,9 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
     );
     f.write_config(&config("5ms"))?;
     f.reload()?;
-    f.wait_log(
-        &t,
-        &format!("uplink=1 family={fam} from=Up to=Down reason=degraded"),
+    f.wait_event(
+        "path_state_changed",
+        &format!("uplink a {fam}: up -> down (degraded)"),
         1,
         Duration::from_secs(10),
     )?;
@@ -523,9 +569,9 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
     );
     f.write_config(&config("100ms"))?;
     f.reload()?;
-    f.wait_log(
-        &t,
-        &format!("uplink=1 family={fam} from=Down to=Up reason=probes_recovered"),
+    f.wait_event(
+        "path_state_changed",
+        &format!("uplink a {fam}: down -> up (probes_recovered)"),
         1,
         Duration::from_secs(8),
     )?;
@@ -543,18 +589,11 @@ fn as39_quality_gates_with_unequal_target_rtts(fam: Family) -> Result<()> {
 fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     let t = build();
     let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
-    let nft = t.router().sh("command -v nft")?.trim().to_owned();
-    let slow = f.dir.join("nft-slow");
-    let wrapper = t.exec_dir()?.join("nft");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ -e {slow} ] && [ \"$1\" = -f ]; then sleep 5; fi\nexec {nft} \"$@\"\n",
-            slow = slow.display()
-        ),
-    )?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    // Each slow branch leaves a marker once entered.
+    let applying = f.dir.join("nft-applying");
+    let (wrapper, slow) = nft_wrapper(&t, &f, &["-f"], &format!("touch {}; sleep 5", applying.display()))?;
     let writes = f.dir.join("slow-writes");
+    let waiting = f.dir.join("slow-writes.waiting");
     f.set_env("POLYWAN_TEST_SLOW_WRITES", &writes.display().to_string());
     let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
     let policy = policies(&[("p", Family::V4, "a", "balance", "protocol = \"udp\"\n")]);
@@ -596,7 +635,9 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     f.write_config(&config(&ab(), &policy))?;
     f.reload()?;
     f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(5))?;
-    std::thread::sleep(Duration::from_millis(500));
+    t.wait_for("the slow nftables application", Duration::from_secs(10), || {
+        Ok(applying.exists())
+    })?;
     withdrawn(&f, "slow nft")?;
     std::fs::remove_file(&slow)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(20))?;
@@ -618,7 +659,9 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     std::fs::write(&writes, "5000")?;
     f.write_config(&config(&abc(), &policy))?;
     f.reload()?;
-    std::thread::sleep(Duration::from_millis(500));
+    t.wait_for("a slow persistence job", Duration::from_secs(10), || {
+        Ok(waiting.exists())
+    })?;
     withdrawn(&f, "slow persistence")?;
     f.wait_log(&t, "config_reloaded", 2, Duration::from_secs(30))?;
     std::fs::remove_file(&writes)?;
@@ -670,7 +713,6 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
     );
     t.carrier_down(Uplink::B)?;
     f.wait_event(
-        &t,
         "path_state_changed",
         // The reason is the first readiness loss observed (carrier,
         // address), which depends on the kernel.
@@ -679,18 +721,13 @@ fn api_status_and_events_through_the_sockets() -> Result<()> {
         Duration::from_secs(5),
     )?;
     f.wait_event(
-        &t,
         "active_set_changed",
         "ipv4 active set: [a, b] -> [a]",
         1,
         Duration::from_secs(5),
     )?;
     let s = f.status()?;
-    let b = s["paths"]
-        .as_array()
-        .and_then(|p| p.iter().find(|p| p["uplink"] == "b"))
-        .cloned()
-        .unwrap_or_default();
+    let b = polywan::path(&s, "b", Family::V4);
     assert_eq!(
         (b["state"].as_str(), b["ready"].as_bool()),
         (Some("down"), Some(false)),
@@ -813,14 +850,13 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
     wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(10))?;
     let flows = start_flows(&t, fam, 30, 20)?;
     std::thread::sleep(Duration::from_millis(500));
-    let out = f.drain("a", true, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", true, false)?)?;
     assert_eq!(
         balancing_members(&t, fam)?,
         ["wanb"],
         "applied when the command returns"
     );
-    f.wait_event(&t, "uplink_drained", "uplink a drained", 1, Duration::from_secs(5))?;
+    f.wait_event("uplink_drained", "uplink a drained", 1, Duration::from_secs(5))?;
     for port in [TCP_PORT, TCP_PORT_HTTPS] {
         let r = t.connect_to(
             Node::Client,
@@ -868,14 +904,7 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
     // AS-29: A's probes keep running; it stays up while drained.
     std::thread::sleep(Duration::from_secs(4));
     let s = f.status()?;
-    let path_a = |s: &serde_json::Value| {
-        s["paths"]
-            .as_array()
-            .and_then(|p| p.iter().find(|p| p["uplink"] == "a"))
-            .cloned()
-            .unwrap_or_default()
-    };
-    assert_eq!(path_a(&s)["state"], "up", "{s}");
+    assert_eq!(polywan::path(&s, "a", fam)["state"], "up", "{s}");
     assert_eq!(s["uplinks"][0]["drained"], true, "{s}");
     flows_on_continuous(flows, &[Uplink::A, Uplink::B])?;
     // FR-SEL-4: the last candidate.
@@ -886,8 +915,7 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
         polywan::output_text(&out)
     );
     assert_eq!(balancing_members(&t, fam)?, ["wanb"]);
-    let out = f.drain("b", true, true)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("b", true, true)?)?;
     assert!(balancing_members(&t, fam)?.is_empty());
     assert_rejected(&t.connect_to(
         Node::Client,
@@ -896,21 +924,27 @@ fn as16_drain_and_undrain(fam: Family) -> Result<()> {
         false,
         Duration::from_secs(2),
     )?);
-    let out = f.drain("b", false, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("b", false, false)?)?;
     assert_eq!(balancing_members(&t, fam)?, ["wanb"]);
     // The drain survives a restart.
     f.stop()?;
     f.start(&t)?;
-    f.wait_installed(&t)?;
-    std::thread::sleep(Duration::from_secs(3));
+    wait_a_eligible(&t, &f, fam)?;
     assert_eq!(balancing_members(&t, fam)?, ["wanb"], "still drained after the restart");
     assert_eq!(f.status()?["uplinks"][0]["drained"], true);
-    let out = f.drain("a", false, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", false, false)?)?;
     assert_eq!(balancing_members(&t, fam)?, ["wana", "wanb"]);
     f.stop()?;
     Ok(())
+}
+
+/// Waits until the desired state is applied with A's path of `fam` up and
+/// ready: A is then out of the balancing members only if it is drained.
+fn wait_a_eligible(t: &Topology, f: &polywan::Polywan, fam: Family) -> Result<()> {
+    f.wait_path_where(t, "a", fam, "up and ready", Duration::from_secs(20), |p| {
+        p["state"] == "up" && p["ready"] == true
+    })?;
+    f.wait_settled(t)
 }
 
 /// AS-46: a crash between the persistence of a drain and its routes, and
@@ -938,14 +972,12 @@ fn as46_drain_survives_a_crash_at_each_step() -> Result<()> {
         f.wait_exit(&t, Duration::from_secs(10))?;
         std::fs::remove_file(&faults)?;
         f.start(&t)?;
-        f.wait_installed(&t)?;
-        std::thread::sleep(Duration::from_secs(2));
+        wait_a_eligible(&t, &f, Family::V4)?;
         let expected: &[&str] = if drained { &["wanb"] } else { &["wana", "wanb"] };
         wait_members(&t, Family::V4, expected, Duration::from_secs(10))?;
         assert_eq!(f.status()?["uplinks"][0]["drained"], drained, "{crash}");
         if drained {
-            let out = f.drain("a", false, false)?;
-            assert!(out.status.success(), "{}", polywan::output_text(&out));
+            succeeded(f.drain("a", false, false)?)?;
             wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
         }
     }
@@ -966,23 +998,19 @@ fn api_reload_and_forget() -> Result<()> {
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     let before = f.status()?["generation"]["applied"].as_u64().unwrap_or(0);
-    f.write_config(&polywan::ipv4(&[
+    let out = f.reload_with(&polywan::ipv4(&[
         polywan::UplinkSpec::new(Uplink::A, 1).weight(3),
         polywan::UplinkSpec::new(Uplink::B, 2),
     ]))?;
-    let out = f.reload_cli()?;
     let text = polywan::output_text(&out);
-    assert!(
-        out.status.success() && text.contains("configuration reloaded"),
-        "{text}"
-    );
+    assert!(text.contains("configuration reloaded"), "{text}");
     assert!(f.status()?["generation"]["applied"].as_u64().unwrap_or(0) > before);
     // Validation errors go to the client, not to the public event.
     f.write_config(&polywan::ipv4(&ab()).replace("version = 2\n", "version = 2\nbogus_key = 1\n"))?;
     let out = f.reload_cli()?;
     let text = polywan::output_text(&out);
     assert!(!out.status.success() && text.contains("bogus_key"), "{text}");
-    f.wait_event(&t, "reload_failed", "was not reloaded", 1, Duration::from_secs(5))?;
+    f.wait_event("reload_failed", "was not reloaded", 1, Duration::from_secs(5))?;
     assert!(
         !f.events()?.iter().any(|(_, _, l)| l.contains("bogus_key")),
         "no configuration excerpt in events"
@@ -995,8 +1023,7 @@ fn api_reload_and_forget() -> Result<()> {
         "{}",
         polywan::output_text(&out)
     );
-    f.write_config(&polywan::ipv4(&ab()[1..]))?;
-    assert!(f.reload_cli()?.status.success());
+    f.reload_with(&polywan::ipv4(&ab()[1..]))?;
     let reuse = polywan::ipv4(&ab()).replace("name = \"a\"", "name = \"fiber\"");
     f.write_config(&reuse)?;
     let out = f.reload_cli()?;
@@ -1005,10 +1032,8 @@ fn api_reload_and_forget() -> Result<()> {
         "{}",
         polywan::output_text(&out)
     );
-    let out = f.cli_config(&["forget-uplink", "a", "--socket", &socket])?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.cli_config(&["forget-uplink", "a", "--socket", &socket])?)?;
+    succeeded(f.reload_cli()?)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(15))?;
     Ok(())
 }
@@ -1093,7 +1118,7 @@ fn as25_hooks_run_bounded_and_detached() -> Result<()> {
         })
         .and_then(|_| Ok(std::fs::read_to_string(out.join("child"))?.trim().parse()?))?;
     t.wait_for("the child killed with its group", Duration::from_secs(6), || {
-        Ok(gone(child))
+        Ok(exited(child))
     })?;
     f.wait_log(&t, "hook failed", 1, Duration::from_secs(5))?;
     assert!(f.log().contains("end=timed out"), "{}", f.log());
@@ -1101,34 +1126,42 @@ fn as25_hooks_run_bounded_and_detached() -> Result<()> {
     Ok(())
 }
 
-/// An IPv4 configuration over A and B with email through `sendmail`,
-/// coalescing over `coalesce`, and `more` keys of `[notify.email]`.
-fn with_email(sendmail: &std::path::Path, coalesce: &str, more: &str) -> String {
-    with(&format!(
-        "[notify]\ncoalesce = \"{coalesce}\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\", \"noc@example.org\"]\nsendmail = \"{}\"\n{more}",
-        sendmail.display()
-    ))
+/// The event types that email selects by default (FR-MAIL-2).
+const MAILED: [&str; 10] = [
+    "daemon_started",
+    "daemon_stopping",
+    "config_reloaded",
+    "reload_failed",
+    "path_state_changed",
+    "active_set_changed",
+    "uplink_drained",
+    "uplink_undrained",
+    "status_degraded",
+    "status_recovered",
+];
+
+/// Waits until every event after sequence number `after` of the types
+/// `kinds` is in a message that the stub accepted: none waits in a batch
+/// or for a retry.
+fn wait_mailed(t: &Topology, f: &polywan::Polywan, stub: &Stub, after: u64, kinds: &[&str]) -> Result<()> {
+    t.wait_for("the emails of the events", Duration::from_secs(20), || {
+        let bodies: String = stub
+            .calls()?
+            .into_iter()
+            .filter(|c| c.mode == "accept")
+            .filter_map(|c| Some(c.message?.body))
+            .collect();
+        Ok(f.events()?
+            .iter()
+            .filter(|(seq, kind, _)| *seq > after && kinds.contains(&kind.as_str()))
+            .all(|(_, kind, l)| bodies.contains(&format!("{} {kind}", l.split(' ').next().unwrap_or("")))))
+    })
+    .map(|_| ())
 }
 
-fn message_id(c: &Call) -> Option<String> {
-    c.message.as_ref()?.header("Message-ID").map(str::to_owned)
-}
-
-fn subject(c: &Call) -> String {
-    c.message
-        .as_ref()
-        .and_then(|m| m.header("Subject"))
-        .unwrap_or_default()
-        .to_owned()
-}
-
-/// Whether a process has ended: gone, or a zombie (an orphan whose init
-/// does not reap, as in a virtme-ng guest).
-fn gone(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
-        .is_none_or(|zombie| zombie)
+/// The sequence number of the latest event.
+fn latest(f: &polywan::Polywan) -> Result<u64> {
+    Ok(f.events()?.last().map_or(0, |e| e.0))
 }
 
 /// AS-25, sendmail (FR-MAIL-1, FR-MAIL-3), with the minute of the retries
@@ -1145,7 +1178,8 @@ fn gone(pid: u32) -> bool {
 fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
     let t = build();
     let stub = Stub::new(&t, "sendmail")?;
-    let mut f = t.prepare_polywan(&with_email(&stub.path, "1s", ""))?;
+    let to = ["admin@example.com", "noc@example.org"];
+    let mut f = t.prepare_polywan(&with(&notify_email(&stub.path, "coalesce = \"1s\"\n", &to, "")))?;
     f.set_env("POLYWAN_TEST_MAIL_TIMES", "500,2000");
     f.start(&t)?;
     f.wait_installed(&t)?;
@@ -1160,24 +1194,28 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
     assert_eq!(first.pgid, first.pid, "its own process group");
     let m = first.message.as_ref().context("the startup message")?;
     assert!(m.body.contains(" daemon_started: polywan "), "{}", m.body);
-    assert!(subject(first).starts_with("PolyWAN notification"), "{}", m.raw);
+    assert!(
+        first
+            .header("Subject")
+            .is_some_and(|s| s.starts_with("PolyWAN notification")),
+        "{}",
+        m.raw
+    );
     let mut toggle = {
         let mut drained = false;
         move |f: &polywan::Polywan| -> Result<()> {
             drained = !drained;
-            let out = f.drain("a", drained, false)?;
-            anyhow::ensure!(out.status.success(), "{}", polywan::output_text(&out));
-            Ok(())
+            succeeded(f.drain("a", drained, false)?).map(|_| ())
         }
     };
     // Exit status 75: three retries, 0.5, 2.5 and 7.5 s after each failure.
-    stub.set(Mode::Exit(75))?;
+    stub.script(&[Mode::Exit(75); 4])?;
     let before = stub.calls()?.len();
     toggle(&f)?;
     let calls = stub.wait_calls(&t, before + 4, Duration::from_secs(20))?;
     let tries = &calls[before..before + 4];
-    let id = message_id(&tries[0]).context("Message-ID")?;
-    assert!(tries.iter().all(|c| message_id(c).as_ref() == Some(&id)), "{tries:?}");
+    let id = tries[0].header("Message-ID").context("Message-ID")?;
+    assert!(tries.iter().all(|c| c.header("Message-ID") == Some(id)), "{tries:?}");
     for (pair, minutes) in tries.windows(2).zip([1u64, 5, 15]) {
         let gap = pair[1].at.duration_since(pair[0].at)?;
         let expected = Duration::from_millis(500 * minutes);
@@ -1195,25 +1233,27 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
         (Mode::Flood, "exit status 1, stderr: xxxx", 1),
         (Mode::Signal, "killed by signal 9", 1),
     ] {
-        stub.set(mode)?;
+        stub.script(&[mode])?;
         let before = stub.calls()?.len();
         let submitted = f.log().matches("email submitted").count();
         toggle(&f)?;
-        stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
-        stub.set(Mode::Accept)?;
-        let calls = stub.wait_calls(&t, before + 2, Duration::from_secs(10))?;
-        assert_eq!(message_id(&calls[before]), message_id(&calls[before + 1]));
+        let calls = stub.wait_calls(&t, before + 2, Duration::from_secs(20))?;
+        assert_eq!(
+            calls[before].header("Message-ID"),
+            calls[before + 1].header("Message-ID")
+        );
         f.wait_log(&t, "email submitted", submitted + 1, Duration::from_secs(5))?;
         assert_eq!(f.log().matches(needle).count(), n, "{}", f.log());
     }
     assert!(f.log().contains("xxxx [truncated]"), "bounded standard error");
     // Hanging with a child (A undrained by the toggle), then never reading:
     // killed at the deadline, and routing meets its deadlines meanwhile.
+    // Each phase ends with every email out, so that the next phase's mode
+    // goes to its own message.
     for mode in [Mode::Hang, Mode::NoRead] {
-        // A retry of the previous phase must not take this phase's mode.
-        stub.wait_quiet(&t, Duration::from_secs(2), Duration::from_secs(20))?;
-        stub.set(mode)?;
+        stub.script(&[mode])?;
         let before = stub.calls()?.len();
+        let since = latest(&f)?;
         let timeouts = f.log().matches("timed out").count();
         toggle(&f)?;
         let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(10))?;
@@ -1235,22 +1275,22 @@ fn as25_sendmail_failures_are_bounded_and_retried() -> Result<()> {
             t.carrier_up(Uplink::B)?;
             wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
         }
-        stub.set(Mode::Accept)?;
         t.wait_for("the timeout", Duration::from_secs(5), || {
             Ok(f.log().matches("timed out").count() > timeouts)
         })
         .with_context(|| format!("{mode:?}: {}", f.log()))?;
         t.wait_for("the group killed", Duration::from_secs(5), || {
-            Ok(gone(pid) && stub.child().is_none_or(gone))
+            Ok(exited(pid) && stub.child().is_none_or(exited))
         })?;
         // The retry is accepted (after the batch of B's carrier loss, due
         // first), with the same Message-ID when the first attempt read it.
-        let id = message_id(&call);
+        let id = call.header("Message-ID");
         t.wait_for("the accepted retry", Duration::from_secs(10), || {
             Ok(stub.calls()?[before + 1..]
                 .iter()
-                .any(|c| c.mode == "accept" && c.message.is_some() && (id.is_none() || message_id(c) == id)))
+                .any(|c| c.mode == "accept" && c.message.is_some() && (id.is_none() || c.header("Message-ID") == id)))
         })?;
+        wait_mailed(&t, &f, &stub, since, &MAILED)?;
     }
     Ok(())
 }
@@ -1266,55 +1306,42 @@ fn as25_sendmail_retries_follow_reloads() -> Result<()> {
     let t = build();
     let old = Stub::new(&t, "sendmail")?;
     let new = Stub::new(&t, "sendmail2")?;
-    let mut f = t.prepare_polywan(&with_email(&old.path, "1s", ""))?;
+    let email = |stub: &Stub, to: &[&str]| with(&notify_email(&stub.path, "coalesce = \"1s\"\n", to, ""));
+    let mut f = t.prepare_polywan(&email(&old, &["admin@example.com", "noc@example.org"]))?;
     // Retries 2 s after a failure; the deadline 2 s.
     f.set_env("POLYWAN_TEST_MAIL_TIMES", "2000,2000");
     f.start(&t)?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     old.wait_calls(&t, 1, Duration::from_secs(10))?;
-    old.set(Mode::Hang)?;
-    let out = f.drain("a", true, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    old.script(&[Mode::Hang])?;
+    succeeded(f.drain("a", true, false)?)?;
+    // Its message read (it hangs after reading).
     let calls = old.wait_calls(&t, 2, Duration::from_secs(10))?;
     let pid = calls[1].pid;
-    let id = t
-        .wait_for("the running submission's message", Duration::from_secs(5), || {
-            Ok(old.calls()?.get(1).and_then(message_id).is_some())
-        })
-        .and_then(|_| old.calls()?.get(1).and_then(message_id).context("Message-ID"))?;
+    let id = calls[1].header("Message-ID").context("Message-ID")?;
     // While it runs, the path and the recipients change.
-    let changed = with(&format!(
-        "[notify]\ncoalesce = \"1s\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"ops@example.net\"]\nsendmail = \"{}\"\n",
-        new.path.display()
-    ));
-    f.write_config(&changed)?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&email(&new, &["ops@example.net"]))?;
     // It ends at its deadline, with the old path; the retry takes the new
     // path and recipients, with the same Message-ID.
     t.wait_for("the old submission's deadline", Duration::from_secs(5), || {
-        Ok(gone(pid))
+        Ok(exited(pid))
     })?;
-    let is_retry = |c: &Call| message_id(c).as_ref() == Some(&id);
     t.wait_for("the retry through the new path", Duration::from_secs(10), || {
-        Ok(new.calls()?.iter().any(is_retry))
+        Ok(!new.attempts(id)?.is_empty())
     })?;
-    let retry = new.calls()?.into_iter().find(is_retry).context("the retry")?;
+    let retry = new.attempts(id)?.remove(0);
     assert_eq!(retry.args, ["-i", "-f", "router@example.com", "ops@example.net"]);
     let m = retry.message.as_ref().context("message")?;
     assert_eq!(m.header("To"), Some("ops@example.net"));
     assert!(m.body.contains(" uplink_drained a: "), "{}", m.body);
     assert_eq!(old.calls()?.len(), 2, "nothing more through the old path");
     // A failing submission, then email removed: the retry is discarded.
-    new.set(Mode::Exit(75))?;
+    new.script(&[Mode::Exit(75)])?;
     let before = new.calls()?.len();
-    let out = f.drain("a", false, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", false, false)?)?;
     new.wait_calls(&t, before + 1, Duration::from_secs(10))?;
-    f.write_config(&polywan::ipv4(&ab()))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&polywan::ipv4(&ab()))?;
     f.wait_log(&t, "pending email discarded", 1, Duration::from_secs(5))?;
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(new.calls()?.len(), before + 1, "no retry once email is removed");
@@ -1341,35 +1368,31 @@ fn as25_notification_tests() -> Result<()> {
     let record = format!("cat > {}/stdin", out.display());
     let sleeper = format!("sleep $(cat {})", delay.display());
     // Filters that the tests bypass; hooks as root, to write the record.
-    let config = with(&format!(
-        "[notify]\ncoalesce = \"1s\"\nhook_user = \"root\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\nsendmail = \"{}\"\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {record:?}]\nevents = [\"daemon_stopping\"]\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {sleeper:?}]\nevents = [\"daemon_stopping\"]\ntimeout = \"15s\"\n",
-        stub.path.display()
-    ));
+    let hooks = format!(
+        "[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {record:?}]\nevents = [\"daemon_stopping\"]\n[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {sleeper:?}]\nevents = [\"daemon_stopping\"]\ntimeout = \"15s\"\n"
+    );
+    let notify = "coalesce = \"1s\"\nhook_user = \"root\"\n";
+    let config = with(&notify_email(&stub.path, notify, &["admin@example.com"], &hooks));
     let mut f = t.prepare_polywan(&config)?;
     f.set_env("POLYWAN_TEST_MAIL_TIMES", "500,5000");
     f.start(&t)?;
     f.wait_installed(&t)?;
     stub.wait_calls(&t, 1, Duration::from_secs(10))?;
-    // A test outlasting the ordinary deadline, and a second one meanwhile.
-    let socket = f.control_socket().display().to_string();
-    let bin = polywan::daemon_bin()?;
+    // A test outlasting the ordinary deadline, and a second one meanwhile:
+    // once the first runs its hooks.
     let started = Instant::now();
     let (long, second) = std::thread::scope(|s| {
-        let h = s.spawn(|| {
-            std::process::Command::new(&bin)
-                .args(["notify-test", "--socket", &socket])
-                .output()
-        });
-        std::thread::sleep(Duration::from_secs(2));
-        let second = std::process::Command::new(&bin)
-            .args(["notify-test", "--socket", &socket])
-            .output();
+        let h = s.spawn(|| f.notify_test());
+        let second = t
+            .wait_for("the first test's recording hook", Duration::from_secs(10), || {
+                Ok(out.join("stdin").exists())
+            })
+            .and_then(|_| f.notify_test());
         (h.join().expect("the long test"), second)
     });
-    let (long, second) = (long?, second?);
+    let (long, second) = (succeeded(long?)?, second?);
     let elapsed = started.elapsed();
     let text = polywan::output_text(&long);
-    assert!(long.status.success(), "{text}");
     assert!(
         elapsed > Duration::from_secs(10) && elapsed < Duration::from_secs(20),
         "{elapsed:?}"
@@ -1392,7 +1415,7 @@ fn as25_notification_tests() -> Result<()> {
     assert_eq!(calls.iter().filter(|c| kind(c) == "test").count(), 1);
     // A failing sendmail: reported, not retried.
     std::fs::write(&delay, "0")?;
-    stub.set(Mode::Exit(75))?;
+    stub.script(&[Mode::Exit(75)])?;
     let before = stub.calls()?.len();
     let failed = f.notify_test()?;
     let text = polywan::output_text(&failed);
@@ -1401,7 +1424,6 @@ fn as25_notification_tests() -> Result<()> {
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(stub.calls()?.len(), before + 1, "tests are not retried");
     // Offline: refused while the daemon holds the lock, then run.
-    stub.set(Mode::Accept)?;
     let refused = f.cli_config(&["notify-test", "--offline"])?;
     let text = polywan::output_text(&refused);
     assert!(
@@ -1410,9 +1432,8 @@ fn as25_notification_tests() -> Result<()> {
     );
     f.stop()?;
     let before = stub.calls()?.len();
-    let offline = f.cli_config(&["notify-test", "--offline"])?;
+    let offline = succeeded(f.cli_config(&["notify-test", "--offline"])?)?;
     let text = polywan::output_text(&offline);
-    assert!(offline.status.success(), "{text}");
     assert!(text.contains("sandbox was not exercised"), "{text}");
     let calls = stub.wait_calls(&t, before + 1, Duration::from_secs(5))?;
     assert_eq!(kind(&calls[before]), "test");
@@ -1435,20 +1456,11 @@ fn as25_notification_tests() -> Result<()> {
 fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     let t = build();
     let stub = Stub::new(&t, "sendmail")?;
-    let health = HealthSpec {
-        text: HealthSpec::fast().text + "rise = 5\n",
-    };
+    let health = HealthSpec::fast().with("rise = 5\n");
     let config = |max: u32| {
-        polywan::config(
-            &ab(),
-            &[Family::V4],
-            &health,
-            "",
-            &format!(
-                "[notify]\ncoalesce = \"2s\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"admin@example.com\"]\nsendmail = \"{}\"\nmax_per_hour = {max}\n",
-                stub.path.display()
-            ),
-        )
+        let more = format!("max_per_hour = {max}\n");
+        let email = notify_email(&stub.path, "coalesce = \"2s\"\n", &["admin@example.com"], &more);
+        polywan::config(&ab(), &[Family::V4], &health, "", &email)
     };
     let mut f = t.prepare_polywan(&config(1000))?;
     f.set_env("POLYWAN_TEST_MAIL_TIMES", "200,5000");
@@ -1456,13 +1468,12 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     f.wait_installed(&t)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     stub.wait_calls(&t, 1, Duration::from_secs(10))?;
-    let start = f.events()?.last().map_or(0, |e| e.0);
+    let start = latest(&f)?;
     for i in 0..15 {
         t.carrier_down(Uplink::B)?;
         if i == 0 {
             // B's loss opened a batch: the test goes out at once.
-            let out = f.notify_test()?;
-            assert!(out.status.success(), "{}", polywan::output_text(&out));
+            succeeded(f.notify_test()?)?;
         }
         std::thread::sleep(Duration::from_secs(2));
         t.carrier_up(Uplink::B)?;
@@ -1477,18 +1488,7 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
         .collect();
     assert_eq!(changes.len(), 2, "{changes:#?}");
     // Every selected event reaches an email, within the coalescing window.
-    let selected = ["path_state_changed", "active_set_changed"];
-    t.wait_for("the emails of the flapping", Duration::from_secs(10), || {
-        let bodies: String = stub
-            .calls()?
-            .iter()
-            .filter_map(|c| Some(c.message.as_ref()?.body.clone()))
-            .collect();
-        Ok(f.events()?
-            .iter()
-            .filter(|(seq, kind, _)| *seq > start && selected.contains(&kind.as_str()))
-            .all(|(_, kind, l)| bodies.contains(&format!("{} {kind}", l.split(' ').next().unwrap_or("")))))
-    })?;
+    wait_mailed(&t, &f, &stub, start, &["path_state_changed", "active_set_changed"])?;
     let calls = stub.calls()?;
     let tests: Vec<&Call> = calls.iter().filter(|c| kind(c) == "test").collect();
     assert_eq!(tests.len(), 1);
@@ -1530,9 +1530,7 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
     }
     // The rate limit: the earlier admissions leave the 12 s window first.
     std::thread::sleep(Duration::from_secs(13));
-    f.write_config(&config(3))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&config(3))?;
     let from = std::time::SystemTime::now();
     let mut drained = false;
     for i in 0..30 {
@@ -1540,8 +1538,7 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
         f.drain("a", drained, false)?;
         if i == 12 || i == 22 {
             // During the suppression.
-            let out = f.notify_test()?;
-            assert!(out.status.success(), "{}", polywan::output_text(&out));
+            succeeded(f.notify_test()?)?;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -1578,7 +1575,7 @@ fn as07_flapping_coalescing_and_the_hourly_limit() -> Result<()> {
 
 /// What a recorded message is, by its Subject.
 fn kind(c: &Call) -> &'static str {
-    let s = subject(c);
+    let s = c.header("Subject").unwrap_or_default();
     if s.starts_with("PolyWAN notification test") {
         "test"
     } else if s.starts_with("PolyWAN notifications suppressed") {
@@ -1662,9 +1659,7 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     })?;
     t.carrier_up(Uplink::B)?;
     // Moved: the old address closes.
-    f.write_config(&config("127.0.0.1:9751"))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&config("127.0.0.1:9751"))?;
     assert_eq!(get("127.0.0.1:9751", "GET", "/metrics")?.0, 200);
     assert!(
         get("127.0.0.1:9750", "GET", "/metrics").is_err(),
@@ -1680,9 +1675,7 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     );
     assert_eq!(get("127.0.0.1:9751", "GET", "/metrics")?.0, 200);
     // Disabled.
-    f.write_config(&config(""))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&config(""))?;
     assert!(get("127.0.0.1:9751", "GET", "/metrics").is_err(), "metrics disabled");
     Ok(())
 }
@@ -1720,47 +1713,31 @@ fn as51_socket_access() -> Result<()> {
     assert_eq!(get(&[], &control, "GET", "/v1/status")?, None, "not a member");
     assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
     // Restricted to a group.
-    f.write_config(&config(&format!("{open}status_group = \"sys\"\n")))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&config(&format!("{open}status_group = \"sys\"\n")))?;
     let m = std::fs::metadata(&status)?;
     assert_eq!((m.mode() & 0o777, m.uid()), (0o660, 0));
     assert_eq!(get(&[], &status, "GET", "/v1/status")?, None);
     assert_eq!(get(&["sys"], &status, "GET", "/v1/status")?, Some(200));
     // Disabled.
-    f.write_config(&config("status_socket = \"\"\n"))?;
-    let out = f.reload_cli()?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    f.reload_with(&config("status_socket = \"\"\n"))?;
     assert!(!status.exists(), "no status socket");
     assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
     // The lock.
     let m = std::fs::metadata(&f.lock)?;
     assert_eq!((m.mode() & 0o777, m.uid()), (0o600, 0));
     let lock = f.lock.display().to_string();
-    let out = t
-        .ns(Node::Router)
-        .command("setpriv")
-        .args(["--reuid=65534", "--regid=65534", "--clear-groups", "cat", &lock])
-        .output()?;
+    let out = t.as_nobody(&[], "cat", &[&lock])?;
     assert!(!out.status.success(), "the lock is not readable by users");
     // A dry run serves nothing.
     f.stop()?;
     f.write_config(&config(&open))?;
-    let out = f.cli_config(&["run", "--dry-run"])?;
+    let out = succeeded(f.cli_config(&["run", "--dry-run"])?)?;
     let text = polywan::output_text(&out);
-    assert!(out.status.success(), "{text}");
     assert!(
         !text.contains("listening") && !control.exists() && !status.exists(),
         "{text}"
     );
     Ok(())
-}
-
-/// One connection of `polywan-testbed agent hold`.
-#[derive(serde::Deserialize, Debug)]
-struct Held {
-    closed_after: Option<f64>,
-    connected: bool,
 }
 
 /// Held connections: how many were refused at once, how many closed by the
@@ -1818,14 +1795,13 @@ fn as51_floods_and_slow_clients() -> Result<()> {
         "POST /v1/reload HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: 100\\r\\n\\r\\n",
         "XXXXXXXXXXXXXXXXXXXX",
     )?;
-    std::thread::sleep(Duration::from_secs(2));
+    // The listeners accept in connection order: the held ones first.
     assert!(
         t.http(&f.status_socket(), "GET", "/v1/status").is_err(),
         "a 17th client is refused"
     );
     for drain in [true, false] {
-        let out = f.drain("a", drain, false)?;
-        assert!(out.status.success(), "{}", polywan::output_text(&out));
+        succeeded(f.drain("a", drain, false)?)?;
     }
     let lost = Instant::now();
     t.carrier_down(Uplink::B)?;
@@ -1840,7 +1816,6 @@ fn as51_floods_and_slow_clients() -> Result<()> {
     // Floods.
     let flood_status = t.agent_child(&["flood", &status, "/v1/status", "--count", "3000", "--parallel", "8"])?;
     let flood_metrics = t.agent_child(&["flood", metrics, "/metrics", "--count", "1000", "--parallel", "8"])?;
-    std::thread::sleep(Duration::from_millis(500));
     let lost = Instant::now();
     t.carrier_down(Uplink::B)?;
     wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
@@ -1848,30 +1823,28 @@ fn as51_floods_and_slow_clients() -> Result<()> {
         lost.elapsed() < Duration::from_secs(2),
         "routing unaffected by the floods"
     );
-    let out = f.drain("a", true, true)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", true, true)?)?;
     for child in [flood_status, flood_metrics] {
         let codes: Vec<BTreeMap<u16, usize>> = t.agent_lines(child)?;
         assert_eq!(codes[0].keys().collect::<Vec<_>>(), [&200], "{codes:?}");
     }
-    let out = f.drain("a", false, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", false, false)?)?;
     t.carrier_up(Uplink::B)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
     // Long polls fill the status socket until an event.
     let s = f.status()?;
     let instance = s["instance"].as_str().context("instance")?.to_owned();
-    let latest = f.events()?.last().map_or(0, |e| e.0);
+    let latest = latest(&f)?;
     let head = format!("GET /v1/events?instance={instance}&after={latest}&wait=30 HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n");
     let polls = t.agent_child(&["hold", &status, "--count", "16", "--head", &head, "--seconds", "40"])?;
+    // Pending for a while before an event answers them.
     std::thread::sleep(Duration::from_secs(2));
     assert!(
         t.http(&f.status_socket(), "GET", "/v1/status").is_err(),
         "the status socket is full"
     );
     assert_eq!(t.http(&f.control_socket(), "GET", "/v1/status")?.0, 200);
-    let out = f.drain("a", true, false)?;
-    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    succeeded(f.drain("a", true, false)?)?;
     // Answered by the drain's events, long before their 30 s wait.
     let list: Vec<Held> = t.agent_lines(polls)?;
     assert!(

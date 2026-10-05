@@ -272,8 +272,38 @@ impl Ns {
                     .push((std::time::Instant::now(), line));
             }
         });
-        // `ip monitor` subscribes right after it starts.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        Ok(LinkMonitor { child, lines })
+        let monitor = LinkMonitor { child, lines };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !subscribed(monitor.child.id()) {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "ip monitor link did not subscribe in {}",
+                self.name
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(monitor)
     }
+}
+
+/// Whether process `pid` holds a routing netlink socket bound to multicast
+/// groups (`ip monitor` once subscribed): its namespace's
+/// `/proc/net/netlink` lists the socket's protocol (0), groups and inode.
+fn subscribed(pid: u32) -> bool {
+    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter_map(|l| {
+            let l = l.to_str()?;
+            Some(l.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+        })
+        .collect();
+    std::fs::read_to_string(format!("/proc/{pid}/net/netlink"))
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .any(|w| w.len() >= 10 && w[1] == "0" && w[3] != "00000000" && inodes.iter().any(|i| i == w[9]))
 }

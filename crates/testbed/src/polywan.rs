@@ -105,6 +105,13 @@ impl HealthSpec {
     pub fn defaults() -> HealthSpec {
         HealthSpec { text: String::new() }
     }
+
+    /// These settings with `extra` (TOML lines of `[health]`, then
+    /// possibly `[health.quality]`) appended.
+    pub fn with(mut self, extra: &str) -> HealthSpec {
+        self.text.push_str(extra);
+        self
+    }
 }
 
 /// The `fwmark_mask` the scenarios run with: `POLYWAN_TEST_FWMARK_MASK` (for
@@ -328,6 +335,68 @@ impl Polywan {
         Ok(serde_json::from_slice(&out.stdout)?)
     }
 
+    /// `GET path` on the status socket, from the test process: a Unix
+    /// socket needs no network namespace.
+    fn get(&self, path: &str) -> Result<serde_json::Value> {
+        let (code, body) = crate::agent::http(&self.status_socket(), "GET", path, "")?;
+        anyhow::ensure!(code == 200, "GET {path}: {code} {body}");
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    /// Waits until `/v1/status` satisfies `cond`; fails if the daemon exits.
+    /// Before the daemon serves its status socket, nothing satisfies it.
+    fn wait_status(
+        &self,
+        t: &Topology,
+        what: &str,
+        timeout: Duration,
+        mut cond: impl FnMut(&serde_json::Value) -> bool,
+    ) -> Result<Duration> {
+        t.wait_for(what, timeout, || {
+            if self.daemon.as_ref().is_some_and(Daemon::exited) {
+                anyhow::bail!("the daemon exited:\n{}", self.log());
+            }
+            Ok(self.get("/v1/status").is_ok_and(|s| cond(&s)))
+        })
+    }
+
+    /// Waits until the desired state is applied, interface settings
+    /// included (`generation.applied == generation.desired > 0`): unlike
+    /// [`Polywan::wait_installed`], not while a setting keeps failing.
+    pub fn wait_settled(&self, t: &Topology) -> Result<()> {
+        self.wait_status(t, "the desired state applied", Duration::from_secs(20), |s| {
+            let g = &s["generation"];
+            g["desired"].as_u64().is_some_and(|d| d > 0) && g["applied"] == g["desired"]
+        })
+        .map(|_| ())
+    }
+
+    /// Waits until the status of `uplink`'s path of `family` ([`path`])
+    /// satisfies `cond`, for example `up` and ready.
+    pub fn wait_path_where(
+        &self,
+        t: &Topology,
+        uplink: &str,
+        family: Family,
+        what: &str,
+        timeout: Duration,
+        cond: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<Duration> {
+        self.wait_status(t, &format!("{what} on {uplink} {family}"), timeout, |s| {
+            cond(path(s, uplink, family))
+        })
+    }
+
+    /// Waits until the quality window of `uplink`'s path of `family` holds
+    /// `n` samples or more.
+    pub fn wait_samples(&self, t: &Topology, uplink: &str, family: Family, n: u64, timeout: Duration) -> Result<()> {
+        let what = format!("{n} samples");
+        self.wait_path_where(t, uplink, family, &what, timeout, |p| {
+            p["statistics"]["samples"].as_u64().is_some_and(|s| s >= n)
+        })
+        .map(|_| ())
+    }
+
     /// The events so far through `polywan events`: (sequence, type, line).
     pub fn events(&self) -> Result<Vec<(u64, String, String)>> {
         let socket = self.status_socket().display().to_string();
@@ -344,24 +413,41 @@ impl Polywan {
             .collect())
     }
 
-    /// Waits until `count` events of type `kind` whose line contains
-    /// `needle` exist.
-    pub fn wait_event(
-        &self,
-        t: &Topology,
-        kind: &str,
-        needle: &str,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<Duration> {
-        t.wait_for(&format!("{count} {kind} events with {needle:?}"), timeout, || {
-            Ok(self
-                .events()?
-                .iter()
-                .filter(|(_, k, l)| k == kind && l.contains(needle))
-                .count()
-                >= count)
-        })
+    /// Waits until `count` events of type `kind` whose message contains
+    /// `needle` exist, through long polls of `/v1/events` (FR-API-2) that
+    /// the next event answers.
+    pub fn wait_event(&self, kind: &str, needle: &str, count: usize, timeout: Duration) -> Result<Duration> {
+        let start = std::time::Instant::now();
+        let (mut instance, mut after, mut found) = (None::<String>, None::<u64>, 0);
+        loop {
+            let mut query = Vec::new();
+            if let Some(i) = &instance {
+                query.push(format!("instance={i}"));
+            }
+            if let Some(a) = after {
+                query.push(format!("after={a}"));
+            }
+            // Whole seconds within the agent's 15 s read timeout.
+            let left = timeout.saturating_sub(start.elapsed());
+            query.push(format!("wait={}", left.as_secs().clamp(1, 10)));
+            let page = self.get(&format!("/v1/events?{}", query.join("&")))?;
+            if page["reset"] == true {
+                found = 0;
+            }
+            instance = page["instance"].as_str().map(str::to_owned);
+            for e in page["events"].as_array().into_iter().flatten() {
+                after = e["seq"].as_u64().or(after);
+                if e["type"] == kind && e["message"].as_str().is_some_and(|m| m.contains(needle)) {
+                    found += 1;
+                }
+            }
+            if found >= count {
+                return Ok(start.elapsed());
+            }
+            if start.elapsed() > timeout {
+                anyhow::bail!("timed out after {timeout:?} waiting for {count} {kind} events with {needle:?}");
+            }
+        }
     }
 
     /// `polywan drain NAME [--force]` or `undrain NAME` on the control
@@ -379,6 +465,13 @@ impl Polywan {
     pub fn reload_cli(&self) -> Result<Output> {
         let socket = self.control_socket().display().to_string();
         self.cli(&["reload", "--socket", &socket])
+    }
+
+    /// Replaces the configuration with `config` and reloads it through the
+    /// control socket, which must succeed.
+    pub fn reload_with(&self, config: &str) -> Result<Output> {
+        self.write_config(config)?;
+        succeeded(self.reload_cli()?)
     }
 
     /// `polywan notify-test` on the control socket.
@@ -419,7 +512,9 @@ impl Polywan {
         .map(|_| ())
     }
 
-    /// Waits for the first complete application of the desired state.
+    /// Waits for the first application of the desired state (its
+    /// `applied` log line), also while an interface setting keeps failing
+    /// (AS-27); [`Polywan::wait_settled`] waits for the settings too.
     pub fn wait_installed(&self, t: &Topology) -> Result<()> {
         self.wait_log(t, "applied", 1, Duration::from_secs(20)).map(|_| ())
     }
@@ -457,4 +552,24 @@ impl Drop for Polywan {
 /// Standard error then standard output of a command, as text.
 pub fn output_text(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout)
+}
+
+/// The output of a command that must have succeeded; otherwise an error
+/// with its [`output_text`].
+pub fn succeeded(out: Output) -> Result<Output> {
+    anyhow::ensure!(out.status.success(), "{}", output_text(&out));
+    Ok(out)
+}
+
+/// The status (`GET /v1/status`) of `uplink`'s path of `family`; null if
+/// there is none.
+pub fn path<'a>(status: &'a serde_json::Value, uplink: &str, family: Family) -> &'a serde_json::Value {
+    static NONE: serde_json::Value = serde_json::Value::Null;
+    status["paths"]
+        .as_array()
+        .and_then(|p| {
+            p.iter()
+                .find(|p| p["uplink"] == uplink && p["family"] == family.to_string())
+        })
+        .unwrap_or(&NONE)
 }

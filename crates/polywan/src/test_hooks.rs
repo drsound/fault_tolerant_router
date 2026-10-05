@@ -37,13 +37,17 @@ pub fn gateway_warning(default: Duration) -> Duration {
 
 /// `POLYWAN_TEST_SLOW_WRITES`: a control file holding milliseconds; while it
 /// exists, every job of the persistence lane first waits that long, as a
-/// slow storage device would (IMPL-4 scenarios).
+/// slow storage device would (IMPL-4 scenarios). Waiting creates
+/// `<file>.waiting`, so that a scenario knows the lane is held.
 #[cfg(feature = "test-hooks")]
 pub fn slow_persistence() {
     let Some(path) = std::env::var_os("POLYWAN_TEST_SLOW_WRITES") else {
         return;
     };
-    if let Some(ms) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+    if let Some(ms) = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse().ok()) {
+        let mut waiting = path;
+        waiting.push(".waiting");
+        let _ = std::fs::write(waiting, "");
         std::thread::sleep(Duration::from_millis(ms));
     }
 }

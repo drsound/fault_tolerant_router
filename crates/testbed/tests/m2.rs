@@ -111,7 +111,7 @@ fn as19_reload_adds_ipv6_to_running_ipv4_uplinks() -> Result<()> {
     let t = build();
     let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
     // The replacement that installs the IPv6 assignments fails at first.
-    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"])?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"], NFT_FAILS)?;
     let firewall = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
     let config = |families: &[Family]| polywan::config(&ab(), families, &polywan::HealthSpec::fast(), "", &firewall);
     f.write_config(&config(&[Family::V4]))?;

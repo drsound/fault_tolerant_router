@@ -22,7 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -569,6 +569,10 @@ fn api_stream(socket: &Path) -> Result<Box<dyn ReadWrite>> {
     })
 }
 
+/// The line that `hold` and `flood` print once under way, before their
+/// results ([`crate::Topology::agent_child`] waits for it).
+pub const READY: &str = "ready";
+
 /// When a held connection ended.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Held {
@@ -582,15 +586,19 @@ pub struct Held {
 
 /// `count` connections held at once for up to `seconds` (AS-51): each sends
 /// `head` at once, then `drip` one byte a second, and reads until the server
-/// closes it.
-pub fn hold(socket: &Path, count: usize, head: &str, drip: &str, seconds: u64) -> Vec<Held> {
+/// closes it. `ready` runs once every connection is open (or refused) and
+/// has sent its head: the server accepts in connection order, so a later
+/// client comes after them.
+pub fn hold(socket: &Path, count: usize, head: &str, drip: &str, seconds: u64, ready: impl FnOnce()) -> Vec<Held> {
     let end = Instant::now() + Duration::from_secs(seconds);
+    let (opened, open) = mpsc::channel();
     let handles: Vec<_> = (0..count)
         .map(|_| {
-            let (socket, head, drip) = (socket.to_owned(), head.to_owned(), drip.to_owned());
+            let (socket, head, drip, opened) = (socket.to_owned(), head.to_owned(), drip.to_owned(), opened.clone());
             thread::spawn(move || {
                 let start = Instant::now();
                 let Ok(mut s) = api_stream(&socket) else {
+                    let _ = opened.send(());
                     return Held {
                         closed_after: None,
                         connected: false,
@@ -598,6 +606,7 @@ pub fn hold(socket: &Path, count: usize, head: &str, drip: &str, seconds: u64) -
                     };
                 };
                 let _ = s.write_all(head.as_bytes());
+                let _ = opened.send(());
                 let mut received = 0;
                 let mut drip = drip.bytes();
                 let mut buf = [0u8; 4096];
@@ -636,14 +645,26 @@ pub fn hold(socket: &Path, count: usize, head: &str, drip: &str, seconds: u64) -
             })
         })
         .collect();
+    drop(opened);
+    open.iter().take(count).for_each(drop);
+    ready();
     handles.into_iter().filter_map(|h| h.join().ok()).collect()
 }
 
 /// `count` requests `GET path` over `parallel` connections at a time;
 /// returns the number of responses per status code (0: no response).
-pub fn flood(socket: &Path, path: &str, count: usize, parallel: usize) -> std::collections::BTreeMap<u16, usize> {
+/// `ready` runs once every connection has had its first request answered
+/// (or has none to make): the flood is under way.
+pub fn flood(
+    socket: &Path,
+    path: &str,
+    count: usize,
+    parallel: usize,
+    ready: impl FnOnce(),
+) -> std::collections::BTreeMap<u16, usize> {
     let next = Arc::new(AtomicUsize::new(0));
     let codes = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let (answered, first) = mpsc::channel();
     let handles: Vec<_> = (0..parallel)
         .map(|_| {
             let (socket, path, next, codes) = (
@@ -652,14 +673,23 @@ pub fn flood(socket: &Path, path: &str, count: usize, parallel: usize) -> std::c
                 Arc::clone(&next),
                 Arc::clone(&codes),
             );
+            let mut answered = Some(answered.clone());
             thread::spawn(move || {
                 while next.fetch_add(1, Ordering::Relaxed) < count {
                     let code = http(&socket, "GET", &path, "").map_or(0, |(c, _)| c);
                     *codes.lock().unwrap_or_else(|e| e.into_inner()).entry(code).or_insert(0) += 1;
+                    if let Some(a) = answered.take() {
+                        let _ = a.send(());
+                    }
                 }
             })
         })
         .collect();
+    // A connection without a request drops its sender, which ends the
+    // iteration once every sender is gone.
+    drop(answered);
+    first.iter().take(parallel).for_each(drop);
+    ready();
     for h in handles {
         let _ = h.join();
     }

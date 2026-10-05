@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, SocketAddr};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -264,27 +265,37 @@ impl Topology {
         Ok((code.trim().parse().context("agent http status")?, body.to_owned()))
     }
 
-    /// Starts the agent with `args` in the router's namespace, its output
-    /// captured; [`Topology::agent_lines`] waits for it.
-    pub fn agent_child(&self, args: &[&str]) -> Result<Child> {
-        Ok(self
+    /// Starts the agent's `hold` or `flood` with `args` in the router's
+    /// namespace, its output captured, and returns once it is under way (its
+    /// [`crate::agent::READY`] line); [`Topology::agent_lines`] waits for its
+    /// end.
+    pub fn agent_child(&self, args: &[&str]) -> Result<AgentChild> {
+        let mut child = self
             .ns(Node::Router)
             .command(self.agent_bin())
             .arg("agent")
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?)
+            .spawn()?;
+        let mut stdout = BufReader::new(child.stdout.take().context("agent output")?);
+        let mut line = String::new();
+        stdout.read_line(&mut line)?;
+        if line.trim_end() != crate::agent::READY {
+            let out = child.wait_with_output()?;
+            anyhow::bail!("agent {args:?}: {line}{}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(AgentChild { child, stdout })
     }
 
-    /// The JSON lines a child of [`Topology::agent_child`] printed.
-    pub fn agent_lines<T: serde::de::DeserializeOwned>(&self, child: Child) -> Result<Vec<T>> {
-        let out = child.wait_with_output()?;
+    /// The JSON lines a child of [`Topology::agent_child`] printed after
+    /// its ready line.
+    pub fn agent_lines<T: serde::de::DeserializeOwned>(&self, mut agent: AgentChild) -> Result<Vec<T>> {
+        let mut text = String::new();
+        agent.stdout.read_to_string(&mut text)?;
+        let out = agent.child.wait_with_output()?;
         anyhow::ensure!(out.status.success(), "agent: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| Ok(serde_json::from_str(l)?))
-            .collect()
+        text.lines().map(|l| Ok(serde_json::from_str(l)?)).collect()
     }
 
     /// A copy of the agent that any user can run: the agent itself may live
@@ -299,10 +310,14 @@ impl Topology {
         Ok(path)
     }
 
-    /// The agent with `args` in the router's namespace, as `nobody` (user
+    /// `program` with `args` in the router's namespace, as `nobody` (user
     /// and group 65534) with the supplementary `groups` only (AS-51).
-    pub fn agent_as_nobody(&self, groups: &[&str], args: &[&str]) -> Result<std::process::Output> {
-        let agent = self.public_agent()?;
+    pub fn as_nobody(
+        &self,
+        groups: &[&str],
+        program: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+    ) -> Result<std::process::Output> {
         let mut c = self.ns(Node::Router).command("setpriv");
         c.args(["--reuid=65534", "--regid=65534"]);
         if groups.is_empty() {
@@ -310,7 +325,14 @@ impl Topology {
         } else {
             c.arg(format!("--groups={}", groups.join(",")));
         }
-        Ok(c.arg(agent).arg("agent").args(args).output()?)
+        Ok(c.arg(program).args(args).output()?)
+    }
+
+    /// The agent with `args`, as [`Topology::as_nobody`].
+    pub fn agent_as_nobody(&self, groups: &[&str], args: &[&str]) -> Result<std::process::Output> {
+        let agent = self.public_agent()?;
+        let args: Vec<&str> = std::iter::once("agent").chain(args.iter().copied()).collect();
+        self.as_nobody(groups, agent, &args)
     }
 
     /// `GET`/`POST` as `nobody` with `groups` on a socket: the status code,
@@ -394,4 +416,11 @@ impl Topology {
         self.router().cmd("nft", "reset counters table inet tb_egress")?;
         Ok(())
     }
+}
+
+/// A background agent of [`Topology::agent_child`], its output after the
+/// ready line still to read.
+pub struct AgentChild {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
 }

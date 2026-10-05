@@ -126,7 +126,7 @@ enum AgentCommand {
     },
     /// Connections held at once (AS-51): each sends HEAD, then DRIP one
     /// byte a second, until the server closes it or SECONDS pass; prints
-    /// one JSON line per connection.
+    /// `ready` once they are open, then one JSON line per connection.
     Hold {
         socket: PathBuf,
         #[arg(long, default_value_t = 1)]
@@ -138,8 +138,9 @@ enum AgentCommand {
         #[arg(long, default_value_t = 15)]
         seconds: u64,
     },
-    /// COUNT requests `GET PATH`, PARALLEL at a time; prints the responses
-    /// per status code as JSON (0: none).
+    /// COUNT requests `GET PATH`, PARALLEL at a time; prints `ready` once
+    /// each connection had its first answer, then the responses per status
+    /// code as JSON (0: none).
     Flood {
         socket: PathBuf,
         path: String,
@@ -292,7 +293,8 @@ fn run(cli: Cli) -> Result<()> {
             } => {
                 // Escapes in arguments: \r and \n.
                 let unescape = |t: &str| t.replace("\\r", "\r").replace("\\n", "\n");
-                for h in agent::hold(&socket, count, &unescape(&head), &unescape(&drip), seconds) {
+                let ready = || println!("{}", agent::READY);
+                for h in agent::hold(&socket, count, &unescape(&head), &unescape(&drip), seconds, ready) {
                     println!("{}", serde_json::to_string(&h)?);
                 }
             }
@@ -301,10 +303,10 @@ fn run(cli: Cli) -> Result<()> {
                 path,
                 count,
                 parallel,
-            } => println!(
-                "{}",
-                serde_json::to_string(&agent::flood(&socket, &path, count, parallel))?
-            ),
+            } => {
+                let codes = agent::flood(&socket, &path, count, parallel, || println!("{}", agent::READY));
+                println!("{}", serde_json::to_string(&codes)?);
+            }
             AgentCommand::Http {
                 socket,
                 method,
