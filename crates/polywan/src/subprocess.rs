@@ -181,6 +181,9 @@ pub async fn run(spec: &Spec) -> Outcome {
             let after_exit = if spec.supervise_descendants {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
             } else {
+                // Left alone from the exit on, also if the run is
+                // cancelled while the output is read.
+                group.disarm();
                 AFTER_EXIT
             };
             let held = !drained && tokio::time::timeout(after_exit, &mut drains).await.is_err();
@@ -370,6 +373,19 @@ mod tests {
             (o.stdout.data.as_slice(), o.stderr.data.as_slice()),
             (&b"out\n"[..], &b"diag\n"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn sendmail_s_descendants_survive_a_cancellation_after_its_exit() {
+        let dir = std::env::temp_dir().join(format!("polywan-unsupervised-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join("delivery");
+        // Cancelled while the output its delivery holds is still read.
+        let spec = sh(&format!("(sleep 1; touch {}) & exit 0", mark.display()), 5000);
+        let _ = tokio::time::timeout(Duration::from_millis(300), run(&spec)).await;
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(mark.exists(), "the delivery was left alone");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
