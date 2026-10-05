@@ -524,21 +524,8 @@ pub fn send_ra(device: &str, ra: &Advertisement, count: u32, interval: Duration)
 /// One HTTP/1.1 request on a Unix socket, the connection closed after it:
 /// the status code and the body.
 pub fn http(socket: &Path, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
-    use std::io::{Read, Write};
-
-    // `tcp:ADDRESS:PORT` for the metrics listener, a Unix socket otherwise.
-    let mut s: Box<dyn ReadWrite> = match socket.to_str().and_then(|s| s.strip_prefix("tcp:")) {
-        Some(addr) => {
-            let s = std::net::TcpStream::connect(addr).with_context(|| addr.to_owned())?;
-            s.set_read_timeout(Some(Duration::from_secs(15)))?;
-            Box::new(s)
-        }
-        None => {
-            let s = std::os::unix::net::UnixStream::connect(socket).with_context(|| socket.display().to_string())?;
-            s.set_read_timeout(Some(Duration::from_secs(15)))?;
-            Box::new(s)
-        }
-    };
+    let mut s = api_stream(socket)?;
+    s.set_timeout(Duration::from_secs(15))?;
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: polywan\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -555,5 +542,128 @@ pub fn http(socket: &Path, method: &str, path: &str, body: &str) -> Result<(u16,
     Ok((code, body))
 }
 
-trait ReadWrite: std::io::Read + std::io::Write {}
-impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+/// A stream of [`api_stream`].
+trait ReadWrite: Read + Write + Send {
+    fn set_timeout(&self, d: Duration) -> io::Result<()>;
+}
+
+impl ReadWrite for TcpStream {
+    fn set_timeout(&self, d: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(d))
+    }
+}
+
+impl ReadWrite for std::os::unix::net::UnixStream {
+    fn set_timeout(&self, d: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(d))
+    }
+}
+
+/// A connection to a Unix socket, or to `tcp:ADDRESS:PORT`.
+fn api_stream(socket: &Path) -> Result<Box<dyn ReadWrite>> {
+    Ok(match socket.to_str().and_then(|s| s.strip_prefix("tcp:")) {
+        Some(addr) => Box::new(TcpStream::connect(addr).with_context(|| addr.to_owned())?),
+        None => {
+            Box::new(std::os::unix::net::UnixStream::connect(socket).with_context(|| socket.display().to_string())?)
+        }
+    })
+}
+
+/// When a held connection ended.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct Held {
+    /// Seconds after the connection until the server closed it; `None`
+    /// when it was still open at the end, or could not connect.
+    pub closed_after: Option<f64>,
+    pub connected: bool,
+    /// Bytes the server sent.
+    pub received: usize,
+}
+
+/// `count` connections held at once for up to `seconds` (AS-51): each sends
+/// `head` at once, then `drip` one byte a second, and reads until the server
+/// closes it.
+pub fn hold(socket: &Path, count: usize, head: &str, drip: &str, seconds: u64) -> Vec<Held> {
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let handles: Vec<_> = (0..count)
+        .map(|_| {
+            let (socket, head, drip) = (socket.to_owned(), head.to_owned(), drip.to_owned());
+            thread::spawn(move || {
+                let start = Instant::now();
+                let Ok(mut s) = api_stream(&socket) else {
+                    return Held {
+                        closed_after: None,
+                        connected: false,
+                        received: 0,
+                    };
+                };
+                let _ = s.write_all(head.as_bytes());
+                let mut received = 0;
+                let mut drip = drip.bytes();
+                let mut buf = [0u8; 4096];
+                // Reads with a short timeout so that drip bytes go out
+                // between reads.
+                let _ = s.set_timeout(Duration::from_millis(200));
+                let mut next_drip = start + Duration::from_secs(1);
+                loop {
+                    if Instant::now() >= end {
+                        return Held {
+                            closed_after: None,
+                            connected: true,
+                            received,
+                        };
+                    }
+                    if Instant::now() >= next_drip {
+                        next_drip += Duration::from_secs(1);
+                        if let Some(b) = drip.next()
+                            && s.write_all(&[b]).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => received += n,
+                        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                        Err(_) => break,
+                    }
+                }
+                Held {
+                    closed_after: Some(start.elapsed().as_secs_f64()),
+                    connected: true,
+                    received,
+                }
+            })
+        })
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
+/// `count` requests `GET path` over `parallel` connections at a time;
+/// returns the number of responses per status code (0: no response).
+pub fn flood(socket: &Path, path: &str, count: usize, parallel: usize) -> std::collections::BTreeMap<u16, usize> {
+    let next = Arc::new(AtomicUsize::new(0));
+    let codes = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let handles: Vec<_> = (0..parallel)
+        .map(|_| {
+            let (socket, path, next, codes) = (
+                socket.to_owned(),
+                path.to_owned(),
+                Arc::clone(&next),
+                Arc::clone(&codes),
+            );
+            thread::spawn(move || {
+                while next.fetch_add(1, Ordering::Relaxed) < count {
+                    let code = http(&socket, "GET", &path, "").map_or(0, |(c, _)| c);
+                    *codes.lock().unwrap_or_else(|e| e.into_inner()).entry(code).or_insert(0) += 1;
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+    Arc::try_unwrap(codes)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default()
+}

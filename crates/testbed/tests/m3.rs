@@ -4,6 +4,7 @@
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
@@ -1681,5 +1682,202 @@ fn metrics_follow_the_paths_and_reloads() -> Result<()> {
     let out = f.reload_cli()?;
     assert!(out.status.success(), "{}", polywan::output_text(&out));
     assert!(get("127.0.0.1:9751", "GET", "/metrics").is_err(), "metrics disabled");
+    Ok(())
+}
+
+/// AS-51, access (FR-API-1, IMPL-6, IMPL-11): the default status socket
+/// (0666) serves an unprivileged user (`nobody` without groups), its write
+/// paths are 404; the control socket refuses a non-member of `api.group`
+/// and serves a member; `api.status_group` restricts the status socket to
+/// its members, an empty `api.status_socket` removes it; the instance lock
+/// is root's, mode 0600, unreadable by users; a dry run opens no socket.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as51_socket_access() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let t = build();
+    let dir = t.polywan_dir();
+    let (control, status) = (dir.join("api.sock"), dir.join("status.sock"));
+    let config = |status_lines: &str| {
+        with(&format!(
+            "[api]\nsocket = \"{}\"\ngroup = \"adm\"\n{status_lines}",
+            control.display()
+        ))
+    };
+    let open = format!("status_socket = \"{}\"\n", status.display());
+    let mut f = t.start_polywan(&config(&open))?;
+    f.wait_installed(&t)?;
+    let get = |groups: &[&str], socket: &std::path::Path, method: &str, path: &str| {
+        t.http_as_nobody(groups, socket, method, path)
+    };
+    assert_eq!(get(&[], &status, "GET", "/v1/status")?, Some(200));
+    assert_eq!(get(&[], &status, "GET", "/v1/events")?, Some(200));
+    assert_eq!(get(&[], &status, "POST", "/v1/reload")?, Some(404));
+    assert_eq!(get(&[], &status, "POST", "/v1/uplinks/a/drain")?, Some(404));
+    assert_eq!(get(&[], &control, "GET", "/v1/status")?, None, "not a member");
+    assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
+    // Restricted to a group.
+    f.write_config(&config(&format!("{open}status_group = \"sys\"\n")))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    let m = std::fs::metadata(&status)?;
+    assert_eq!((m.mode() & 0o777, m.uid()), (0o660, 0));
+    assert_eq!(get(&[], &status, "GET", "/v1/status")?, None);
+    assert_eq!(get(&["sys"], &status, "GET", "/v1/status")?, Some(200));
+    // Disabled.
+    f.write_config(&config("status_socket = \"\"\n"))?;
+    let out = f.reload_cli()?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    assert!(!status.exists(), "no status socket");
+    assert_eq!(get(&["adm"], &control, "GET", "/v1/status")?, Some(200));
+    // The lock.
+    let m = std::fs::metadata(&f.lock)?;
+    assert_eq!((m.mode() & 0o777, m.uid()), (0o600, 0));
+    let lock = f.lock.display().to_string();
+    let out = t
+        .ns(Node::Router)
+        .command("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups", "cat", &lock])
+        .output()?;
+    assert!(!out.status.success(), "the lock is not readable by users");
+    // A dry run serves nothing.
+    f.stop()?;
+    f.write_config(&config(&open))?;
+    let out = f.cli_config(&["run", "--dry-run"])?;
+    let text = polywan::output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        !text.contains("listening") && !control.exists() && !status.exists(),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// One connection of `polywan-testbed agent hold`.
+#[derive(serde::Deserialize, Debug)]
+struct Held {
+    closed_after: Option<f64>,
+    connected: bool,
+}
+
+/// Held connections: how many were refused at once, how many closed by the
+/// 10 s deadline.
+fn held(list: &[Held]) -> (usize, usize) {
+    let refused = list
+        .iter()
+        .filter(|h| !h.connected || h.closed_after.is_some_and(|s| s < 1.0))
+        .count();
+    let deadline = list
+        .iter()
+        .filter(|h| h.closed_after.is_some_and(|s| (9.0..13.0).contains(&s)))
+        .count();
+    (refused, deadline)
+}
+
+/// AS-51, overload (FR-API-4, FR-MET-1, INV-8): 20 idle clients on the
+/// status socket, 20 that send their head a byte a second on the metrics
+/// listener and 8 that send a body a byte a second on the control socket:
+/// each listener admits 16 and refuses the rest at once, the admitted ones
+/// close at the 10 s deadline, and meanwhile control commands complete and
+/// B's carrier loss is withdrawn within the FR-HEALTH-5 bound. Then a flood
+/// of requests on the status socket and the metrics, and 16 long polls
+/// that fill the status socket until an event ends them, leave routing and
+/// the control socket unaffected.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as51_floods_and_slow_clients() -> Result<()> {
+    let t = build();
+    let f = t.start_polywan(&with("[metrics]\nlisten = \"127.0.0.1:9750\"\n"))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let status = f.status_socket().display().to_string();
+    let control = f.control_socket().display().to_string();
+    let metrics = "tcp:127.0.0.1:9750";
+    let hold = |socket: &str, count: &str, head: &str, drip: &str| {
+        t.agent_child(&[
+            "hold",
+            socket,
+            "--count",
+            count,
+            "--head",
+            head,
+            "--drip",
+            drip,
+            "--seconds",
+            "15",
+        ])
+    };
+    let idle = hold(&status, "20", "", "")?;
+    let slow_head = hold(metrics, "20", "GET /metrics HTTP/1.1\\r\\n", "XXXXXXXXXXXXXXXXXXXX")?;
+    let slow_body = hold(
+        &control,
+        "8",
+        "POST /v1/reload HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: 100\\r\\n\\r\\n",
+        "XXXXXXXXXXXXXXXXXXXX",
+    )?;
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        t.http(&f.status_socket(), "GET", "/v1/status").is_err(),
+        "a 17th client is refused"
+    );
+    for drain in [true, false] {
+        let out = f.drain("a", drain, false)?;
+        assert!(out.status.success(), "{}", polywan::output_text(&out));
+    }
+    let lost = Instant::now();
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
+    assert!(lost.elapsed() < Duration::from_secs(2), "routing unaffected");
+    t.carrier_up(Uplink::B)?;
+    for (child, admitted) in [(idle, 16), (slow_head, 16), (slow_body, 8)] {
+        let list: Vec<Held> = t.agent_lines(child)?;
+        assert_eq!(held(&list), (list.len() - admitted, admitted), "{list:?}");
+    }
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    // Floods.
+    let flood_status = t.agent_child(&["flood", &status, "/v1/status", "--count", "3000", "--parallel", "8"])?;
+    let flood_metrics = t.agent_child(&["flood", metrics, "/metrics", "--count", "1000", "--parallel", "8"])?;
+    std::thread::sleep(Duration::from_millis(500));
+    let lost = Instant::now();
+    t.carrier_down(Uplink::B)?;
+    wait_members(&t, Family::V4, &["wana"], Duration::from_secs(3))?;
+    assert!(
+        lost.elapsed() < Duration::from_secs(2),
+        "routing unaffected by the floods"
+    );
+    let out = f.drain("a", true, true)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    for child in [flood_status, flood_metrics] {
+        let codes: Vec<BTreeMap<u16, usize>> = t.agent_lines(child)?;
+        assert_eq!(codes[0].keys().collect::<Vec<_>>(), [&200], "{codes:?}");
+    }
+    let out = f.drain("a", false, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    t.carrier_up(Uplink::B)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    // Long polls fill the status socket until an event.
+    let s = f.status()?;
+    let instance = s["instance"].as_str().context("instance")?.to_owned();
+    let latest = f.events()?.last().map_or(0, |e| e.0);
+    let head = format!("GET /v1/events?instance={instance}&after={latest}&wait=30 HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n");
+    let polls = t.agent_child(&["hold", &status, "--count", "16", "--head", &head, "--seconds", "40"])?;
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        t.http(&f.status_socket(), "GET", "/v1/status").is_err(),
+        "the status socket is full"
+    );
+    assert_eq!(t.http(&f.control_socket(), "GET", "/v1/status")?.0, 200);
+    let out = f.drain("a", true, false)?;
+    assert!(out.status.success(), "{}", polywan::output_text(&out));
+    // Answered by the drain's events, long before their 30 s wait.
+    let list: Vec<Held> = t.agent_lines(polls)?;
+    assert!(
+        list.len() == 16
+            && list
+                .iter()
+                .all(|h| h.closed_after.is_some_and(|s| (1.5..10.0).contains(&s))),
+        "{list:?}"
+    );
     Ok(())
 }

@@ -264,6 +264,73 @@ impl Topology {
         Ok((code.trim().parse().context("agent http status")?, body.to_owned()))
     }
 
+    /// Starts the agent with `args` in the router's namespace, its output
+    /// captured; [`Topology::agent_lines`] waits for it.
+    pub fn agent_child(&self, args: &[&str]) -> Result<Child> {
+        Ok(self
+            .ns(Node::Router)
+            .command(self.agent_bin())
+            .arg("agent")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
+    }
+
+    /// The JSON lines a child of [`Topology::agent_child`] printed.
+    pub fn agent_lines<T: serde::de::DeserializeOwned>(&self, child: Child) -> Result<Vec<T>> {
+        let out = child.wait_with_output()?;
+        anyhow::ensure!(out.status.success(), "agent: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| Ok(serde_json::from_str(l)?))
+            .collect()
+    }
+
+    /// A copy of the agent that any user can run: the agent itself may live
+    /// in a directory only root can enter (`/root` on the test hosts).
+    pub fn public_agent(&self) -> Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.exec_dir()?.join("polywan-testbed");
+        if !path.exists() {
+            fs::copy(self.agent_bin(), &path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(path)
+    }
+
+    /// The agent with `args` in the router's namespace, as `nobody` (user
+    /// and group 65534) with the supplementary `groups` only (AS-51).
+    pub fn agent_as_nobody(&self, groups: &[&str], args: &[&str]) -> Result<std::process::Output> {
+        let agent = self.public_agent()?;
+        let mut c = self.ns(Node::Router).command("setpriv");
+        c.args(["--reuid=65534", "--regid=65534"]);
+        if groups.is_empty() {
+            c.arg("--clear-groups");
+        } else {
+            c.arg(format!("--groups={}", groups.join(",")));
+        }
+        Ok(c.arg(agent).arg("agent").args(args).output()?)
+    }
+
+    /// `GET`/`POST` as `nobody` with `groups` on a socket: the status code,
+    /// or `None` when the request got no response (connection refused).
+    pub fn http_as_nobody(
+        &self,
+        groups: &[&str],
+        socket: &std::path::Path,
+        method: &str,
+        path: &str,
+    ) -> Result<Option<u16>> {
+        let socket = socket.display().to_string();
+        let out = self.agent_as_nobody(groups, &["http", &socket, method, path])?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text.lines().next().and_then(|c| c.trim().parse().ok()))
+    }
+
     /// Everything the test servers logged so far.
     pub fn server_events(&self) -> Result<Vec<ServerEvent>> {
         let p = self.dir().join("server-events.jsonl");

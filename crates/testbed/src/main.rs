@@ -124,6 +124,30 @@ enum AgentCommand {
         #[arg(long, default_value_t = 0)]
         interval_us: u64,
     },
+    /// Connections held at once (AS-51): each sends HEAD, then DRIP one
+    /// byte a second, until the server closes it or SECONDS pass; prints
+    /// one JSON line per connection.
+    Hold {
+        socket: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long, default_value = "")]
+        head: String,
+        #[arg(long, default_value = "")]
+        drip: String,
+        #[arg(long, default_value_t = 15)]
+        seconds: u64,
+    },
+    /// COUNT requests `GET PATH`, PARALLEL at a time; prints the responses
+    /// per status code as JSON (0: none).
+    Flood {
+        socket: PathBuf,
+        path: String,
+        #[arg(long, default_value_t = 100)]
+        count: usize,
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+    },
     /// One HTTP/1.1 request on a Unix socket; prints the status code, then
     /// the body.
     Http {
@@ -259,6 +283,28 @@ fn run(cli: Cli) -> Result<()> {
                 count,
                 Duration::from_micros(interval_us),
             )?,
+            AgentCommand::Hold {
+                socket,
+                count,
+                head,
+                drip,
+                seconds,
+            } => {
+                // Escapes in arguments: \r and \n.
+                let unescape = |t: &str| t.replace("\\r", "\r").replace("\\n", "\n");
+                for h in agent::hold(&socket, count, &unescape(&head), &unescape(&drip), seconds) {
+                    println!("{}", serde_json::to_string(&h)?);
+                }
+            }
+            AgentCommand::Flood {
+                socket,
+                path,
+                count,
+                parallel,
+            } => println!(
+                "{}",
+                serde_json::to_string(&agent::flood(&socket, &path, count, parallel))?
+            ),
             AgentCommand::Http {
                 socket,
                 method,
