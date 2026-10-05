@@ -15,7 +15,7 @@ PolyWAN 2.0 is a ground-up rewrite in Rust, under development on this branch (`v
 | M1 | IPv4 core: configuration, discovery, probes, health, routing, nftables, `run`, `check-config`, `export-nft`, `cleanup`, `forget-uplink` | complete |
 | M2 | IPv6 | complete |
 | M3 | Operations: status API and the rest of the command line, drain, policies, events, email, hooks, Prometheus metrics, quality gates | in progress |
-| M4 | Release: packages, documentation, migration guide from 1.x | planned |
+| M4 | Release: packages, documentation | planned |
 
 Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
 
@@ -59,7 +59,7 @@ Every functional requirement is verified by acceptance scenarios that move real 
 
 ## Coming from Fault Tolerant Router 1.x
 
-2.0 does not read 1.x YAML configurations, and it no longer needs hand-integrated iptables rules or a main table without default routes. The release will include a migration guide with the 2.0 equivalent of every 1.x parameter. Fault Tolerant Router 1.x was featured on [Slashdot](http://linux.slashdot.org/story/15/03/03/1910206/linux-and-multiple-internet-uplinks-a-new-tool) in 2015.
+2.0 does not read 1.x YAML configurations, and it no longer needs hand-integrated iptables rules or a main table without default routes. A 2.0 configuration is written anew, starting from the example it ships. Fault Tolerant Router 1.x was featured on [Slashdot](http://linux.slashdot.org/story/15/03/03/1910206/linux-and-multiple-internet-uplinks-a-new-tool) in 2015.
 
 ## License
 
