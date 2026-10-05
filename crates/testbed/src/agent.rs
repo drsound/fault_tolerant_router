@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, IoSlice, IoSliceMut, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -518,4 +519,27 @@ pub fn send_ra(device: &str, ra: &Advertisement, count: u32, interval: Duration)
             .context("sending the Router Advertisement")?;
     }
     Ok(())
+}
+
+/// One HTTP/1.1 request on a Unix socket, the connection closed after it:
+/// the status code and the body.
+pub fn http(socket: &Path, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
+    use std::io::{Read, Write};
+
+    let mut s = std::os::unix::net::UnixStream::connect(socket).with_context(|| socket.display().to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: polywan\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut text = String::new();
+    s.read_to_string(&mut text)?;
+    let code = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .context("no HTTP status line")?;
+    let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
+    Ok((code, body))
 }

@@ -247,6 +247,23 @@ impl Topology {
         Ok(())
     }
 
+    /// One HTTP request on a Unix socket, from the router namespace
+    /// (`agent http`): the status code and the body.
+    pub fn http(&self, socket: &std::path::Path, method: &str, path: &str) -> Result<(u16, String)> {
+        let out = self.ns(Node::Router).run(
+            &self.agent_bin().to_string_lossy(),
+            [
+                "agent".to_owned(),
+                "http".into(),
+                socket.display().to_string(),
+                method.into(),
+                path.into(),
+            ],
+        )?;
+        let (code, body) = out.split_once('\n').unwrap_or((out.as_str(), ""));
+        Ok((code.trim().parse().context("agent http status")?, body.to_owned()))
+    }
+
     /// Everything the test servers logged so far.
     pub fn server_events(&self) -> Result<Vec<ServerEvent>> {
         let p = self.dir().join("server-events.jsonl");

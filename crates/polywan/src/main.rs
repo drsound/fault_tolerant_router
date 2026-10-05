@@ -56,6 +56,22 @@ enum Command {
         #[arg(long, default_value = config::DEFAULT_PATH)]
         config: PathBuf,
     },
+    /// Show the daemon's status (through the status socket by default).
+    Status {
+        /// The raw JSON of `GET /v1/status`.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Show recent events (through the status socket by default).
+    Events {
+        /// Keep waiting for new events.
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
+        socket: PathBuf,
+    },
     /// Release the persisted id binding of a removed uplink.
     ForgetUplink {
         name: String,
@@ -124,6 +140,8 @@ fn main() -> ExitCode {
                 cleanup::run(&cfg, &dir).await
             }
             Command::ForgetUplink { name, config } => forget(&config, &name, &cli.lock),
+            Command::Status { json, socket } => polywan::cli::status(&socket, json).await,
+            Command::Events { follow, socket } => polywan::cli::events(&socket, follow).await,
         }
     });
     match result {

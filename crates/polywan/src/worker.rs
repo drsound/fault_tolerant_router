@@ -169,13 +169,18 @@ pub enum Done {
         manifest: Manifest,
     },
     Reload(ReloadOutcome),
+    /// The API listeners of a reloaded configuration are bound (FR-API-1).
+    ApiPrepared {
+        seq: u64,
+        result: Result<(), String>,
+    },
 }
 
 /// A validated reload, or why it was rejected; the flowtable inspection
 /// of the running configuration either way (FR-CT-2).
 pub struct ReloadOutcome {
     pub seq: u64,
-    pub result: Result<Box<Config>, Vec<String>>,
+    pub result: Result<(Box<Config>, Vec<crate::api::Endpoint>), Vec<String>>,
     pub running_flowtables: Option<Result<Value, String>>,
 }
 
@@ -240,6 +245,15 @@ impl Lanes {
         self.persist.try_send(job).map_err(Lost::from)
     }
 
+    /// Prepares the API listeners of a reloaded configuration.
+    pub fn prepare_api(&self, seq: u64, api: crate::api::Api, endpoints: Vec<crate::api::Endpoint>) {
+        let done = self.done.clone();
+        self.handle.spawn(async move {
+            let result = api.prepare(endpoints).await;
+            let _ = done.send(Done::ApiPrepared { seq, result }).await;
+        });
+    }
+
     /// Validates a reload on the I/O runtime: reading and checking the file,
     /// the trust of the binaries and the accounts, the inspection of the
     /// flowtables against the running and the proposed configuration.
@@ -292,10 +306,11 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
                 unsupported.join(", ")
             )]);
         }
-        Ok(new)
+        let endpoints = crate::api::endpoints(&new.api).map_err(|e| vec![e])?;
+        Ok((new, endpoints))
     })
     .await;
-    let new = match loaded {
+    let (new, endpoints) = match loaded {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return reject(e, None),
         Err(e) => return reject(vec![format!("validation task failed: {e}")], None),
@@ -319,7 +334,7 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
     }
     ReloadOutcome {
         seq,
-        result: Ok(Box::new(new)),
+        result: Ok((Box::new(new), endpoints)),
         running_flowtables: Some(listing),
     }
 }

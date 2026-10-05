@@ -124,6 +124,15 @@ enum AgentCommand {
         #[arg(long, default_value_t = 0)]
         interval_us: u64,
     },
+    /// One HTTP/1.1 request on a Unix socket; prints the status code, then
+    /// the body.
+    Http {
+        socket: PathBuf,
+        method: String,
+        path: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
     UdpSend {
         #[arg(long)]
         src_port: u16,
@@ -250,6 +259,15 @@ fn run(cli: Cli) -> Result<()> {
                 count,
                 Duration::from_micros(interval_us),
             )?,
+            AgentCommand::Http {
+                socket,
+                method,
+                path,
+                body,
+            } => {
+                let (code, text) = agent::http(&socket, &method, &path, &body)?;
+                println!("{code}\n{text}");
+            }
             AgentCommand::UdpSend {
                 src_port,
                 count,

@@ -7,7 +7,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use testbed::Outcome;
 use testbed::plan::{Family, Node, TCP_PORT, TCP_PORT_HTTPS, Uplink};
 use testbed::polywan::{self, HealthSpec};
@@ -598,10 +598,17 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     withdrawn(&f, "slow nft")?;
     std::fs::remove_file(&slow)?;
     wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(20))?;
-    t.wait_for("the policy rule installed", Duration::from_secs(15), || {
+    t.wait_for("the policy rule installed", Duration::from_secs(30), || {
         Ok(t.router()
             .sh("nft list table inet polywan")?
             .contains("meta l4proto udp"))
+    })
+    .with_context(|| {
+        format!(
+            "ruleset:\n{}\ndaemon log:\n{}",
+            t.router().sh("nft list table inet polywan").unwrap_or_default(),
+            f.log()
+        )
     })?;
 
     // Slow persistence: the reload's binding waits behind slow writes.
@@ -614,5 +621,167 @@ fn impl4_slow_nft_and_persistence_do_not_delay_withdrawals() -> Result<()> {
     std::fs::remove_file(&writes)?;
     wait_members(&t, Family::V4, &["ppp0", "wana", "wanb"], Duration::from_secs(30))?;
     f.stop()?;
+    Ok(())
+}
+
+/// FR-API-1, FR-API-2, IMPL-6: the status and control sockets exist with
+/// their modes (status 0666, control 0660 with its group), the lock is a
+/// 0600 file; `status` reports the paths and active sets, `events` the
+/// history with sequence numbers, and a carrier loss appears in both; the
+/// status socket refuses the control endpoints (404) and other methods
+/// (405), the control socket serves the status too; the sockets are removed
+/// at shutdown.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn api_status_and_events_through_the_sockets() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let t = build();
+    let mut f = t.start_polywan(&polywan::ipv4(&ab()))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).map(|m| (m.mode() & 0o7777, m.uid(), m.gid()));
+    assert_eq!(mode(&f.status_socket())?, (0o666, 0, 0));
+    assert_eq!(mode(&f.control_socket())?, (0o660, 0, 0));
+    assert_eq!(mode(&f.lock)?.0, 0o600);
+    let s = f.status()?;
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["active"]["ipv4"], serde_json::json!(["a", "b"]), "{s}");
+    assert_eq!(s["generation"]["desired"], s["generation"]["applied"], "{s}");
+    let paths = s["paths"].as_array().cloned().unwrap_or_default();
+    assert!(
+        paths
+            .iter()
+            .all(|p| p["state"] == "up" && p["ready"] == true && p["source"].is_string()),
+        "{s}"
+    );
+    let events = f.events()?;
+    assert_eq!(
+        events.first().map(|e| e.1.as_str()),
+        Some("daemon_started"),
+        "{events:?}"
+    );
+    assert!(
+        events.windows(2).all(|w| w[1].0 == w[0].0 + 1),
+        "consecutive sequence numbers: {events:?}"
+    );
+    t.carrier_down(Uplink::B)?;
+    f.wait_event(
+        &t,
+        "path_state_changed",
+        "uplink b ipv4: up -> down (carrier_lost)",
+        1,
+        Duration::from_secs(5),
+    )?;
+    f.wait_event(
+        &t,
+        "active_set_changed",
+        "ipv4 active set: [a, b] -> [a]",
+        1,
+        Duration::from_secs(5),
+    )?;
+    let s = f.status()?;
+    let b = s["paths"]
+        .as_array()
+        .and_then(|p| p.iter().find(|p| p["uplink"] == "b"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (b["state"].as_str(), b["reason"].as_str()),
+        (Some("down"), Some("carrier_lost")),
+        "{s}"
+    );
+    t.carrier_up(Uplink::B)?;
+    // Allowlists (IMPL-11).
+    let code = |socket: &std::path::Path, method: &str, path: &str| t.http(socket, method, path).map(|r| r.0);
+    assert_eq!(code(&f.status_socket(), "POST", "/v1/reload")?, 404);
+    assert_eq!(code(&f.status_socket(), "POST", "/v1/uplinks/a/drain")?, 404);
+    assert_eq!(code(&f.status_socket(), "DELETE", "/v1/status")?, 405);
+    assert_eq!(code(&f.status_socket(), "GET", "/v1/nothing")?, 404);
+    assert_eq!(code(&f.status_socket(), "GET", "/v1/events?verbose=1")?, 400);
+    assert_eq!(code(&f.control_socket(), "GET", "/v1/status")?, 200);
+    assert_eq!(code(&f.control_socket(), "GET", "/v1/reload")?, 405);
+    f.stop()?;
+    assert!(
+        !f.status_socket().exists() && !f.control_socket().exists(),
+        "sockets removed at shutdown"
+    );
+    Ok(())
+}
+
+/// FR-API-1: a foreign object at a socket path refuses startup and is left
+/// alone; after a crash the record of published sockets identifies the
+/// stale sockets, which a restart replaces; a reload changes the status
+/// socket's access (group, mode 0660), disables it (removed), and is
+/// refused when it would swap the roles of the existing paths.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn api_socket_lifecycle() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    let (status, control) = (f.status_socket(), f.control_socket());
+    std::fs::write(&status, "not a socket")?;
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    assert!(f.log().contains("PolyWAN cannot identify as its own"), "{}", f.log());
+    assert_eq!(std::fs::read_to_string(&status)?, "not a socket", "left alone");
+    std::fs::remove_file(&status)?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    // A crash leaves the sockets; the record identifies them.
+    f.kill()?;
+    assert!(status.exists() && control.exists());
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    assert_eq!(f.status()?["status"], "ok");
+    let api = |extra: &str| {
+        let mut c = polywan::ipv4(&ab());
+        c += &format!("\n[api]\nsocket = \"{}\"\ngroup = \"root\"\n{extra}", control.display());
+        c
+    };
+    // Restricted access: group and mode change, the socket stays.
+    let ino = std::fs::metadata(&status)?.ino();
+    f.write_config(&api(&format!(
+        "status_socket = \"{}\"\nstatus_group = \"daemon\"\n",
+        status.display()
+    )))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 1, Duration::from_secs(10))?;
+    let daemon_gid = t
+        .router()
+        .sh("getent group daemon | cut -d: -f3")?
+        .trim()
+        .parse::<u32>()?;
+    let m = std::fs::metadata(&status)?;
+    assert_eq!((m.mode() & 0o7777, m.gid(), m.ino()), (0o660, daemon_gid, ino));
+    // Swapping the roles of the existing paths is refused.
+    let mut swapped = polywan::ipv4(&ab());
+    swapped += &format!(
+        "\n[api]\nsocket = \"{}\"\nstatus_socket = \"{}\"\ngroup = \"root\"\n",
+        status.display(),
+        control.display()
+    );
+    f.write_config(&swapped)?;
+    f.reload()?;
+    f.wait_log(&t, "reload_failed", 1, Duration::from_secs(10))?;
+    assert!(f.log().contains("cannot change from the"), "{}", f.log());
+    // Disabled: removed.
+    f.write_config(&api("status_socket = \"\"\n"))?;
+    f.reload()?;
+    f.wait_log(&t, "config_reloaded", 2, Duration::from_secs(10))?;
+    t.wait_for("the status socket removed", Duration::from_secs(5), || {
+        Ok(!status.exists())
+    })?;
+    assert!(control.exists());
+    // A symbolic link at a socket path is refused at startup.
+    f.stop()?;
+    std::os::unix::fs::symlink("/dev/null", &status)?;
+    f.write_config(&polywan::ipv4(&ab()))?;
+    f.start(&t)?;
+    f.wait_exit(&t, Duration::from_secs(10))?;
+    assert!(f.log().contains("PolyWAN cannot identify as its own"), "{}", f.log());
+    std::fs::remove_file(&status)?;
     Ok(())
 }

@@ -459,16 +459,33 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
+    /// IMPL-6: the lock is a regular file of the daemon's user (root) with
+    /// mode 0600, created so from the outset, never opened through a
+    /// symbolic link, never replaced or unlinked. Its directory is created
+    /// with mode 0755 when missing (IMPL-10).
     pub fn acquire(path: &Path) -> io::Result<InstanceLock> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+        if let Some(dir) = path.parent()
+            && !dir.exists()
+        {
+            fs::DirBuilder::new().recursive(true).mode(0o755).create(dir)?;
         }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
             .open(path)?;
+        let m = file.metadata()?;
+        if !m.is_file() || m.uid() != nix::unistd::geteuid().as_raw() || m.mode() & 0o077 != 0 {
+            return Err(io::Error::other(format!(
+                "{}: the instance lock must be a regular file owned by root with mode 0600 (IMPL-6)",
+                path.display()
+            )));
+        }
         match file.try_lock() {
             Ok(()) => Ok(InstanceLock { _file: file }),
             Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
@@ -619,12 +636,22 @@ interface = "wanb"
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("lock");
         let held = InstanceLock::acquire(&p).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(
             InstanceLock::acquire(&p).err().map(|e| e.kind()),
             Some(io::ErrorKind::WouldBlock)
         );
         drop(held);
         assert!(InstanceLock::acquire(&p).is_ok());
+        // Never through a symbolic link, never a permissive file (IMPL-6).
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert!(InstanceLock::acquire(&link).is_err());
+        let open = dir.join("open");
+        fs::write(&open, "").unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(InstanceLock::acquire(&open).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

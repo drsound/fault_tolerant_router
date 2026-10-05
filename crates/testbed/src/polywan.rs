@@ -309,6 +309,61 @@ impl Polywan {
             .output()?)
     }
 
+    /// This run's status socket ([`Polywan::write_config`]).
+    pub fn status_socket(&self) -> PathBuf {
+        self.dir.join("status.sock")
+    }
+
+    /// This run's control socket.
+    pub fn control_socket(&self) -> PathBuf {
+        self.dir.join("api.sock")
+    }
+
+    /// `GET /v1/status` through `polywan status --json` on the status
+    /// socket.
+    pub fn status(&self) -> Result<serde_json::Value> {
+        let socket = self.status_socket().display().to_string();
+        let out = self.cli(&["status", "--json", "--socket", &socket])?;
+        anyhow::ensure!(out.status.success(), "status: {}", output_text(&out));
+        Ok(serde_json::from_slice(&out.stdout)?)
+    }
+
+    /// The events so far through `polywan events`: (sequence, type, line).
+    pub fn events(&self) -> Result<Vec<(u64, String, String)>> {
+        let socket = self.status_socket().display().to_string();
+        let out = self.cli(&["events", "--socket", &socket])?;
+        anyhow::ensure!(out.status.success(), "events: {}", output_text(&out));
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                // TIMESTAMP #SEQ TYPE MESSAGE
+                let mut w = l.split_whitespace().skip(1);
+                let seq = w.next()?.strip_prefix('#')?.parse().ok()?;
+                Some((seq, w.next()?.to_owned(), l.to_owned()))
+            })
+            .collect())
+    }
+
+    /// Waits until `count` events of type `kind` whose line contains
+    /// `needle` exist.
+    pub fn wait_event(
+        &self,
+        t: &Topology,
+        kind: &str,
+        needle: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Duration> {
+        t.wait_for(&format!("{count} {kind} events with {needle:?}"), timeout, || {
+            Ok(self
+                .events()?
+                .iter()
+                .filter(|(_, k, l)| k == kind && l.contains(needle))
+                .count()
+                >= count)
+        })
+    }
+
     /// Runs a CLI command with this run's configuration (`--config`).
     pub fn cli_config(&self, args: &[&str]) -> Result<Output> {
         let config = self.config.display().to_string();

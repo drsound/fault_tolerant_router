@@ -18,6 +18,11 @@ clap.workspace = true
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
+# The API sockets, the metrics listener and the CLI's client, without a web
+# framework (IMPL-2, Q19).
+http-body-util = { version = "0.1", default-features = false }
+hyper = { version = "1.11", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 ipnet.workspace = true
 # Pre-1.0 netlink crates are pinned exactly (IMPL-2).
 netlink-packet-core = "=0.9.0"

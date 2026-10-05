@@ -4,8 +4,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod checks;
 pub mod cleanup;
+pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod discover;

@@ -154,6 +154,11 @@ struct NftFlight {
 /// manifest by the persistence lane, then committed (FR-CFG-3).
 enum ReloadPhase {
     Validating(u64),
+    /// The API listeners of the new configuration are being bound.
+    Preparing {
+        seq: u64,
+        config: Arc<Config>,
+    },
     Binding {
         seq: u64,
         config: Arc<Config>,
@@ -212,6 +217,8 @@ struct Daemon {
     /// a pass leaves nothing to do (FR-COEX-3).
     repairs: BTreeSet<&'static str>,
     repairs_total: BTreeMap<&'static str, u64>,
+    /// The API listener manager; none in a dry run.
+    api: Option<crate::api::Api>,
     layout: Layout,
     scope: Scope,
     protocol: u8,
@@ -462,6 +469,7 @@ pub async fn run(opts: Options) -> Result<()> {
         started: std::time::SystemTime::now(),
         repairs: BTreeSet::new(),
         repairs_total: BTreeMap::new(),
+        api: None,
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -500,6 +508,22 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.dry_run {
         return d.dry_run();
     }
+    // The API sockets (FR-API-1), served on the I/O runtime.
+    let endpoints = crate::api::endpoints(&d.cfg.api).map_err(|e| anyhow::anyhow!("api: {e}"))?;
+    let shared = crate::api::Shared {
+        status: d.status.subscribe(),
+        ring: d.bus.ring(),
+        latest: d.bus.subscribe(),
+        started: std::time::Instant::now(),
+    };
+    let runtime_dir = opts.lock.parent().unwrap_or(Path::new("/run/polywan")).to_owned();
+    let Some(io) = d.io.as_ref() else {
+        bail!("the I/O thread is not running");
+    };
+    let api = crate::api::Api::start(io.handle(), endpoints, runtime_dir, shared)
+        .await
+        .map_err(|e| anyhow::anyhow!("api: {e}"))?;
+    d.api = Some(api);
     // Applied by the first pass, with the failure handling of any other
     // (FR-REC-3, FR-REC-5).
     d.sysctls_pending.extend(d.sysctl_scopes());
@@ -1931,10 +1955,30 @@ impl Daemon {
         if let Some(listing) = &outcome.running_flowtables {
             self.record_flowtables(listing);
         }
-        let new = match outcome.result {
-            Ok(new) => Arc::new(*new),
+        let (new, endpoints) = match outcome.result {
+            Ok((new, endpoints)) => (Arc::new(*new), endpoints),
             Err(errors) => return self.reload_failed(&errors),
         };
+        // FR-API-1: the listeners are prepared before the commit.
+        let Some(api) = self.api.clone() else {
+            return self.reload_failed(&["the API is not running".to_owned()]);
+        };
+        let seq = self.next_seq();
+        self.lanes.prepare_api(seq, api, endpoints);
+        self.reload = Some(ReloadPhase::Preparing { seq, config: new });
+    }
+
+    /// The API listeners are prepared: the manifest binding follows.
+    fn api_prepared(&mut self, seq: u64, result: std::result::Result<(), String>) {
+        if !matches!(self.reload, Some(ReloadPhase::Preparing { seq: s, .. }) if s == seq) {
+            return;
+        }
+        let Some(ReloadPhase::Preparing { config: new, .. }) = self.reload.take() else {
+            return;
+        };
+        if let Err(e) = result {
+            return self.reload_failed(&[e]);
+        }
         let drained: BTreeSet<UplinkId> = self
             .drained
             .iter()
@@ -1957,8 +2001,19 @@ impl Daemon {
                     drained,
                 })
             }
-            Err(Lost::Full) => self.reload_failed(&["the persistence queue is full".to_owned()]),
+            Err(Lost::Full) => {
+                self.api_command(crate::api::Command::Rollback);
+                self.reload_failed(&["the persistence queue is full".to_owned()])
+            }
             Err(Lost::Closed) => self.lost(),
+        }
+    }
+
+    fn api_command(&mut self, c: crate::api::Command) {
+        if let Some(api) = &self.api
+            && !api.send(c)
+        {
+            warn!("the API manager did not take a command");
         }
     }
 
@@ -1974,8 +2029,10 @@ impl Daemon {
             return;
         };
         if let Err(errors) = result {
+            self.api_command(crate::api::Command::Rollback);
             return self.reload_failed(&errors);
         }
+        self.api_command(crate::api::Command::Commit);
         let new = Arc::unwrap_or_clone(config);
         self.drained = drained;
         self.cfg = new;
@@ -2042,6 +2099,7 @@ impl Daemon {
                 self.handed_back(seq, result);
             }
             Done::Reload(outcome) => self.reload_validated(outcome),
+            Done::ApiPrepared { seq, result } => self.api_prepared(seq, result),
         }
     }
 
@@ -2136,8 +2194,12 @@ impl Daemon {
                 h.abort();
             }
         }
-        // The lanes stop first (a running write completes), so that the
-        // last checkpoint is not overwritten by an older one.
+        // The API sockets go first, then the lanes (a running write
+        // completes), so that the last checkpoint is not overwritten by an
+        // older one.
+        if let Some(api) = self.api.take() {
+            api.shutdown().await;
+        }
         drop(self.io.take());
         self.write_checkpoint_now();
         if self.cfg.routing.on_shutdown == OnShutdown::Cleanup {
