@@ -210,13 +210,53 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
     ops
 }
 
-/// The outcome of a failed operation (FR-REC-5).
+/// The kind of artifact a failed step concerned (FR-REC-5,
+/// `polywan_apply_failures_total{kind}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FailureKind {
+    Route,
+    Rule,
+    Nftables,
+    Sysctl,
+}
+
+impl FailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::Route => "route",
+            FailureKind::Rule => "rule",
+            FailureKind::Nftables => "nftables",
+            FailureKind::Sysctl => "sysctl",
+        }
+    }
+}
+
+/// The outcome of a failed operation (FR-REC-5): the operation, its kind,
+/// and for kernel operations the errno and extended acknowledgement
+/// (PLAT-1); `error` is the diagnostic for the log.
 #[derive(Clone, Debug)]
 pub struct Failure {
     pub op: String,
+    pub kind: FailureKind,
     pub error: String,
+    pub errno: Option<i32>,
+    pub extack: Option<String>,
     /// The route that failed, if it was a route installation (FR-DISC-7).
     pub route: Option<(Family, u32)>,
+}
+
+impl Failure {
+    /// A failure without kernel details.
+    pub fn new(op: impl Into<String>, kind: FailureKind, error: impl Into<String>) -> Failure {
+        Failure {
+            op: op.into(),
+            kind,
+            error: error.into(),
+            errno: None,
+            extack: None,
+            route: None,
+        }
+    }
 }
 
 /// Executes operations in order, stopping at the first failure: later
@@ -276,13 +316,17 @@ where
 {
     let mut done = 0;
     for op in ops {
+        let kind = match &op {
+            Op::ReplaceRoute(_) | Op::DeleteRoute { .. } => FailureKind::Route,
+            Op::AddRule(_) | Op::DeleteRule(_) => FailureKind::Rule,
+            Op::ApplyNft => FailureKind::Nftables,
+        };
         let fail = |error: String| Failure {
-            op: op.to_string(),
-            error,
             route: match &op {
                 Op::ReplaceRoute(r) => Some((r.family, r.table)),
                 _ => None,
             },
+            ..Failure::new(op.to_string(), kind, error)
         };
         if let Err(e) = crate::test_hooks::step(&op) {
             if e.removes_route
@@ -314,7 +358,13 @@ where
                 match client.mutate(message.clone(), kind).await {
                     Ok(()) => {}
                     Err(KernelError { errno, .. }) if tolerated.contains(&errno) => {}
-                    Err(e) => return Err(fail(e.to_string())),
+                    Err(e) => {
+                        return Err(Failure {
+                            errno: Some(e.errno),
+                            extack: e.extack.clone(),
+                            ..fail(e.to_string())
+                        });
+                    }
                 }
                 system.apply(scope, &message);
             }

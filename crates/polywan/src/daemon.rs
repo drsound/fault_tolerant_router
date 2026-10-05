@@ -26,7 +26,7 @@ use crate::observer;
 use crate::plan::{self, Input, Layout, PathInput};
 use crate::probe;
 use crate::quality;
-use crate::reconcile::{self, DiffInput, Failure, Op};
+use crate::reconcile::{self, DiffInput, Failure, FailureKind, Op};
 use crate::select::{self, Candidate};
 use crate::state::{self, Checkpoint, InstanceLock, Manifest, PathCheckpoint, StateDir};
 use crate::sysctl;
@@ -190,6 +190,16 @@ struct Daemon {
     applied_ops: usize,
     /// An internal task ended (FR-REC-7): the daemon exits with this error.
     fatal: Option<String>,
+    /// FR-REC-5: the desired generation changes with every change of the
+    /// planner's input or of the configuration; the applied generation is
+    /// the last desired one whose pass left nothing pending, settings
+    /// included.
+    desired_generation: u64,
+    applied_generation: u64,
+    /// What the desired generation was computed from.
+    last_desired: Option<(plan::Desired, String, String)>,
+    /// Failed steps by kind, since startup.
+    apply_failures: BTreeMap<FailureKind, u64>,
     layout: Layout,
     scope: Scope,
     protocol: u8,
@@ -378,6 +388,10 @@ pub async fn run(opts: Options) -> Result<()> {
         reload_again: false,
         applied_ops: 0,
         fatal: None,
+        desired_generation: 0,
+        applied_generation: 0,
+        last_desired: None,
+        apply_failures: BTreeMap::new(),
         protocol: cfg.routing.route_protocol,
         layout,
         scope,
@@ -1322,7 +1336,8 @@ impl Daemon {
             (Err(e), SysctlScope::Interface(i)) => {
                 let i = i.clone();
                 self.sysctls_applied.remove(&scope);
-                error!(interface = %i, "apply_failed: set sysctls: {e}");
+                *self.apply_failures.entry(FailureKind::Sysctl).or_default() += 1;
+                error!(interface = %i, kind = "sysctl", "apply_failed: set sysctls: {e}");
                 self.sysctls_failed.insert(i.clone(), e);
                 self.degrade("apply_failed");
                 let backoff = self
@@ -1341,11 +1356,7 @@ impl Daemon {
             (Err(e), SysctlScope::Global) => {
                 self.sysctls_applied.remove(&scope);
                 self.failed(
-                    Failure {
-                        op: "set sysctls".into(),
-                        error: e,
-                        route: None,
-                    },
+                    Failure::new("set sysctls", FailureKind::Sysctl, e),
                     SYSCTL_ATTEMPT.to_owned(),
                 )
             }
@@ -1401,6 +1412,11 @@ impl Daemon {
             BTreeSet::new()
         };
         let desired = plan::plan(&self.cfg, &input);
+        let key = (desired.clone(), transaction.clone(), self.cfg.digest.clone());
+        if self.last_desired.as_ref() != Some(&key) {
+            self.desired_generation += 1;
+            self.last_desired = Some(key);
+        }
         let before = (!new_paths.is_empty()).then(|| plan::plan(&self.cfg, &plan::without(&input, &new_paths)));
         let families: Vec<Family> = Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)).collect();
         let ops = reconcile::diff(
@@ -1469,8 +1485,15 @@ impl Daemon {
                 }
                 return;
             }
+            if self.sysctls_pending.is_empty() {
+                self.applied_generation = self.desired_generation;
+            }
             if self.applied_ops > 0 {
-                info!(operations = std::mem::take(&mut self.applied_ops), "applied");
+                info!(
+                    operations = std::mem::take(&mut self.applied_ops),
+                    generation = self.applied_generation,
+                    "applied"
+                );
             }
             self.applied();
             return;
@@ -1533,11 +1556,7 @@ impl Daemon {
                 self.applied_ops += 1;
             }
             Err(error) => self.failed(
-                Failure {
-                    op: Op::ApplyNft.to_string(),
-                    error,
-                    route: None,
-                },
+                Failure::new(Op::ApplyNft.to_string(), FailureKind::Nftables, error),
                 flight.attempt,
             ),
         }
@@ -1551,11 +1570,7 @@ impl Daemon {
         self.dirty = true;
         if let Err(error) = result {
             self.failed(
-                Failure {
-                    op: "restore sysctls of a handed-back family".into(),
-                    error,
-                    route: None,
-                },
+                Failure::new("restore sysctls of a handed-back family", FailureKind::Sysctl, error),
                 attempt,
             );
         }
@@ -1571,7 +1586,9 @@ impl Daemon {
 
     /// FR-REC-5: report, count, retry with exponential backoff (1 s to 60 s).
     fn failed(&mut self, f: Failure, attempt: String) {
-        error!(operation = %f.op, "apply_failed: {}", f.error);
+        let count = self.apply_failures.entry(f.kind).or_default();
+        *count += 1;
+        error!(operation = %f.op, kind = f.kind.as_str(), errno = ?f.errno, extack = ?f.extack, failures = *count, "apply_failed: {}", f.error);
         self.degrade("apply_failed");
         if let Some((family, table)) = f.route {
             // The view follows a route mutation only when it succeeds, but
