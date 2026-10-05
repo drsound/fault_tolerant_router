@@ -2200,6 +2200,7 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
         .into_iter()
         .map(|u| address(&t, Family::V4, u))
         .collect::<Result<_>>()?;
+    let bc_a = provider_counter(&t, Node::IspA, "ip", "t44", "bc")?;
     let bc_b = provider_counter(&t, Node::IspB, "ip", "t44", "bc")?;
     wait_members(&t, Family::V4, &["ppp0", "wana", "wanb"], Duration::from_secs(15))?;
     assert!(path_route(&t, Family::V4, 1003)?.contains("dev ppp0"), "C's path route");
@@ -2215,8 +2216,15 @@ fn as44_boot_before_any_uplink_is_configured() -> Result<()> {
     t.wait_for("A's unicast renewal", lease, || {
         Ok(provider_counter(&t, Node::IspA, "ip", "t44", "uni")? > 0)
     })?;
-    t.wait_for("A's renewed lease", Duration::from_secs(5), || renewed(Uplink::A))
+    // A client retransmits an unanswered renewal (the CI runner once took
+    // longer than 5 s); still by unicast, well before rebinding at T2.
+    t.wait_for("A's renewed lease", Duration::from_secs(30), || renewed(Uplink::A))
         .with_context(|| format!("A's valid lifetime {:?}\n{}", valid_lft(&t, Uplink::A), t.diagnostics()))?;
+    assert_eq!(
+        provider_counter(&t, Node::IspA, "ip", "t44", "bc")?,
+        bc_a,
+        "A renewed by unicast, without rebinding"
+    );
     let left = lease.saturating_sub(acquired.elapsed());
     t.wait_for("B's broadcast rebinding", left, || {
         Ok(provider_counter(&t, Node::IspB, "ip", "t44", "bc")? > bc_b)
