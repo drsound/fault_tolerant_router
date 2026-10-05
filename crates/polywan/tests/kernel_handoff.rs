@@ -80,7 +80,7 @@ fn topology() {
 async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pending: bool) -> usize {
     let layout = Layout::of(cfg);
     let scope = Scope {
-        polywan_tables: layout.tables(),
+        polywan_tables: vec![layout.tables()],
         discovery_tables: cfg.routing.discovery_tables.clone(),
     };
     let client = Client::new().unwrap();
@@ -130,7 +130,6 @@ async fn converge(cfg: &Config, dir: &StateDir, manifest: &mut Manifest, nft_pen
             before_nft: &desired,
             desired: &desired,
             nft_pending,
-            teardown: false,
         },
     );
     let n = ops.len();

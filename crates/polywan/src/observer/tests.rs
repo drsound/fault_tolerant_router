@@ -100,7 +100,7 @@ impl Dumper for Fake {
 
 fn scope() -> Scope {
     Scope {
-        polywan_tables: 1000..=1191,
+        polywan_tables: std::iter::once(1000..=1191).collect(),
         discovery_tables: vec![254],
     }
 }

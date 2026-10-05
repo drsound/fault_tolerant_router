@@ -1,7 +1,8 @@
 //! M4 acceptance scenarios (SPEC.md §14.3, §17): the systemd integration
 //! that the daemon provides by itself (IMPL-10: the configuration exit
-//! status, readiness, status and stopping notifications), with the daemon
-//! under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
+//! status, readiness, status and stopping notifications) and `cleanup`
+//! over the union of the manifest and the configuration (IMPL-7), with the
+//! daemon under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.
 
@@ -198,5 +199,83 @@ fn impl10_notifications_without_systemd() -> Result<()> {
     assert!(lines.windows(2).all(|w| w[0] != w[1]), "{lines:?}");
     assert!(f.stop()?.success());
     assert!(notifications(&socket).iter().any(|n| n.contains("STOPPING=1")));
+    Ok(())
+}
+
+/// The rules (both families) and routes (every table) tagged with
+/// `protocol`, as `ip` shows them.
+fn tagged(t: &testbed::Topology, protocol: &str) -> Result<usize> {
+    let mut n = 0;
+    for args in [
+        "-4 -d rule show",
+        "-6 -d rule show",
+        "-4 route show table all",
+        "-6 route show table all",
+    ] {
+        let v = t.router().ip_json(args)?;
+        n += v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o["protocol"].as_str() == Some(protocol))
+            .count();
+    }
+    Ok(n)
+}
+
+/// IMPL-7 and FR-REC-4: artifacts of two layouts are installed (a run
+/// with other table and priority ranges and route protocol whose manifest
+/// was lost, then a run with the default layout); `cleanup` with the
+/// first configuration, in external firewall mode, removes both layouts
+/// and the managed nftables table that only the manifest records, keeps
+/// objects of another protocol in both ranges, and removes the manifest.
+/// The overlapping ranges are covered by the reconciler's unit tests: a
+/// daemon refuses objects of another protocol in its ranges (FR-ROUTE-6).
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn impl7_cleanup_covers_the_installed_and_the_configured_layout() -> Result<()> {
+    let t = build();
+    let other = "table_base = 2000\nrule_priority_base = 3000\nroute_protocol = 250\n";
+    let mut f = t.start_polywan(&polywan::config(&ab(), &Family::ALL, &HealthSpec::fast(), other, ""))?;
+    f.wait_installed(&t)?;
+    assert!(f.stop()?.success());
+    std::fs::remove_file(f.state.join("manifest.json"))?;
+    f.write_config(&polywan::dual(&ab()))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V4, &["wana", "wanb"], Duration::from_secs(10))?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(15))?;
+    assert!(f.stop()?.success());
+    assert!(tagged(&t, "249")? > 0 && tagged(&t, "250")? > 0);
+    // Another protocol in both layouts' ranges.
+    let r = t.router();
+    for family in ["-4", "-6"] {
+        for (pref, table) in [(1650, 1150), (3650, 2150)] {
+            r.ip(&format!("{family} rule add pref {pref} lookup {table} proto 251"))?;
+            r.ip(&format!("{family} route add blackhole default table {table} proto 251"))?;
+        }
+    }
+    let external = "[firewall]\nmode = \"external\"\n";
+    f.write_config(&polywan::config(
+        &ab(),
+        &Family::ALL,
+        &HealthSpec::fast(),
+        other,
+        external,
+    ))?;
+    succeeded(f.cli_config(&["cleanup"])?)?;
+    assert_eq!(tagged(&t, "249")?, 0, "the installed layout is removed");
+    assert_eq!(tagged(&t, "250")?, 0, "the configured layout is removed");
+    assert_eq!(tagged(&t, "251")?, 8, "other protocols stay");
+    assert!(
+        r.sh("nft list table inet polywan").is_err(),
+        "the managed table is removed"
+    );
+    assert!(!f.state.join("manifest.json").exists());
+    for family in ["-4", "-6"] {
+        for pref in [1650, 3650] {
+            r.ip(&format!("{family} rule del pref {pref} proto 251"))?;
+        }
+    }
     Ok(())
 }

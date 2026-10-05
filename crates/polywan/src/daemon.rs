@@ -515,7 +515,7 @@ pub async fn run(opts: Options) -> Result<()> {
     let dumper = Client::new().context("netlink socket")?;
     let layout = Layout::of(&cfg);
     let scope = Scope {
-        polywan_tables: layout.tables(),
+        polywan_tables: vec![layout.tables()],
         discovery_tables: cfg.routing.discovery_tables.clone(),
     };
     let observer::View { system, interrupted } = observer::full(&dumper, &scope)
@@ -753,7 +753,7 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     }
     let layout = Layout::of(cfg);
     let scope = Scope {
-        polywan_tables: layout.tables(),
+        polywan_tables: vec![layout.tables()],
         discovery_tables: cfg.routing.discovery_tables.clone(),
     };
     let client = Client::new().context("netlink socket")?;
@@ -2139,7 +2139,6 @@ impl Daemon {
                 before_nft: before.as_ref().unwrap_or(&desired),
                 desired: &desired,
                 nft_pending,
-                teardown: false,
             },
         );
         // FR-COEX-4: while repairs of a kind are suspended, artifacts that a
@@ -2809,7 +2808,6 @@ impl Daemon {
                 before_nft: &desired,
                 desired: &desired,
                 nft_pending: self.cfg.firewall.mode == FirewallMode::Managed,
-                teardown: false,
             },
         );
         for op in &ops {

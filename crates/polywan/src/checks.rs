@@ -653,7 +653,7 @@ mod tests {
         let mut rules = layout.static_rules(Family::V4, &[id]);
         rules.extend(layout.source_rules(Family::V4, id, "192.0.2.2".parse().unwrap()));
         let scope = crate::system::Scope {
-            polywan_tables: layout.tables(),
+            polywan_tables: vec![layout.tables()],
             discovery_tables: Vec::new(),
         };
         let mut s = System::default();

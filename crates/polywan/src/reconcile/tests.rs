@@ -57,7 +57,7 @@ fn input(ids: &[u8]) -> Input {
 
 fn scope(cfg: &Config) -> Scope {
     Scope {
-        polywan_tables: Layout::of(cfg).tables(),
+        polywan_tables: vec![Layout::of(cfg).tables()],
         discovery_tables: vec![254],
     }
 }
@@ -82,7 +82,6 @@ fn diff_for(system: &System, cfg: &Config, before: &Desired, desired: &Desired, 
             before_nft: before,
             desired,
             nft_pending,
-            teardown: false,
         },
     )
 }
@@ -153,33 +152,113 @@ fn teardown_withdraws_every_route_after_the_rules() {
     let install = diff_for(&System::default(), &cfg, &desired, &desired, true);
     let mut s = System::default();
     apply(&mut s, &cfg, &install);
-    let empty = Desired::default();
-    let teardown = |teardown| {
-        rule_kinds(&diff(
-            &s,
-            &DiffInput {
-                layout: Layout::of(&cfg),
-                protocol: 249,
-                families: &[Family::V4],
-                before_nft: &empty,
-                desired: &empty,
-                nft_pending: false,
-                teardown,
-            },
-        ))
-    };
     // FR-REC-4: final guard first, class guards last among the rules, then
     // every route.
-    let v = teardown(true);
+    let v = rule_kinds(&teardown(&s, &[(Layout::of(&cfg), 249)]));
     let last_rule = v.iter().rposition(|x| !x.starts_with("-route")).unwrap();
     let first_route = v.iter().position(|x| x.starts_with("-route")).unwrap();
     assert!(last_rule < first_route, "{v:?}");
     assert_eq!(v[0], "-1699");
     assert!(position(&v, "-1600") < position(&v, "-1064"), "{v:?}");
     // At runtime the balancing route goes before the rules (FR-REC-3).
-    let v = teardown(false);
+    let empty = Desired::default();
+    let v = rule_kinds(&diff_for(&s, &cfg, &empty, &empty, false));
     assert!(position(&v, "-route 1000") < position(&v, "-1699"), "{v:?}");
     assert!(position(&v, "-1064") < position(&v, "-route 1001"), "{v:?}");
+}
+
+/// IMPL-7: cleanup removes the union of the installed layout and the
+/// configured one, each with its own protocol, with overlapping ranges:
+/// every rule of both first, in removal order, then every route; what both
+/// share once; objects of another protocol in both ranges stay.
+#[test]
+fn teardown_covers_the_union_of_layouts_and_keeps_other_protocols() {
+    let installed = config::parse(CONFIG).unwrap();
+    let configured = config::parse(&format!(
+        "[routing]\ntable_base = 1100\nrule_priority_base = 1300\nroute_protocol = 250\n{CONFIG}"
+    ))
+    .unwrap();
+    let layouts = [(Layout::of(&installed), 249), (Layout::of(&configured), 250)];
+    let scope = Scope {
+        polywan_tables: layouts.iter().map(|(l, _)| l.tables()).collect(),
+        discovery_tables: Vec::new(),
+    };
+    let mut s = System::default();
+    let mut install = |cfg: &Config, protocol: u8, table: Option<u32>, priority: Option<u32>| {
+        let desired = plan::plan(cfg, &input(&[1, 2]));
+        for r in desired.routes.values() {
+            let r = Route {
+                table: table.unwrap_or(r.table),
+                ..r.clone()
+            };
+            s.apply(&scope, &RouteNetlinkMessage::NewRoute(msg::route_message(&r, protocol)));
+        }
+        for r in &desired.rules {
+            let r = Rule {
+                priority: priority.unwrap_or(r.priority),
+                ..*r
+            };
+            s.apply(&scope, &RouteNetlinkMessage::NewRule(msg::rule_message(&r, protocol)));
+        }
+    };
+    install(&installed, 249, None, None);
+    install(&configured, 250, None, None);
+    // Another protocol in both ranges: tables 1100 to 1191 and priorities
+    // 1300 to 1699.
+    install(&installed, 251, Some(1150), Some(1650));
+    let foreign = |s: &System| {
+        (
+            s.rules.iter().filter(|r| r.protocol == 251).count(),
+            s.routes.values().filter(|r| r.protocol == 251).count(),
+        )
+    };
+    let before = foreign(&s);
+    assert!(before.0 > 0 && before.1 > 0);
+    let ops = teardown(&s, &layouts);
+    let v = rule_kinds(&ops);
+    let last_rule = v.iter().rposition(|x| !x.starts_with("-route")).unwrap();
+    let first_route = v.iter().position(|x| x.starts_with("-route")).unwrap();
+    assert!(last_rule < first_route, "{v:?}");
+    let mut finals = v[..2].to_vec();
+    finals.sort();
+    assert_eq!(finals, ["-1699", "-1999"], "both final guards first: {v:?}");
+    // Each route with its layout's protocol.
+    let tables = |cfg: &Config, protocol: u8| {
+        plan::plan(cfg, &input(&[1, 2]))
+            .routes
+            .into_keys()
+            .map(move |(family, table)| (protocol, family, table))
+    };
+    let expected: BTreeSet<_> = tables(&installed, 249).chain(tables(&configured, 250)).collect();
+    let deleted: BTreeSet<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::DeleteRoute {
+                family,
+                table,
+                protocol,
+            } => Some((*protocol, *family, *table)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deleted, expected);
+    for op in &ops {
+        let (m, _, _) = netlink_op(op, 0);
+        s.apply(&scope, &m);
+    }
+    assert_eq!(s.rules.len(), before.0, "only the other protocol's rules stay");
+    assert_eq!(s.routes.len(), before.1, "only the other protocol's routes stay");
+    assert_eq!(foreign(&s), before);
+    // A layout counted twice is removed once.
+    let mut s = System::default();
+    let desired = plan::plan(&installed, &input(&[1, 2]));
+    apply(
+        &mut s,
+        &installed,
+        &diff_for(&System::default(), &installed, &desired, &desired, true),
+    );
+    let once = teardown(&s, &layouts[..1]).len();
+    assert_eq!(teardown(&s, &[layouts[0], layouts[0]]).len(), once);
 }
 
 #[test]
@@ -417,7 +496,6 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &before,
             desired: &before,
             nft_pending: true,
-            teardown: false,
         },
     );
     apply(&mut s, &dual, &install);
@@ -436,7 +514,6 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &after,
             desired: &after,
             nft_pending: true,
-            teardown: false,
         },
     );
     // Nothing of IPv4 is touched.
@@ -474,7 +551,6 @@ fn family_handoff_follows_fr_rec_9_and_leaves_the_other_family_alone() {
             before_nft: &after,
             desired: &after,
             nft_pending: false,
-            teardown: false,
         },
     );
     assert!(again.is_empty(), "converged: {again:?}");

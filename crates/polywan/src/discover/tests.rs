@@ -120,7 +120,7 @@ fn system() -> System {
 
 fn scope() -> crate::system::Scope {
     crate::system::Scope {
-        polywan_tables: 1000..=1191,
+        polywan_tables: std::iter::once(1000..=1191).collect(),
         discovery_tables: vec![254, 200],
     }
 }

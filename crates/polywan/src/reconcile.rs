@@ -32,7 +32,13 @@ pub enum Op {
     AddRule(Rule),
     ApplyNft,
     DeleteRule(ObservedRule),
-    DeleteRoute { family: Family, table: u32 },
+    /// The route of a table, tagged with `protocol` (IMPL-7: cleanup
+    /// removes the routes of each layout with its own protocol).
+    DeleteRoute {
+        family: Family,
+        table: u32,
+        protocol: u8,
+    },
 }
 
 impl fmt::Display for Op {
@@ -42,7 +48,7 @@ impl fmt::Display for Op {
             Op::AddRule(r) => write!(f, "add {} rule {} ({:?})", r.family, r.priority, r.kind),
             Op::ApplyNft => write!(f, "apply the nftables table"),
             Op::DeleteRule(r) => write!(f, "delete {} rule {}", r.family, r.priority),
-            Op::DeleteRoute { family, table } => write!(f, "delete {family} route of table {table}"),
+            Op::DeleteRoute { family, table, .. } => write!(f, "delete {family} route of table {table}"),
         }
     }
 }
@@ -125,11 +131,6 @@ pub struct DiffInput<'a> {
     pub before_nft: &'a Desired,
     pub desired: &'a Desired,
     pub nft_pending: bool,
-    /// Cleanup (FR-REC-4): every route is withdrawn after the rules.
-    /// Otherwise balancing and policy routes are withdrawn first, so that a
-    /// removed uplink or family leaves the active set and its policy tables
-    /// before anything else changes (FR-REC-3, FR-REC-9).
-    pub teardown: bool,
 }
 
 /// Computes the ordered operations.
@@ -141,21 +142,14 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
         }
     }
     // Routes to withdraw. Path tables go last, after the rules that use them
-    // (FR-REC-4). Balancing and policy tables go first, except in a
-    // teardown, by comparison with the state before the nftables
-    // replacement: a removed uplink leaves the active set and its policy
-    // tables before its assignments do (FR-REC-3, FR-REC-9), also when an
-    // added uplink takes its place; the final state's routes come back
-    // after the replacement.
-    let mut tables = BTreeSet::new();
-    for r in system.routes.values() {
-        if r.protocol == d.protocol && d.layout.tables().contains(&r.table) && r.as_planned().is_some() {
-            tables.insert((r.family, r.table));
-        }
-    }
-    let (early, late): (Vec<_>, Vec<_>) = tables
+    // (FR-REC-4). Balancing and policy tables go first, by comparison with
+    // the state before the nftables replacement: a removed uplink leaves
+    // the active set and its policy tables before its assignments do
+    // (FR-REC-3, FR-REC-9), also when an added uplink takes its place; the
+    // final state's routes come back after the replacement.
+    let (early, late): (Vec<_>, Vec<_>) = observed_tables(system, d.layout, d.protocol)
         .into_iter()
-        .partition(|(_, t)| !d.teardown && !d.layout.is_path_table(*t));
+        .partition(|(_, t)| !d.layout.is_path_table(*t));
     let early: Vec<_> = early
         .into_iter()
         .filter(|key| !d.before_nft.routes.contains_key(key))
@@ -173,8 +167,13 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
                 .iter()
                 .any(|r| r.family == family && r.action == Action::Lookup(table))
         });
+    let protocol = d.protocol;
     for &(family, table) in early.iter().chain(&withdrawn) {
-        ops.push(Op::DeleteRoute { family, table });
+        ops.push(Op::DeleteRoute {
+            family,
+            table,
+            protocol,
+        });
     }
     let observed = observed_rules(system, d.layout, d.protocol);
     let mut adds: Vec<&Rule> = d
@@ -201,21 +200,66 @@ pub fn diff(system: &System, d: &DiffInput) -> Vec<Op> {
         .filter(|o| d.families.contains(&o.family) || !d.desired.rules.iter().any(|r| r.family == o.family))
         .filter(|o| !d.desired.rules.iter().any(|r| o.is(r, d.protocol)))
         .collect();
-    deletes.sort_by_key(|o| {
-        let kind = classify(d.layout, o.priority);
-        let guard_first = u8::from(kind != Some(RuleKind::SourceGuard));
-        (
-            removal_rank(kind),
-            o.source,
-            guard_first,
-            o.family,
-            std::cmp::Reverse(o.priority),
-        )
-    });
+    deletes.sort_by_key(|o| removal_key(d.layout, o));
     ops.extend(deletes.into_iter().cloned().map(Op::DeleteRule));
     for (family, table) in late {
-        ops.push(Op::DeleteRoute { family, table });
+        ops.push(Op::DeleteRoute {
+            family,
+            table,
+            protocol,
+        });
     }
+    ops
+}
+
+/// The tables holding a PolyWAN route of `layout`, tagged with `protocol`.
+fn observed_tables(system: &System, layout: Layout, protocol: u8) -> BTreeSet<(Family, u32)> {
+    system
+        .routes
+        .values()
+        .filter(|r| r.protocol == protocol && layout.tables().contains(&r.table) && r.as_planned().is_some())
+        .map(|r| (r.family, r.table))
+        .collect()
+}
+
+/// The removal order of a rule of `layout` (FR-REC-4): by role, each source
+/// guard before its source rule.
+fn removal_key(layout: Layout, o: &ObservedRule) -> impl Ord + use<> {
+    let kind = classify(layout, o.priority);
+    let guard_first = u8::from(kind != Some(RuleKind::SourceGuard));
+    (
+        removal_rank(kind),
+        o.source,
+        guard_first,
+        o.family,
+        std::cmp::Reverse(o.priority),
+    )
+}
+
+/// Cleanup's operations (FR-REC-4, IMPL-7) over the union of `layouts`,
+/// each with its route protocol: the rules of every layout in removal
+/// order, then every route; an object that two layouts share is removed
+/// once, and objects tagged with another protocol are kept (FR-ROUTE-6).
+pub fn teardown(system: &System, layouts: &[(Layout, u8)]) -> Vec<Op> {
+    let mut rules: Vec<(_, &ObservedRule)> = Vec::new();
+    let mut routes = BTreeSet::new();
+    for &(layout, protocol) in layouts {
+        for o in observed_rules(system, layout, protocol) {
+            if !rules.iter().any(|(_, r)| std::ptr::eq(*r, o)) {
+                rules.push((removal_key(layout, o), o));
+            }
+        }
+        for (family, table) in observed_tables(system, layout, protocol) {
+            routes.insert((protocol, family, table));
+        }
+    }
+    rules.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut ops: Vec<Op> = rules.into_iter().map(|(_, o)| Op::DeleteRule(o.clone())).collect();
+    ops.extend(routes.into_iter().map(|(protocol, family, table)| Op::DeleteRoute {
+        family,
+        table,
+        protocol,
+    }));
     ops
 }
 
@@ -357,8 +401,12 @@ fn netlink_op(op: &Op, protocol: u8) -> (RouteNetlinkMessage, Mutation, &'static
             Mutation::Delete,
             &[ENOENT],
         ),
-        Op::DeleteRoute { family, table } => (
-            RouteNetlinkMessage::DelRoute(msg::route_delete_key(*family, *table, protocol)),
+        Op::DeleteRoute {
+            family,
+            table,
+            protocol,
+        } => (
+            RouteNetlinkMessage::DelRoute(msg::route_delete_key(*family, *table, *protocol)),
             Mutation::Delete,
             &[ESRCH, ENOENT],
         ),

@@ -255,7 +255,7 @@ impl std::fmt::Display for ManifestConflict {
         match self {
             ManifestConflict::Structure { recorded, configured } => write!(
                 f,
-                "structural settings differ from the installed ones ({recorded:?} installed, {configured:?} configured): run `polywan cleanup` with the old settings, then start with the new ones (FR-CFG-4)"
+                "structural settings differ from the installed ones ({recorded:?} installed, {configured:?} configured): run `polywan cleanup`, which removes the installed artifacts as well, then start with the new settings (FR-CFG-4, IMPL-7)"
             ),
             ManifestConflict::IdReused {
                 id,

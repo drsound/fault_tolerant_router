@@ -38,13 +38,19 @@ pub enum Via {
 /// Which routes the model keeps.
 #[derive(Clone, Debug)]
 pub struct Scope {
-    pub polywan_tables: std::ops::RangeInclusive<u32>,
+    /// PolyWAN's table ranges: the configured layout's, and for cleanup the
+    /// installed one's too (IMPL-7).
+    pub polywan_tables: Vec<std::ops::RangeInclusive<u32>>,
     pub discovery_tables: Vec<u32>,
 }
 
 impl Scope {
+    pub fn is_polywan(&self, table: u32) -> bool {
+        self.polywan_tables.iter().any(|t| t.contains(&table))
+    }
+
     pub fn keeps(&self, r: &ObservedRoute) -> bool {
-        self.polywan_tables.contains(&r.table)
+        self.is_polywan(r.table)
             || (r.is_default() && self.discovery_tables.contains(&r.table))
             || (r.table == TABLE_MAIN && !r.is_default() && r.nexthops.iter().all(|h| h.gateway.is_none()))
     }
@@ -73,7 +79,7 @@ pub enum Change {
 }
 
 fn route_key(scope: &Scope, r: &ObservedRoute) -> RouteKey {
-    let via = if scope.polywan_tables.contains(&r.table) {
+    let via = if scope.is_polywan(r.table) {
         Via::Table
     } else if let Some(id) = r.nexthop_id {
         Via::Object(id)
@@ -244,7 +250,7 @@ impl System {
     /// no entry (one member of a multipath route). It must be evaluated
     /// against the view before the notification is applied.
     pub fn stale_after(&self, scope: &Scope, r: &ObservedRoute, deleted: bool, flags: u16) -> Option<(Family, u32)> {
-        if scope.polywan_tables.contains(&r.table) {
+        if scope.is_polywan(r.table) {
             return None;
         }
         let key = route_key(scope, r);
@@ -325,7 +331,7 @@ mod tests {
     #[test]
     fn a_rule_is_kept_once_whatever_its_source() {
         let scope = Scope {
-            polywan_tables: 1000..=1191,
+            polywan_tables: std::iter::once(1000..=1191).collect(),
             discovery_tables: vec![254],
         };
         let rule = Rule {
@@ -350,7 +356,7 @@ mod tests {
 
     fn scope() -> Scope {
         Scope {
-            polywan_tables: 1000..=1191,
+            polywan_tables: std::iter::once(1000..=1191).collect(),
             discovery_tables: vec![254],
         }
     }
