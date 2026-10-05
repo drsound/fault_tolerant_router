@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use hyper::Method;
+use hyper::{Method, StatusCode};
 use serde_json::Value;
 
 use crate::api::{self, client};
@@ -38,6 +38,16 @@ pub fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
     }
 }
 
+/// Reads and validates a configuration file, for the commands that need it.
+pub fn load(path: &Path) -> Result<crate::config::Config> {
+    crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The server's message in an error response.
+fn error_text(v: &Value) -> &str {
+    v.get("error").and_then(Value::as_str).unwrap_or("request failed")
+}
+
 /// `GET` on a socket, as JSON; any status but 200 is an error with the
 /// server's message.
 async fn get(socket: &Path, path: &str, timeout: Duration) -> Result<Value> {
@@ -46,13 +56,21 @@ async fn get(socket: &Path, path: &str, timeout: Duration) -> Result<Value> {
         .with_context(|| socket.display().to_string())?;
     let v: Value = serde_json::from_slice(&body).context("the response is not JSON")?;
     if !status.is_success() {
-        bail!(
-            "{}: {}",
-            status,
-            v.get("error").and_then(Value::as_str).unwrap_or("request failed")
-        );
+        bail!("{}: {}", status, error_text(&v));
     }
     Ok(v)
+}
+
+/// `POST` on the control socket: the status and the JSON body (`null` if
+/// the body is not JSON).
+async fn post(
+    socket: &Path,
+    path: &str,
+    body: Option<String>,
+    timeout: Duration,
+) -> Result<(StatusCode, Value), client::Error> {
+    let (status, body) = client::request(socket, Method::POST, path, body, timeout).await?;
+    Ok((status, serde_json::from_slice(&body).unwrap_or_default()))
 }
 
 pub async fn status(socket: &Path, json: bool) -> Result<()> {
@@ -197,23 +215,15 @@ pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Resul
     }
     let action = if drain { "drain" } else { "undrain" };
     let body = (drain && force).then(|| r#"{"force": true}"#.to_owned());
-    let (status, body) = client::request(
-        socket,
-        Method::POST,
-        &format!("/v1/uplinks/{name}/{action}"),
-        body,
-        api::DEADLINE,
-    )
-    .await
-    .with_context(|| socket.display().to_string())?;
-    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-    let message = v.get("error").and_then(Value::as_str).unwrap_or("request failed");
-    if status != hyper::StatusCode::OK {
+    let (status, v) = post(socket, &format!("/v1/uplinks/{name}/{action}"), body, api::DEADLINE)
+        .await
+        .with_context(|| socket.display().to_string())?;
+    if status != StatusCode::OK {
         let steps = v
             .get("failed_steps")
             .map(|s| format!(" (failed steps: {s})"))
             .unwrap_or_default();
-        bail!("{action} {name}: {status}: {message}{steps}");
+        bail!("{action} {name}: {status}: {}{steps}", error_text(&v));
     }
     crate::say!(
         "uplink {name} {}, applied in generation {}",
@@ -225,15 +235,11 @@ pub async fn drain(socket: &Path, name: &str, drain: bool, force: bool) -> Resul
 
 /// `reload` (FR-API-3): the validation errors, or the applied generation.
 pub async fn reload(socket: &Path) -> Result<()> {
-    let (status, body) = client::request(socket, Method::POST, "/v1/reload", None, api::DEADLINE)
+    let (status, v) = post(socket, "/v1/reload", None, api::DEADLINE)
         .await
         .with_context(|| socket.display().to_string())?;
-    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-    if status != hyper::StatusCode::OK {
-        let mut message = format!(
-            "reload: {status}: {}",
-            v.get("error").and_then(Value::as_str).unwrap_or("request failed")
-        );
+    if status != StatusCode::OK {
+        let mut message = format!("reload: {status}: {}", error_text(&v));
         for e in v.get("errors").and_then(Value::as_array).into_iter().flatten() {
             message += &format!("\n{}", e.as_str().unwrap_or_default());
         }
@@ -253,22 +259,10 @@ pub async fn forget(socket: &Path, name: &str, config: &Path, lock: &Path) -> Re
     if !crate::config::valid_uplink_name(name) {
         bail!("{name:?} is not an uplink name");
     }
-    let r = client::request(
-        socket,
-        Method::POST,
-        &format!("/v1/uplinks/{name}/forget"),
-        None,
-        api::DEADLINE,
-    )
-    .await;
-    match r {
-        Ok((status, body)) => {
-            let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-            if status != hyper::StatusCode::OK {
-                bail!(
-                    "forget {name}: {status}: {}",
-                    v.get("error").and_then(Value::as_str).unwrap_or("request failed")
-                );
+    match post(socket, &format!("/v1/uplinks/{name}/forget"), None, api::DEADLINE).await {
+        Ok((status, v)) => {
+            if status != StatusCode::OK {
+                bail!("forget {name}: {status}: {}", error_text(&v));
             }
             crate::say!("uplink {name:?} forgotten; id {} can be reused", v["id"]);
             Ok(())
@@ -287,7 +281,7 @@ pub async fn forget(socket: &Path, name: &str, config: &Path, lock: &Path) -> Re
 
 /// Offline: root, the configuration and the instance lock (FR-MARK-4).
 fn forget_offline(path: &Path, name: &str, lock: &Path) -> Result<()> {
-    let cfg = crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = load(path)?;
     let _lock = crate::state::InstanceLock::acquire(lock).map_err(|e| anyhow::anyhow!("{e}; stop the daemon first"))?;
     let dir = crate::state::StateDir {
         path: cfg.state_dir.clone(),
@@ -359,15 +353,11 @@ const NOTIFY_TEST_WAIT: Duration = Duration::from_secs(3600);
 
 /// `notify-test` (FR-MAIL-4), through the control socket.
 pub async fn notify_test(socket: &Path) -> Result<()> {
-    let (status, body) = client::request(socket, Method::POST, "/v1/notify-test", None, NOTIFY_TEST_WAIT)
+    let (status, v) = post(socket, "/v1/notify-test", None, NOTIFY_TEST_WAIT)
         .await
         .with_context(|| socket.display().to_string())?;
-    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-    if status != hyper::StatusCode::OK {
-        bail!(
-            "notify-test: {status}: {}",
-            v.get("error").and_then(Value::as_str).unwrap_or("request failed")
-        );
+    if status != StatusCode::OK {
+        bail!("notify-test: {status}: {}", error_text(&v));
     }
     let reports: Vec<crate::notifytest::Report> =
         serde_json::from_value(v["channels"].clone()).context("the response has no channel reports")?;
@@ -380,7 +370,7 @@ pub async fn notify_test_offline(path: &Path, lock: &Path) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("notify-test --offline needs root");
     }
-    let cfg = crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = load(path)?;
     let mut f = crate::checks::trusted(path, &cfg);
     f.extend(crate::checks::identities(&cfg));
     if let Some(e) = f.errors.first() {

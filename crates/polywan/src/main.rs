@@ -162,12 +162,12 @@ fn main() -> ExitCode {
                 Ok(())
             }
             Command::ExportNft { config } => {
-                let cfg = load(&config)?;
+                let cfg = polywan::cli::load(&config)?;
                 polywan::cli::write_stdout(format_args!("{}", nft::ruleset(&cfg)), false);
                 Ok(())
             }
             Command::Cleanup { config } => {
-                let cfg = load(&config)?;
+                let cfg = polywan::cli::load(&config)?;
                 let _lock = state::InstanceLock::acquire(&cli.lock)?;
                 let dir = state::StateDir {
                     path: cfg.state_dir.clone(),
@@ -204,12 +204,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn load(path: &Path) -> anyhow::Result<config::Config> {
-    config::load(path).map_err(|e| anyhow::anyhow!("{e}"))
-}
-
 async fn check_config(path: &Path, offline: bool) -> anyhow::Result<()> {
-    let cfg = load(path)?;
+    let cfg = polywan::cli::load(path)?;
     if !offline {
         let f = daemon::check_system(path, &cfg).await?;
         for w in &f.warnings {
