@@ -112,7 +112,7 @@ upgrade() {
 	rm -rf "$dir"
 	dpkg-deb -R "$deb" "$dir"
 	sed -i "s/^Version: .*/Version: $v/" "$dir/DEBIAN/control"
-	dpkg-deb --root-owner-group -b "$dir" "$work/polywan_$v.deb" >/dev/null
+	dpkg-deb --root-owner-group -Znone -b "$dir" "$work/polywan_$v.deb" >/dev/null
 	rm -rf "$dir"
 	pkg -i "$work/polywan_$v.deb"
 }
@@ -236,8 +236,7 @@ trap 'reset; rm -rf "$work"' EXIT
 section "fresh install (DIST-1): group, files, nothing enabled or started"
 reset
 topology
-pkg -i "$deb"
-check "dpkg -i succeeds" [ $? -eq 0 ]
+check "dpkg -i succeeds" pkg -i "$deb"
 gid=$(getent group polywan | cut -d: -f3)
 check "the polywan group is a system group" test "${gid:-1000}" -lt 1000
 for f in /usr/bin/polywan /usr/lib/systemd/system/$UNIT /usr/lib/sysusers.d/polywan.conf \
@@ -251,10 +250,8 @@ eq "the unit is not enabled" "$(enabled)" disabled
 eq "the unit is not started" "$(active)" inactive
 refute "no state directory" test -e $STATE
 refute "no configuration" test -e /etc/polywan
-maint postinst configure "$version"
-check "postinst configure again succeeds" [ $? -eq 0 ]
-maint postinst configure "$version"
-check "and a third time" [ $? -eq 0 ]
+check "postinst configure again succeeds" maint postinst configure "$version"
+check "and a third time" maint postinst configure "$version"
 eq "one polywan group" "$(grep -c '^polywan:' /etc/group)" 1
 eq "still not enabled" "$(enabled)" disabled
 eq "still not started" "$(active)" inactive
@@ -266,25 +263,21 @@ start
 eq "started" "$(active)" active
 check "PolyWAN's routing installed in the namespace" [ "$(artifacts)" -gt 0 ]
 pid=$(prop MainPID)
-upgrade
-check "upgrade while running succeeds" [ $? -eq 0 ]
+check "upgrade while running succeeds" upgrade
 eq "running after the upgrade" "$(active)" active
 now=$(prop MainPID)
 check "restarted by the upgrade" test "$now" != "$pid" -a "$now" != 0
 eq "still enabled" "$(enabled)" enabled
 systemctl stop $UNIT
-upgrade
-check "upgrade while stopped succeeds" [ $? -eq 0 ]
+check "upgrade while stopped succeeds" upgrade
 eq "stopped after the upgrade" "$(active)" inactive
 eq "still enabled" "$(enabled)" enabled
 systemctl disable $UNIT >/dev/null 2>&1
-upgrade
-check "upgrade while disabled succeeds" [ $? -eq 0 ]
+check "upgrade while disabled succeeds" upgrade
 eq "still disabled" "$(enabled)" disabled
 eq "not started" "$(active)" inactive
 systemctl mask $UNIT >/dev/null 2>&1
-upgrade
-check "upgrade while masked succeeds" [ $? -eq 0 ]
+check "upgrade while masked succeeds" upgrade
 eq "still masked" "$(enabled)" masked
 eq "not started" "$(active)" inactive
 systemctl unmask $UNIT >/dev/null 2>&1
@@ -294,16 +287,13 @@ start
 pid=$(prop MainPID)
 printf '#!/bin/sh\nexit 101\n' >$POLICY
 chmod 0755 $POLICY
-upgrade
-check "upgrade succeeds" [ $? -eq 0 ]
+check "upgrade succeeds" upgrade
 eq "not restarted" "$(prop MainPID)" "$pid"
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 said "cleanup skipped while the daemon runs" "polywan.service is still running"
 eq "the daemon still runs" "$(active)" active
 check "its routing stays" [ "$(artifacts)" -gt 0 ]
-pkg -P polywan
-check "purge succeeds" [ $? -eq 0 ]
+check "purge succeeds" pkg -P polywan
 said "purge reports the held lock" "the instance lock is held"
 check "the manifest stays" manifest
 rm -f $POLICY
@@ -316,38 +306,30 @@ check "the group stays" getent group polywan
 section "removal with a valid configuration: stop and cleanup"
 fresh
 start
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 quiet "nothing reported"
 eq "stopped" "$(active)" inactive
 eq "no artifacts" "$(artifacts)" 0
 refute "no manifest" manifest
-pkg -P polywan
-check "purge succeeds" [ $? -eq 0 ]
+check "purge succeeds" pkg -P polywan
 refute "purge after a successful cleanup deletes $STATE" test -e $STATE
 
 section "maintainer scripts run again: already stopped, already cleaned"
 fresh
 start
-maint prerm remove
-check "prerm remove succeeds" [ $? -eq 0 ]
+check "prerm remove succeeds" maint prerm remove
 eq "stopped" "$(active)" inactive
 eq "no artifacts" "$(artifacts)" 0
 refute "no manifest" manifest
-maint prerm remove
-check "prerm remove again succeeds" [ $? -eq 0 ]
+check "prerm remove again succeeds" maint prerm remove
 quiet "nothing reported"
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 quiet "nothing reported"
-maint postrm purge
-check "postrm purge succeeds" [ $? -eq 0 ]
+check "postrm purge succeeds" maint postrm purge
 refute "$STATE deleted" test -e $STATE
-maint postrm purge
-check "postrm purge again succeeds" [ $? -eq 0 ]
+check "postrm purge again succeeds" maint postrm purge
 quiet "nothing reported"
-pkg -P polywan
-check "purge succeeds" [ $? -eq 0 ]
+check "purge succeeds" pkg -P polywan
 quiet "nothing reported"
 
 section "removal without a configuration"
@@ -355,8 +337,7 @@ fresh
 start
 systemctl stop $UNIT
 mv $CONFIG $work/config.toml
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 said "cleanup skipped" "$CONFIG does not exist"
 said "with recovery instructions" "run: polywan cleanup"
 check "the routing stays" [ "$(artifacts)" -gt 0 ]
@@ -370,8 +351,7 @@ start
 systemctl stop $UNIT
 cp $CONFIG $work/config.toml
 echo 'bogus = 1' >>$CONFIG
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 said "cleanup failed" "cleanup failed (see above); the manifest in $STATE is kept"
 check "the manifest stays" manifest
 pkg -P polywan
@@ -414,12 +394,10 @@ systemctl start $UNIT >"$out" 2>&1
 check "the start fails" [ $? -ne 0 ]
 check "the daemon refused the lock" journalctl -u $UNIT --since "-1min" -o cat --grep "instance lock"
 eq "the lock file is the same" "$(lock_inode)" "$inode"
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "removal succeeds" pkg -r polywan
 said "cleanup refused by the lock" "held by another instance"
 said "reported" "cleanup failed (see above)"
-pkg -P polywan
-check "purge succeeds" [ $? -eq 0 ]
+check "purge succeeds" pkg -P polywan
 said "purge reports the held lock" "the instance lock is held"
 check "the manifest stays" manifest
 eq "the lock file is the same" "$(lock_inode)" "$inode"
@@ -447,15 +425,12 @@ status_socket = \"$CUSTOM_RUN/status.sock\""
 start
 eq "started" "$(active)" active
 check "the manifest is in $CUSTOM_STATE" test -e $CUSTOM_STATE/manifest.json
-systemctl reload $UNIT
-check "reload through the custom socket" [ $? -eq 0 ]
-pkg -r polywan
-check "removal succeeds" [ $? -eq 0 ]
+check "reload through the custom socket" systemctl reload $UNIT
+check "removal succeeds" pkg -r polywan
 quiet "nothing reported"
 eq "no artifacts" "$(artifacts)" 0
 refute "cleanup used the custom manifest" test -e $CUSTOM_STATE/manifest.json
-pkg -P polywan
-check "purge succeeds" [ $? -eq 0 ]
+check "purge succeeds" pkg -P polywan
 check "$CUSTOM_STATE kept" test -f $CUSTOM_STATE/marker
 check "$CUSTOM_RUN kept" test -d $CUSTOM_RUN
 refute "$STATE deleted" test -e $STATE

@@ -273,50 +273,14 @@ fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
     let before = ra_expiry(&t, "wana")?.expect("A's default route");
     assert!(before > 60, "A's router lifetime: {before} s");
-    // From now on only advertisements without options leave the providers
-    // (56 bytes with the IPv6 header). dnsmasq's carry prefix information:
-    // their RTM_NEWPREFIX, B's too, would re-read the main table, which
-    // holds both default routes.
-    for p in [Node::IspA, Node::IspB] {
-        t.ns(p).nft(
-            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert meta length != 56 drop\n  }\n}\n",
-        )?;
-    }
-    // Advertisements already sent arrive first.
-    std::thread::sleep(Duration::from_secs(1));
-    t.ns(Node::IspA).run(
-        &t.agent_bin().to_string_lossy(),
-        [
-            "agent",
-            "send-ra",
-            "--device",
-            "wan",
-            "--lifetime",
-            "4",
-            // dnsmasq's managed and other-configuration flags (0xc0): a change of
-            // flags would also notify the interface's IPv6 settings.
-            "--flags",
-            "192",
-        ],
-    )?;
+    options_free_ras(&t)?;
+    send_short_ra(&t, 4)?;
     t.wait_for(
         "A's default route with the short lifetime",
         Duration::from_secs(5),
         || Ok(ra_expiry(&t, "wana")?.is_some_and(|s| s <= 4)),
     )?;
-    let start = std::time::Instant::now();
-    let left = ra_expiry(&t, "wana")?.unwrap_or(0);
-    t.wait_for("A's path route withdrawn", Duration::from_secs(left + 5), || {
-        Ok(path_route(&t, Family::V6, 1001)?.is_empty())
-    })?;
-    let took = start.elapsed();
-    // As in AS-28: `expires` is rounded down to the second.
-    assert!(
-        took <= Duration::from_secs(left + 2) && took + Duration::from_secs(1) >= Duration::from_secs(left),
-        "withdrawn after {took:?}, expiry in {left} s"
-    );
-    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(2))?;
-    Ok(())
+    withdrawn_at_expiry(&t)
 }
 
 /// FR-DISC-5, carried over from M2: A's default route is created again
@@ -334,29 +298,7 @@ fn fr_disc_5_lifetime_refreshed_without_a_notification() -> Result<()> {
     let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
     f.wait_installed(&t)?;
     wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
-    // As in the scenario above: only advertisements without options.
-    for p in [Node::IspA, Node::IspB] {
-        t.ns(p).nft(
-            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert meta length != 56 drop\n  }\n}\n",
-        )?;
-    }
-    std::thread::sleep(Duration::from_secs(1));
-    let advertise = || -> Result<()> {
-        t.ns(Node::IspA).run(
-            &t.agent_bin().to_string_lossy(),
-            [
-                "agent",
-                "send-ra",
-                "--device",
-                "wan",
-                "--lifetime",
-                "6",
-                "--flags",
-                "192",
-            ],
-        )?;
-        Ok(())
-    };
+    options_free_ras(&t)?;
     // The route's creation is notified with its expiry; its refreshes, every
     // 3 s, are not.
     drop_ra_default_routes(&t, "wana")?;
@@ -366,7 +308,7 @@ fn fr_disc_5_lifetime_refreshed_without_a_notification() -> Result<()> {
             let mut last: Option<Instant> = None;
             while !stop.load(Ordering::Relaxed) {
                 if last.is_none_or(|l| l.elapsed() >= Duration::from_secs(3)) {
-                    advertise()?;
+                    send_short_ra(&t, 6)?;
                     last = Some(Instant::now());
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -400,17 +342,59 @@ fn fr_disc_5_lifetime_refreshed_without_a_notification() -> Result<()> {
         watched
     })?;
     // No more refreshes: A goes at the last expiry.
-    let since = Instant::now();
-    let left = ra_expiry(&t, "wana")?.unwrap_or(0);
+    withdrawn_at_expiry(&t)
+}
+
+/// From now on only advertisements without options leave the providers
+/// (56 bytes with the IPv6 header). dnsmasq's carry prefix information:
+/// their RTM_NEWPREFIX, B's too, would re-read the main table, which holds
+/// both default routes. Advertisements already sent arrive first.
+fn options_free_ras(t: &testbed::Topology) -> Result<()> {
+    for p in [Node::IspA, Node::IspB] {
+        t.ns(p).nft(
+            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert meta length != 56 drop\n  }\n}\n",
+        )?;
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    Ok(())
+}
+
+/// An advertisement without options from A's provider with a router
+/// lifetime of `lifetime` seconds.
+fn send_short_ra(t: &testbed::Topology, lifetime: u32) -> Result<()> {
+    t.ns(Node::IspA).run(
+        &t.agent_bin().to_string_lossy(),
+        [
+            "agent",
+            "send-ra",
+            "--device",
+            "wan",
+            "--lifetime",
+            &lifetime.to_string(),
+            // dnsmasq's managed and other-configuration flags (0xc0): a change of
+            // flags would also notify the interface's IPv6 settings.
+            "--flags",
+            "192",
+        ],
+    )?;
+    Ok(())
+}
+
+/// A's path route is withdrawn at the expiry of its default route, then B
+/// is the only member.
+fn withdrawn_at_expiry(t: &testbed::Topology) -> Result<()> {
+    let start = std::time::Instant::now();
+    let left = ra_expiry(t, "wana")?.unwrap_or(0);
     t.wait_for("A's path route withdrawn", Duration::from_secs(left + 5), || {
-        Ok(path_route(&t, Family::V6, 1001)?.is_empty())
+        Ok(path_route(t, Family::V6, 1001)?.is_empty())
     })?;
-    let took = since.elapsed();
+    let took = start.elapsed();
+    // As in AS-28: `expires` is rounded down to the second.
     assert!(
         took <= Duration::from_secs(left + 2) && took + Duration::from_secs(1) >= Duration::from_secs(left),
         "withdrawn after {took:?}, expiry in {left} s"
     );
-    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(2))?;
+    wait_members(t, Family::V6, &["wanb"], Duration::from_secs(2))?;
     Ok(())
 }
 

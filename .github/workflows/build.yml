@@ -51,9 +51,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Install the packaging tools
+        # qemu-user for the arm binaries, the lifecycle's tools on amd64.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lintian qemu-user mmdebstrap nftables
+          sudo apt-get install -y --no-install-recommends lintian \
+            ${{ matrix.qemu && 'qemu-user' || '' }} ${{ matrix.arch == 'amd64' && 'mmdebstrap nftables' || '' }}
       - name: Build
         run: |
           cargo build --release --locked --target ${{ matrix.target }} -p polywan \

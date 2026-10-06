@@ -36,7 +36,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let run = matches!(cli.command, Command::Run { .. });
     let result = runtime.block_on(async {
         match cli.command {
             Command::Run {
@@ -95,8 +94,8 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
-            // §9: only `run` has a configuration status.
-            if run && e.downcast_ref::<daemon::ConfigRefused>().is_some() {
+            // §9: only `run` refuses a configuration with its own status.
+            if e.downcast_ref::<daemon::ConfigRefused>().is_some() {
                 ExitCode::from(78)
             } else {
                 ExitCode::FAILURE

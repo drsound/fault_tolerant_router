@@ -24,8 +24,9 @@ use crate::test_hooks;
 pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
     let manifest = state_dir.manifest().context("manifest")?;
     // IMPL-7: the union of the installed layout (the manifest's) and the
-    // configured one, each with its own route protocol.
-    let mut layouts = vec![(Layout::of(cfg), cfg.routing.route_protocol)];
+    // configured one, each with its own route protocol; teardown removes
+    // what both share once.
+    let mut layouts = Vec::new();
     let mut managed = cfg.firewall.mode == FirewallMode::Managed;
     if let Some(m) = &manifest {
         let installed = Layout {
@@ -33,11 +34,10 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
             priority_base: m.structure.rule_priority_base,
             mask: m.structure.mask().unwrap_or(FwMask::DEFAULT),
         };
-        if !layouts.contains(&(installed, m.structure.route_protocol)) {
-            layouts.insert(0, (installed, m.structure.route_protocol));
-        }
+        layouts.push((installed, m.structure.route_protocol));
         managed |= m.structure.firewall_mode == Mode::Managed;
     }
+    layouts.push((Layout::of(cfg), cfg.routing.route_protocol));
     if managed {
         test_hooks::step("remove the nftables table").map_err(|e| anyhow!(e))?;
         nftctl::apply(&cfg.firewall.nft_path, &nft::removal())

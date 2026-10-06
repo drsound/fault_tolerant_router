@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::config::{AutoOr, Config};
-use crate::model::{Family, UplinkId};
+use crate::discover;
+use crate::model::Family;
 use crate::netlink::msg::{ObservedAction, TABLE_MAIN};
 use crate::nftctl;
-use crate::plan::{Layout, RuleKind};
+use crate::plan::Layout;
 use crate::system::System;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -272,24 +273,13 @@ fn traversed(path: &Path, link: impl Fn(&Path) -> std::io::Result<Option<PathBuf
 /// them otherwise.
 pub fn adoptable(system: &System, layout: Layout, protocol: u8) -> Findings {
     let mut f = Findings::default();
-    let ids: Vec<UplinkId> = (1..=63).filter_map(UplinkId::new).collect();
     for family in Family::ALL {
-        let planned = layout.static_rules(family, &ids);
         for r in system
             .rules
             .iter()
             .filter(|r| r.family == family && r.protocol == protocol && layout.priorities().contains(&r.priority))
         {
-            let consistent = match (r.source, crate::reconcile::classify(layout, r.priority)) {
-                (Some((a, _)), Some(RuleKind::SourceLookup(id))) => {
-                    r.is(&layout.source_rules(family, id, a)[0], protocol)
-                }
-                (Some((a, _)), Some(RuleKind::SourceGuard)) => {
-                    r.is(&layout.source_rules(family, ids[0], a)[1], protocol)
-                }
-                _ => planned.iter().any(|p| r.is(p, protocol)),
-            };
-            if !consistent {
+            if !crate::reconcile::has_role(layout, r) {
                 f.errors.push(format!(
                     "{family}: PolyWAN's rule at priority {} does not match this configuration (another fwmark_mask or table_base installed it?) and there is no manifest to clean it up with: run `cleanup` with this configuration, then start (IMPL-6)",
                     r.priority
@@ -449,11 +439,10 @@ pub fn targets(locals: &[LocalAddress], config: &Config) -> Vec<String> {
                         "uplink {}: the {family} probe target {t} is an address of the router ({}): the router would answer its probes itself (FR-PROBE-2)",
                         u.name, l.interface
                     ));
-                } else if let Some(l) = locals.iter().find(|l| {
-                    config.downlinks.contains(&l.interface)
-                        && l.address.is_ipv4() == a.is_ipv4()
-                        && network(l.address, l.prefix_len) == network(a, l.prefix_len)
-                }) {
+                } else if let Some(l) = locals
+                    .iter()
+                    .find(|l| config.downlinks.contains(&l.interface) && discover::contains(l.address, l.prefix_len, a))
+                {
                     errors.push(format!(
                         "uplink {}: the {family} probe target {t} is inside {}/{}, the network of downlink {}: its probes would test the LAN, not the internet (FR-PROBE-2)",
                         u.name,
@@ -661,6 +650,7 @@ fn netns_identity(proc: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::UplinkId;
 
     #[test]
     fn a_process_shares_its_own_network_namespace() {

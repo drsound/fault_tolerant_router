@@ -213,9 +213,13 @@ impl Unit {
         Ok(out)
     }
 
-    /// `ActiveState` and `SubState`, for example `active` and `running`.
-    pub fn active_state(&self) -> Result<(String, String)> {
-        Ok((self.property("ActiveState")?, self.property("SubState")?))
+    /// `ActiveState/SubState`, for example `active/running`.
+    pub fn active_state(&self) -> Result<String> {
+        Ok(format!(
+            "{}/{}",
+            self.property("ActiveState")?,
+            self.property("SubState")?
+        ))
     }
 
     /// `systemctl stop` (SIGTERM to the main process, IMPL-10's

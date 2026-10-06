@@ -267,16 +267,24 @@ impl Polywan {
         // The run's state directory, a top-level key: before any table.
         let mut text = format!("state_dir = \"{}\"\n{config}", self.state.display());
         if !text.contains("\n[api]") {
-            let _ = write!(
-                text,
-                "\n[api]\nsocket = \"{}\"\nstatus_socket = \"{}\"\ngroup = \"root\"\n",
-                self.dir.join("api.sock").display(),
-                self.dir.join("status.sock").display()
-            );
+            text += &self.api_table("root", None);
         }
         fs::write(&self.config, text)?;
         fs::set_permissions(&self.config, fs::Permissions::from_mode(0o644))?;
         Ok(())
+    }
+
+    /// An `[api]` table with this run's sockets and the given groups.
+    pub fn api_table(&self, group: &str, status_group: Option<&str>) -> String {
+        let mut table = format!(
+            "\n[api]\nsocket = \"{}\"\nstatus_socket = \"{}\"\ngroup = \"{group}\"\n",
+            self.control_socket().display(),
+            self.status_socket().display()
+        );
+        if let Some(g) = status_group {
+            let _ = writeln!(table, "status_group = \"{g}\"");
+        }
+        table
     }
 
     fn args<'a>(&'a self, rest: &[&'a str]) -> Vec<String> {
@@ -321,9 +329,12 @@ impl Polywan {
         self.unit_options = options;
     }
 
-    /// The unit the daemon runs as, if it was started under one.
-    pub fn unit(&self) -> Option<&crate::unit::Unit> {
-        self.daemon.as_ref()?.unit()
+    /// The unit the daemon runs as: an error unless it was started under one.
+    pub fn unit(&self) -> Result<&crate::unit::Unit> {
+        self.daemon
+            .as_ref()
+            .and_then(|d| d.unit())
+            .context("the daemon runs without the unit")
     }
 
     /// Sets an environment variable for the next starts, for the daemon's
@@ -353,8 +364,14 @@ impl Polywan {
 
     fn cli_command(&self, rest: &[&str]) -> std::process::Command {
         let mut c = Ns::new(self.router_ns.as_str()).command(&self.bin);
-        c.args(self.args(rest)).envs(self.env.iter().map(|(k, v)| (k, v)));
+        self.with_args(&mut c, rest);
         c
+    }
+
+    /// This run's lock, `rest` and environment on a command that runs
+    /// the binary.
+    fn with_args(&self, c: &mut std::process::Command, rest: &[&str]) {
+        c.args(self.args(rest)).envs(self.env.iter().map(|(k, v)| (k, v)));
     }
 
     /// Runs `run --config` with more `run` options in the foreground until
@@ -364,13 +381,10 @@ impl Polywan {
         let config = self.config.display().to_string();
         let mut run = vec!["run", "--config", &config];
         run.extend_from_slice(options);
-        Ok(Ns::new(self.router_ns.as_str())
-            .command("timeout")
-            .args(["--signal=KILL", "30"])
-            .arg(&self.bin)
-            .args(self.args(&run))
-            .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .output()?)
+        let mut c = Ns::new(self.router_ns.as_str()).command("timeout");
+        c.args(["--signal=KILL", "30"]).arg(&self.bin);
+        self.with_args(&mut c, &run);
+        Ok(c.output()?)
     }
 
     /// This run's status socket ([`Polywan::write_config`]).

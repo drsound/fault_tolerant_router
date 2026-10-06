@@ -44,14 +44,13 @@ jobs:
         run: cargo publish -p polywan --locked --dry-run
 
   build:
-    needs: check
     uses: ./.github/workflows/build.yml
     with:
       cache: false
 
   release:
     name: draft release
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-26.04
     permissions:
       contents: write

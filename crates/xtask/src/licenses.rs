@@ -62,8 +62,7 @@ pub fn write(dir: &Path) -> anyhow::Result<()> {
         out += &format!("\n{RULE}\n{}\n{RULE}\n\n{}", users.join(",\n"), text.trim_end());
         out.push('\n');
     }
-    fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
-    fs::write(dir.join("THIRD-PARTY-LICENSES"), out)?;
+    super::write(dir, "THIRD-PARTY-LICENSES", out.as_bytes())?;
 
     let std = sysroot()?.join("share/doc/rust/COPYRIGHT-library.html");
     fs::copy(&std, dir.join("rust-std-copyright.html")).with_context(|| format!("{}", std.display()))?;

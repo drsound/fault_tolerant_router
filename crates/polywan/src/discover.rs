@@ -175,7 +175,7 @@ fn connected(system: &System, family: Family, ifindex: u32, gw: IpAddr) -> bool 
     })
 }
 
-fn contains(net: IpAddr, len: u8, a: IpAddr) -> bool {
+pub(crate) fn contains(net: IpAddr, len: u8, a: IpAddr) -> bool {
     match (net, a) {
         (IpAddr::V4(n), IpAddr::V4(a)) => {
             let mask = if len == 0 {

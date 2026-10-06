@@ -82,25 +82,35 @@ if [ "$mode" = build ]; then
   echo "$bindir"
   exit 0
 fi
+scenarios="m1 m2 m3 m4"
+sudo=
+[ "$(id -u)" -eq 0 ] || sudo=sudo
+daemon=$bindir/polywan
+unit_file=
+m1() { # m1 MASK TEST-ARGS...: every scenario binary, whatever fails
+  m1_mask=$1
+  shift
+  m1_status=0
+  for s in $scenarios; do
+    $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$daemon" \
+      ${unit_file:+"POLYWAN_TEST_UNIT=$unit_file"} POLYWAN_TEST_FWMARK_MASK="$m1_mask" \
+      "$bindir/$s" --ignored "$@" || m1_status=1
+  done
+  return $m1_status
+}
 if [ -n "$unit" ]; then
   # systemd as PID 1 is needed: not in the virtme-ng guest.
   [ "$mode" = host ] || { echo "--unit runs on the host only" >&2; exit 2; }
   [ -z "$installed" ] || [ -x /usr/bin/polywan ] || { echo "--installed: the polywan package is not installed" >&2; exit 2; }
-  sudo=
-  [ "$(id -u)" -eq 0 ] || sudo=sudo
   cd /tmp
-  daemon=$bindir/polywan unit_file=$bindir/polywan.service
+  unit_file=$bindir/polywan.service
   if [ -n "$installed" ]; then
     daemon=/usr/bin/polywan unit_file=/usr/lib/systemd/system/polywan.service
   fi
   status=0
   for mask in ${POLYWAN_TEST_MASKS:-0x00ff0000}; do
     echo "== M1 to M4 scenarios under the unit with fwmark_mask $mask"
-    for s in m1 m2 m3 m4; do
-      $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$daemon" \
-        POLYWAN_TEST_UNIT="$unit_file" POLYWAN_TEST_FWMARK_MASK="$mask" \
-        "$bindir/$s" --ignored "$@" || status=1
-    done
+    m1 "$mask" "$@" || status=1
   done
   exit $status
 fi
@@ -108,7 +118,6 @@ fi
 # and 24); POLYWAN_TEST_MASKS narrows the list; on the host,
 # POLYWAN_PARALLEL_MASKS=1 runs them at the same time.
 masks=${POLYWAN_TEST_MASKS:-"0x00ff0000 0x000000ff 0xff000000"}
-scenarios="m1 m2 m3 m4"
 m1_in_vm=
 for mask in $masks; do
   m1_in_vm="$m1_in_vm && echo '== M1 to M4 scenarios with fwmark_mask $mask'"
@@ -122,9 +131,6 @@ for t in $kernel_tests; do
   kernel_in_vm="$kernel_in_vm unshare -n /mnt/$t --ignored --test-threads=1 &&"
 done
 
-sudo=
-[ "$(id -u)" -eq 0 ] || sudo=sudo
-
 case $mode in
   host)
     cd /tmp
@@ -132,16 +138,6 @@ case $mode in
       $sudo unshare -n "$bindir/$t" --ignored --test-threads=1
     done
     $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" "$bindir/netns" --ignored "$@"
-    m1() { # m1 MASK TEST-ARGS...: every scenario binary, whatever fails
-      m1_mask=$1
-      shift
-      m1_status=0
-      for s in $scenarios; do
-        $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$bindir/polywan" \
-          POLYWAN_TEST_FWMARK_MASK="$m1_mask" "$bindir/$s" --ignored "$@" || m1_status=1
-      done
-      return $m1_status
-    }
     if [ "${POLYWAN_PARALLEL_MASKS:-0}" = 1 ]; then
       # The scenarios wait more than they compute: with enough cores, the
       # masks can run at the same time, each in its own process.

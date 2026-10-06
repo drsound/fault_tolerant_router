@@ -122,7 +122,7 @@ pub struct Desired {
 }
 
 /// Table and priority arithmetic of §4.3 and FR-ROUTE-3.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub table_base: u32,
     pub priority_base: u32,

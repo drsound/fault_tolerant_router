@@ -519,24 +519,9 @@ pub async fn run(opts: Options) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("initial dump: {e}"))?;
 
-    let families: Vec<Family> = Family::ALL.into_iter().filter(|f| cfg.manages(*f)).collect();
-    let mut findings = checks::routing(&system, layout, cfg.routing.route_protocol, &families);
+    let mut findings = system_findings(&system, &cfg).await;
     if without_manifest {
         findings.extend(checks::adoptable(&system, layout, cfg.routing.route_protocol));
-    }
-    findings.extend(checks::downlinks(&system, &cfg));
-    findings
-        .errors
-        .extend(checks::targets(&checks::local_addresses(&system), &cfg));
-    findings.extend(checks::accept_ra(&cfg, sysctl::read));
-    if checks::networkd_running() {
-        findings.extend(checks::networkd(Path::new("/")));
-    }
-    match nftctl::ruleset(&cfg.firewall.nft_path).await {
-        Ok(r) => findings.extend(checks::ruleset(&r, &cfg)),
-        Err(e) => findings
-            .warnings
-            .push(format!("cannot inspect the nftables ruleset: {e}")),
     }
     report(&findings)?;
 
@@ -759,18 +744,7 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
         .await
         .map_err(|e| anyhow::anyhow!("dump: {e}"))?
         .system;
-    let families: Vec<Family> = Family::ALL.into_iter().filter(|x| cfg.manages(*x)).collect();
-    f.extend(checks::routing(&system, layout, cfg.routing.route_protocol, &families));
-    f.extend(checks::downlinks(&system, cfg));
-    f.errors.extend(checks::targets(&checks::local_addresses(&system), cfg));
-    f.extend(checks::accept_ra(cfg, sysctl::read));
-    if checks::networkd_running() {
-        f.extend(checks::networkd(Path::new("/")));
-    }
-    match nftctl::ruleset(&cfg.firewall.nft_path).await {
-        Ok(r) => f.extend(checks::ruleset(&r, cfg)),
-        Err(e) => f.warnings.push(format!("cannot inspect the nftables ruleset: {e}")),
-    }
+    f.extend(system_findings(&system, cfg).await);
     for d in sysctl::differences(&sysctl::desired(cfg), sysctl::read)? {
         let what = if cfg.routing.manage_sysctls {
             "will be set to"
@@ -785,6 +759,25 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
         ));
     }
     Ok(f)
+}
+
+/// The checks of the observed system that startup and `check-config`
+/// share: routing, downlinks, probe targets, sysctls, networkd and the
+/// nftables ruleset.
+async fn system_findings(system: &System, cfg: &Config) -> checks::Findings {
+    let families: Vec<Family> = Family::ALL.into_iter().filter(|f| cfg.manages(*f)).collect();
+    let mut f = checks::routing(system, Layout::of(cfg), cfg.routing.route_protocol, &families);
+    f.extend(checks::downlinks(system, cfg));
+    f.errors.extend(checks::targets(&checks::local_addresses(system), cfg));
+    f.extend(checks::accept_ra(cfg, sysctl::read));
+    if checks::networkd_running() {
+        f.extend(checks::networkd(Path::new("/")));
+    }
+    match nftctl::ruleset(&cfg.firewall.nft_path).await {
+        Ok(r) => f.extend(checks::ruleset(&r, cfg)),
+        Err(e) => f.warnings.push(format!("cannot inspect the nftables ruleset: {e}")),
+    }
+    f
 }
 
 fn report(f: &checks::Findings) -> Result<()> {

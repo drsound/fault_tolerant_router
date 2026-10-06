@@ -238,7 +238,7 @@ fn removal_key(layout: Layout, o: &ObservedRule) -> impl Ord + use<> {
 
 /// Whether `o` is the rule that its priority's role in `layout` installs:
 /// the same fwmark, source and action.
-fn has_role(layout: Layout, o: &ObservedRule) -> bool {
+pub(crate) fn has_role(layout: Layout, o: &ObservedRule) -> bool {
     let Some(kind) = classify(layout, o.priority) else {
         return false;
     };
@@ -252,7 +252,7 @@ fn has_role(layout: Layout, o: &ObservedRule) -> bool {
             UplinkId::new(1).is_some_and(|id| layout.source_rules(o.family, id, address).iter().any(shaped))
         }
         _ => {
-            let ids: Vec<_> = (1..=63).filter_map(UplinkId::new).collect();
+            let ids: Vec<_> = UplinkId::all().collect();
             layout.static_rules(o.family, &ids).iter().any(shaped)
         }
     }
