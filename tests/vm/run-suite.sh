@@ -38,7 +38,11 @@ while [ $# -gt 0 ]; do
 done
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-target=x86_64-unknown-linux-musl
+# The machine's own architecture: x86_64, or aarch64 (a Raspberry Pi).
+case $(uname -m) in
+  aarch64) target=aarch64-unknown-linux-musl ;;
+  *) target=x86_64-unknown-linux-musl ;;
+esac
 target_dir=${CARGO_TARGET_DIR:-$repo/target}
 bindir=$target_dir/netns-suite
 # The daemon's kernel tests (crates/polywan/tests/kernel_*.rs).
