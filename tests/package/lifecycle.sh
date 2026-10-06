@@ -227,7 +227,8 @@ host_net() {
 	ip -6 rule show
 	ip -4 route show table all
 	ip -6 route show table all | sed 's/ expires [0-9]*sec//'
-	nft list ruleset
+	# Without counters, which other traffic moves (a CI runner's firewall).
+	nft -s list ruleset
 }
 
 trap 'reset; rm -rf "$work"' EXIT
