@@ -10,6 +10,17 @@ authors.workspace = true
 readme = "../../README.md"
 keywords = ["multi-wan", "failover", "load-balancing", "policy-routing", "nftables"]
 categories = ["command-line-utilities", "network-programming"]
+# What the published crate holds, whatever else lies in the working tree
+# (the README comes with `readme`).
+include = [
+    "Cargo.toml",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "src/**/*.rs",
+    "src/config/example.toml",
+    "tests/**/*.rs",
+    "tests/golden/*",
+]
 
 [features]
 # Hooks for the acceptance scenarios (src/test_hooks.rs); never in releases.
