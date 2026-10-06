@@ -1,6 +1,6 @@
 # PolyWAN
 
-[![PayPal donate button](https://img.shields.io/badge/paypal-donate-yellow.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=96LFVQRFGRPFW&lc=GB&item_name=Alessandro%20Zarrilli&item_number=polywan&currency_code=EUR&bn=PP%2dDonationsBF%3abtn_donate_SM%2egif%3aNonHosted "Donate once-off to this project using PayPal")
+[![CI](https://github.com/drsound/polywan/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/drsound/polywan/actions/workflows/ci.yml?query=branch%3Amain) [![Latest release](https://img.shields.io/github/v/release/drsound/polywan)](https://github.com/drsound/polywan/releases/latest) [![crates.io](https://img.shields.io/crates/v/polywan.svg)](https://crates.io/crates/polywan) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license) [![PayPal donate button](https://img.shields.io/badge/paypal-donate-yellow.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=96LFVQRFGRPFW&lc=GB&item_name=Alessandro%20Zarrilli&item_number=polywan&currency_code=EUR&bn=PP%2dDonationsBF%3abtn_donate_SM%2egif%3aNonHosted "Donate once-off to this project using PayPal")
 
 *Formerly Fault Tolerant Router.*
 
@@ -22,28 +22,11 @@ PolyWAN runs on a general-purpose Linux distribution (Debian, Ubuntu, Fedora, Ar
 
 How it works is explained in [docs/how-it-works.md](docs/how-it-works.md).
 
-## Releases
-
-PolyWAN 2.0 is a ground-up rewrite of Fault Tolerant Router in Rust. Debian packages and static binaries are on the [releases page](https://github.com/drsound/polywan/releases), and the crate is on crates.io. The changes of each release are in [CHANGELOG.md](CHANGELOG.md); the specification the code is built and tested against is [SPEC.md](SPEC.md).
-
-Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
-
 ## Requirements
 
 - Linux 6.1 or later, on x86_64, aarch64 or armv7.
 - nftables 1.0.6 or later, for the managed firewall mode.
 - Root privileges. systemd is the supported service manager, but not required.
-
-## Documentation
-
-- [Installation](docs/installation.md): packages, static binaries, the systemd unit, upgrades and removal.
-- [Configuration reference](docs/configuration.md): every setting, with its default.
-- [How PolyWAN works](docs/how-it-works.md): routing, health checks, nftables, guarantees.
-- [Recipes](docs/recipes/): systemd-networkd, NetworkManager, PPPoE, CGNAT uplinks, port forwarding, IPv6, reverse-path filtering, larger setups.
-- [API, command line and access](docs/api.md): the sockets, every command and endpoint, metrics.
-- [Email notifications](docs/email.md): msmtp and how sending works.
-- [Troubleshooting](docs/troubleshooting.md): by symptom.
-- `man 8 polywan` for every command and option.
 
 ## Quick start
 
@@ -59,6 +42,23 @@ polywan status
 ```
 
 Other distributions use the static binary; see [installation](docs/installation.md).
+
+## Documentation
+
+- [Installation](docs/installation.md): packages, static binaries, the systemd unit, upgrades and removal.
+- [Configuration reference](docs/configuration.md): every setting, with its default.
+- [How PolyWAN works](docs/how-it-works.md): routing, health checks, nftables, guarantees.
+- [Recipes](docs/recipes/): systemd-networkd, NetworkManager, PPPoE, CGNAT uplinks, port forwarding, IPv6, reverse-path filtering, larger setups.
+- [API, command line and access](docs/api.md): the sockets, every command and endpoint, metrics.
+- [Email notifications](docs/email.md): msmtp and how sending works.
+- [Troubleshooting](docs/troubleshooting.md): by symptom.
+- `man 8 polywan` for every command and option.
+
+## Releases
+
+PolyWAN 2.0 is a ground-up rewrite of Fault Tolerant Router in Rust. Debian packages and static binaries are on the [releases page](https://github.com/drsound/polywan/releases), and the crate is on [crates.io](https://crates.io/crates/polywan). The changes of each release are in [CHANGELOG.md](CHANGELOG.md); the specification the code is built and tested against is [SPEC.md](SPEC.md).
+
+Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
 
 ## Building
 
