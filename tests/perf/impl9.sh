@@ -2,7 +2,9 @@
 # Measures the CPU time and memory of a PolyWAN release build with four
 # uplinks and default settings (IMPL-9), in network namespaces: a router
 # namespace with a LAN interface and four veth uplinks, each to a provider
-# namespace that answers the default probe targets of both families.
+# namespace that answers the default probe targets of both families. The
+# four uplinks share priority 1, as the example's two do, so that every
+# path is active.
 #
 # Usage (as root): tests/perf/impl9.sh POLYWAN-BINARY [SECONDS]
 #                  tests/perf/impl9.sh --unit [SECONDS]
@@ -85,7 +87,7 @@ done
 
 uplinks() {
   for i in 1 2 3 4; do
-    printf '\n[[uplink]]\nid = %d\nname = "isp%d"\ninterface = "wan%d"\n[uplink.ipv4]\n[uplink.ipv6]\nnat = "masquerade"\n' "$i" "$i" "$i"
+    printf '\n[[uplink]]\nid = %d\nname = "isp%d"\ninterface = "wan%d"\npriority = 1\n[uplink.ipv4]\n[uplink.ipv6]\nnat = "masquerade"\n' "$i" "$i" "$i"
   done
 }
 
@@ -142,12 +144,12 @@ hz=$(getconf CLK_TCK)
 start=$(ticks)
 sleep "$seconds"
 end=$(ticks)
-paths=$("$bin" status --socket "$status_socket" | grep -c ': up (')
+paths=$("$bin" status --socket "$status_socket" | grep -c ': up (.*, ready, active')
 rss=$(awk '/^VmRSS/ {print $2}' "/proc/$pid/status")
 hwm=$(awk '/^VmHWM/ {print $2}' "/proc/$pid/status")
 threads=$(awk '/^Threads/ {print $2}' "/proc/$pid/status")
 
-echo "host: $(uname -m), Linux $(uname -r), $(nproc) CPUs ($(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo))"
+echo "host: $(uname -m), Linux $(uname -r), $(nproc) CPUs ($(awk -F': ' '/^(model name|Model)/ {print $2; exit}' /proc/cpuinfo))"
 echo "daemon: $exe, $("$exe" --version), $(stat -c %s "$exe") bytes, sha256 $(sha256sum "$exe" | cut -d ' ' -f 1); $status"
 if [ -n "$unit" ]; then
   echo "unit: $(systemctl show -P FragmentPath "$unit") with $dropin; systemd $(systemctl --version | awk 'NR == 1 {print $2}')"
@@ -158,7 +160,7 @@ if [ -n "$unit" ]; then
   echo "  NRestarts=$(systemctl show -P NRestarts "$unit"), $same main process throughout"
 fi
 [ -z "$before" ] || { echo "$before"; pi "Pi after"; }
-echo "measured: $seconds s after a $warmup s warm-up, 4 uplinks, IPv4 and IPv6, default settings; $paths of 8 paths up at the end"
+echo "measured: $seconds s after a $warmup s warm-up, 4 uplinks, IPv4 and IPv6, default settings; $paths of 8 paths up and active at the end"
 awk -v d="$((end - start))" -v hz="$hz" -v s="$seconds" \
   'BEGIN { printf "CPU: %.3f%% of one core (%d ticks at %d Hz)\n", 100 * d / hz / s, d, hz }'
 echo "memory: RSS $((rss / 1024)) MB ($rss kB), peak $((hwm / 1024)) MB ($hwm kB); $threads threads"
