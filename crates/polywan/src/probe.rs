@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, SockFilter, Socket, Type};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
@@ -27,6 +27,50 @@ use crate::model::PathKey;
 
 const TOKEN_LEN: usize = 16;
 const EINPROGRESS: i32 = 115;
+
+/// ICMP echo reply types.
+const ECHO_REPLY_V4: u8 = 0;
+const ECHO_REPLY_V6: u8 = 129;
+
+/// Packets read from a raw socket before the other tasks of the routing
+/// executor run: a flood must not monopolise it.
+pub(crate) const BATCH: usize = 64;
+
+/// Classic BPF opcodes (linux/filter.h).
+const LDB_ABS: u16 = 0x30; // BPF_LD | BPF_B | BPF_ABS
+const LDB_IND: u16 = 0x50; // BPF_LD | BPF_B | BPF_IND
+const LDX_MSH: u16 = 0xb1; // BPF_LDX | BPF_B | BPF_MSH: X = 4 * (P[k] & 0xf)
+const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+const RET_K: u16 = 0x06; // BPF_RET | BPF_K
+
+/// A socket filter for a raw ICMP socket that passes only messages of
+/// `icmp_type` with code 0, so that the kernel drops every other message
+/// before it is queued. An IPv4 raw socket sees the IP header first; an
+/// IPv6 one starts at the ICMPv6 header.
+pub(crate) fn icmp_filter(ipv4: bool, icmp_type: u8) -> Vec<SockFilter> {
+    // Load the byte at offset k of the ICMP header into A.
+    let load = |k| {
+        if ipv4 {
+            SockFilter::new(LDB_IND, 0, 0, k)
+        } else {
+            SockFilter::new(LDB_ABS, 0, 0, k)
+        }
+    };
+    let mut v = Vec::new();
+    if ipv4 {
+        // X = the IP header's length.
+        v.push(SockFilter::new(LDX_MSH, 0, 0, 0));
+    }
+    v.extend([
+        load(0),
+        SockFilter::new(JEQ_K, 0, 3, u32::from(icmp_type)),
+        load(1),
+        SockFilter::new(JEQ_K, 0, 1, 0),
+        SockFilter::new(RET_K, 0, 0, u32::MAX),
+        SockFilter::new(RET_K, 0, 0, 0),
+    ]);
+    v
+}
 
 /// What a prober task needs; any change means a new generation.
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +294,7 @@ impl Icmp {
         let v6 = spec.source.is_ipv6();
         let protocol = if v6 { Protocol::ICMPV6 } else { Protocol::ICMPV4 };
         let s = probe_socket(spec, Type::RAW, protocol)?;
+        s.attach_filter(&icmp_filter(!v6, if v6 { ECHO_REPLY_V6 } else { ECHO_REPLY_V4 }))?;
         // A raw socket is a datagram socket for send_to/recv_from; std's
         // UdpSocket offers them on initialised buffers.
         let fd = AsyncFd::new(UdpSocket::from(s))?;
@@ -294,8 +339,15 @@ impl Icmp {
             let Ok(mut guard) = self.fd.readable().await else {
                 return;
             };
-            while let Ok(Ok((len, from))) = guard.try_io(|fd| fd.get_ref().recv_from(&mut buf)) {
+            let mut read = 0;
+            while read < BATCH
+                && let Ok(Ok((len, from))) = guard.try_io(|fd| fd.get_ref().recv_from(&mut buf))
+            {
+                read += 1;
                 self.deliver(&buf[..len], from.ip());
+            }
+            if read == BATCH {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -417,6 +469,67 @@ mod tests {
         ip.extend_from_slice(&[192, 0, 2, 2]);
         ip.extend_from_slice(&icmp);
         ip
+    }
+
+    /// The socket filter on real raw sockets over loopback: a message of
+    /// another type, or of the type with another code, never reaches the
+    /// socket; the type with code 0 does. Needs CAP_NET_RAW (skipped
+    /// without it).
+    #[test]
+    fn icmp_filter_passes_only_the_type_with_code_0() {
+        for (v6, ty) in [(false, ECHO_REPLY_V4), (true, ECHO_REPLY_V6), (true, 134)] {
+            let (domain, protocol, to) = if v6 {
+                (
+                    Domain::IPV6,
+                    Protocol::ICMPV6,
+                    SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+                )
+            } else {
+                (
+                    Domain::IPV4,
+                    Protocol::ICMPV4,
+                    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                )
+            };
+            let receiver = match Socket::new(domain, Type::RAW, Some(protocol)) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(e) => panic!("raw socket: {e}"),
+            };
+            receiver.attach_filter(&icmp_filter(!v6, ty)).unwrap();
+            receiver.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let receiver = UdpSocket::from(receiver);
+            let sender = UdpSocket::from(Socket::new(domain, Type::RAW, Some(protocol)).unwrap());
+            let marker = random::<TOKEN_LEN>();
+            // Types the kernel itself ignores, so that nothing answers them.
+            let message = |ty: u8, code: u8, tag: u8| {
+                let mut p = vec![ty, code, 0, 0, 0, 0, 0, tag];
+                p.extend_from_slice(&marker);
+                if !v6 {
+                    let c = checksum(&p);
+                    p[2..4].copy_from_slice(&c.to_be_bytes());
+                }
+                p
+            };
+            for (t, code, tag) in [(ty, 1, 1), (42, 0, 2), (ty, 0, 3)] {
+                sender.send_to(&message(t, code, tag), to).unwrap();
+            }
+            let mut buf = [0u8; 2048];
+            let tag = loop {
+                let (len, _) = receiver
+                    .recv_from(&mut buf)
+                    .expect("the message of the type with code 0");
+                let icmp = if v6 {
+                    &buf[..len]
+                } else {
+                    &buf[usize::from(buf[0] & 0xf) * 4..len]
+                };
+                if icmp.len() == 8 + TOKEN_LEN && icmp[8..] == marker {
+                    break icmp[7];
+                }
+            };
+            assert_eq!(tag, 3, "v6 {v6}, type {ty}");
+        }
     }
 
     #[test]
