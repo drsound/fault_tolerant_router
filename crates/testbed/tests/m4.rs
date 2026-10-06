@@ -12,7 +12,8 @@ use std::process::Output;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use testbed::plan::{Family, Uplink};
+use testbed::Outcome;
+use testbed::plan::{Family, Node, TCP_PORT, Uplink};
 use testbed::polywan::{self, HealthSpec, UplinkSpec, succeeded};
 
 #[macro_use]
@@ -983,6 +984,259 @@ fn api_events_follow_across_a_restart_and_an_eviction() -> Result<()> {
     assert!(lines.iter().all(|l| l["notice"] != "reset"));
     let stderr = follower.finish();
     assert_eq!(stderr.matches("waiting for the daemon").count(), 1, "{stderr}");
+    f.stop()?;
+    Ok(())
+}
+
+/// The recipes of the documentation that make packet-level claims (DIST-3):
+/// their scenarios load the first `nft` block of the page as it is
+/// published.
+const PORT_FORWARDING: &str = include_str!("../../../docs/recipes/port-forwarding.md");
+const REVERSE_PATH_FILTER: &str = include_str!("../../../docs/recipes/reverse-path-filtering.md");
+
+/// Whether the running kernel is `major.minor` or later.
+fn kernel_at_least(major: u32, minor: u32) -> Result<bool> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+    let mut parts = release.trim().split(['.', '-']).map(|p| p.parse::<u32>().unwrap_or(0));
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    Ok(found >= (major, minor))
+}
+
+fn nft_block(page: &str) -> String {
+    let start = page.find("```nft\n").expect("an nft block") + "```nft\n".len();
+    let end = page[start..].find("```").expect("a closing fence");
+    page[start..start + end].to_owned()
+}
+
+per_family!(dist3_recipe_port_forwarding);
+
+/// DIST-3: the port-forwarding recipe, with the topology's interface names,
+/// LAN server and ports in place of the page's, forwards connections from
+/// the internet through A and B to the LAN server, each answered through the
+/// uplink it arrived on (INV-5), while its forward chain (policy drop) lets
+/// the LAN's own connections through.
+fn dist3_recipe_port_forwarding(fam: Family) -> Result<()> {
+    let t = build();
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
+    f.wait_installed(&t)?;
+    let _server = serve_in(&t, Node::Client)?;
+    let mut ruleset = nft_block(PORT_FORWARDING);
+    for (page, here) in [
+        ("\"wan0\"", "\"wana\"".to_owned()),
+        ("\"wan1\"", "\"wanb\"".to_owned()),
+        ("\"lan0\"", "\"lan\"".to_owned()),
+        ("dport 8080", "dport 8007".to_owned()),
+        (
+            "192.168.1.10:80",
+            endpoint(&lan_client(Family::V4).to_string(), TCP_PORT),
+        ),
+        (
+            "[fd00:1::10]:80",
+            endpoint(&lan_client(Family::V6).to_string(), TCP_PORT),
+        ),
+    ] {
+        anyhow::ensure!(ruleset.contains(page), "the recipe has no {page}");
+        ruleset = ruleset.replace(page, &here);
+    }
+    t.router().nft(&ruleset)?;
+    // Provider B (CGNAT) forwards its public IPv4 port to the router, as in
+    // AS-09; its IPv6 addresses are public.
+    if fam == Family::V4 {
+        let b = address(&t, Family::V4, Uplink::B)?;
+        t.ns(Node::IspB).nft(&format!(
+            "table ip tb_in {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"core\" tcp dport 8007 dnat to {b}\n  }}\n}}\n"
+        ))?;
+    }
+    for u in [Uplink::A, Uplink::B] {
+        let iface = u.l3_iface();
+        let public = if u == Uplink::B && fam == Family::V4 {
+            "198.18.0.6".to_owned()
+        } else {
+            address(&t, fam, u)?
+        };
+        counter(
+            &t,
+            &format!("in{iface}"),
+            &format!("oifname \"{iface}\" tcp sport 8007"),
+        )?;
+        counter(
+            &t,
+            &format!("out{iface}"),
+            &format!("oifname != \"{iface}\" oifname != \"lan\" tcp sport 8007"),
+        )?;
+        let r = t.connect_to(
+            Node::Inet,
+            &[endpoint(&public, 8007)],
+            10,
+            false,
+            Duration::from_secs(2),
+        )?;
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok),
+            "{u}: {:?}",
+            r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+        );
+        assert!(
+            counter_value(&t, &format!("in{iface}"))? >= 20,
+            "{u}: replies leave through {iface}"
+        );
+        assert_eq!(
+            counter_value(&t, &format!("out{iface}"))?,
+            0,
+            "{u}: no reply through another uplink"
+        );
+    }
+    let r = t.connect_to(
+        Node::Client,
+        &servers(fam, 1, 10, TCP_PORT),
+        20,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        r.iter().all(|c| c.outcome == Outcome::Ok),
+        "the LAN's connections: {:?}",
+        r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// DIST-3: the IPv6 reverse-path filter recipe, loaded as published, with an
+/// empty active set and no operating-system default route, as AS-30: ICMP
+/// and TCP probe replies, connections forwarded to the LAN server and to a
+/// listener of the router through A pass; Router Advertisements bring A's
+/// address back after its link went down; a provider's duplicate address
+/// detection from the unspecified address reaches the router; a packet arriving on A with a LAN
+/// source is dropped (it is not without the filter); the LAN's connections
+/// pass once an uplink is active.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn dist3_recipe_reverse_path_filter() -> Result<()> {
+    let fam = Family::V6;
+    let t = build();
+    let (gwa, gwb) = (gateway(&t, fam, Uplink::A)?, gateway(&t, fam, Uplink::B)?);
+    let ups = |priority: Option<u16>| {
+        [
+            UplinkSpec::new(Uplink::A, 1)
+                .priority(priority)
+                .path(fam, &format!("gateway = \"{gwa}\"")),
+            UplinkSpec::new(Uplink::B, 2)
+                .priority(priority)
+                .path(fam, &format!("gateway = \"{gwb}\"")),
+        ]
+    };
+    let health = HealthSpec {
+        text: "interval = \"1s\"\ntimeout = \"300ms\"\nattempts = 2\nrequired_reachable = 3\n[health.ipv6]\ntargets = [\"icmp:2606:4700:4700::1111\", \"icmp:2001:4860:4860::8888\", \"tcp:[2620:fe::fe]:443\"]\n".into(),
+    };
+    let config = |priority| polywan::config(&ups(priority), &[fam], &health, "", "");
+    t.router().sysctl(&[
+        "net.ipv6.conf.wana.accept_ra_defrtr=0",
+        "net.ipv6.conf.wanb.accept_ra_defrtr=0",
+    ])?;
+    for u in ["wana", "wanb"] {
+        let _ = t.router().output("ip", ["-6", "route", "del", "default", "dev", u])?;
+    }
+    // Since Linux 7.1, nftables resolves IPv6 fib lookups through
+    // fib6_lookup(), which ignores suppress_prefixlength, the main bypass:
+    // an IPv6 default route of the main table then answers the filter's
+    // lookups. The recipe's page requires none there on those kernels, so
+    // the harness's leak6 route and provider C's go; older kernels keep
+    // them, and pass with defaults in the main table.
+    if kernel_at_least(7, 1)? {
+        t.router().sysctl(&["net.ipv6.conf.ppp0.accept_ra_defrtr=0"])?;
+        while t
+            .router()
+            .output("ip", ["-6", "route", "del", "default"])?
+            .status
+            .success()
+        {}
+    }
+
+    // A packet from a LAN source arriving on A, counted at the router's input.
+    t.router().nft(
+        "table inet t_spoof {\n  counter c {}\n  chain input {\n    type filter hook input priority 0; policy accept;\n    ip6 saddr 2001:db8:1::99 icmpv6 type echo-request counter name c\n  }\n}\n",
+    )?;
+    let a = address(&t, fam, Uplink::A)?;
+    t.ns(Node::IspA).ip("-6 addr add 2001:db8:1::99/128 dev wan nodad")?;
+    let spoof = || -> Result<u64> {
+        let _ = t
+            .ns(Node::IspA)
+            .output("ping", ["-6", "-n", "-c", "2", "-W", "1", "-I", "2001:db8:1::99", &a])?;
+        t.router().counter("inet", "t_spoof", "c")
+    };
+    assert!(spoof()? >= 2, "without the filter, spoofed packets reach the router");
+
+    let mut f = t.start_polywan(&config(None))?;
+    f.wait_installed(&t)?;
+    let recipe = nft_block(REVERSE_PATH_FILTER);
+    t.router().nft(&recipe)?;
+    let before = t.router().counter("inet", "t_spoof", "c")?;
+    assert_eq!(spoof()?, before, "the filter drops a LAN source arriving on an uplink");
+
+    // Probe replies: ICMP and TCP targets, all of them required.
+    assert!(balancing_members(&t, fam)?.is_empty());
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !f.log().contains("to=Down"),
+        "probe replies pass the filter:\n{}",
+        f.log()
+    );
+
+    // Forwarded and local inbound connections.
+    let _client = serve_in(&t, Node::Client)?;
+    let _router = serve_in(&t, Node::Router)?;
+    t.router().nft(&format!(
+        "table ip6 admin {{\n  chain pre {{\n    type nat hook prerouting priority -100; policy accept;\n    iifname \"wana\" tcp dport 8007 dnat to {}\n  }}\n}}\n",
+        endpoint(&lan_client(fam).to_string(), TCP_PORT)
+    ))?;
+    for dst in [endpoint(&a, 8007), endpoint(&a, TCP_PORT)] {
+        let r = t.connect_to(Node::Inet, std::slice::from_ref(&dst), 5, false, Duration::from_secs(2))?;
+        assert!(
+            r.iter().all(|c| c.outcome == Outcome::Ok),
+            "{dst}: {:?}",
+            r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+        );
+    }
+
+    // Router Advertisements: A's address comes back after its link went
+    // down and up, and the path is up again.
+    t.router().ip("link set wana down")?;
+    t.router().ip("link set wana up")?;
+    t.wait_for("A's address after the link came back", Duration::from_secs(20), || {
+        Ok(address(&t, fam, Uplink::A)? == a)
+    })?;
+    f.wait_path_where(&t, "a", fam, "up and ready", Duration::from_secs(20), |p| {
+        p["state"] == "up" && p["ready"] == true
+    })?;
+
+    // Duplicate address detection by the provider, from the unspecified
+    // address: the router defends its address through the filter.
+    // The harness's providers skip duplicate address detection.
+    t.ns(Node::IspA).sysctl(&["net.ipv6.conf.wan.accept_dad=1"])?;
+    t.ns(Node::IspA).ip(&format!("-6 addr add {a}/128 dev wan"))?;
+    std::thread::sleep(Duration::from_secs(3));
+    let defended = t.ns(Node::IspA).ip("-6 addr show dev wan")?.contains("dadfailed");
+    t.ns(Node::IspA).ip(&format!("-6 addr del {a}/128 dev wan"))?;
+    assert!(
+        defended,
+        "the provider's duplicate address detection reaches the router"
+    );
+
+    // The LAN's connections once an uplink is active.
+    f.reload_with(&config(Some(1)))?;
+    wait_members(&t, fam, &["wana", "wanb"], Duration::from_secs(20))?;
+    let r = t.connect_to(
+        Node::Client,
+        &servers(fam, 1, 10, TCP_PORT),
+        20,
+        false,
+        Duration::from_secs(2),
+    )?;
+    assert!(
+        r.iter().all(|c| c.outcome == Outcome::Ok),
+        "the LAN's connections: {:?}",
+        r.iter().map(|c| c.outcome).collect::<Vec<_>>()
+    );
     f.stop()?;
     Ok(())
 }
