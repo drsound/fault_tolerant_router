@@ -11,10 +11,11 @@
 # go to the test binary (for example a test name filter). --build-only
 # leaves the binaries in the suite directory; --bindir runs binaries built
 # earlier (copied to a machine without a Rust toolchain, for example) and
-# skips the build. --unit runs the M1 to M4 scenarios on this host with the
-# daemon started as the shipped packaging/polywan.service (AS-34; copied
-# next to the binaries), once, with the default fwmark_mask unless
-# POLYWAN_TEST_MASKS says otherwise. --installed starts the daemon and the
+# skips the build. --unit runs the M1 to M4 scenarios, then those that
+# need the unit (tests/unit.rs), on this host with the daemon started as
+# the shipped packaging/polywan.service (AS-34; copied next to the
+# binaries), once, with the default fwmark_mask unless POLYWAN_TEST_MASKS
+# says otherwise. --installed starts the daemon and the
 # unit that the polywan package installed instead of the suite's (AS-34
 # against the package, tests/package/lifecycle.sh).
 set -eu
@@ -71,10 +72,11 @@ else
   # its executable without the hooks.
   cp "$target_dir/$target/debug/polywan-testbed" "$target_dir/$target/debug/polywan" "$bindir/"
   cp packaging/polywan.service "$bindir/"
-  # netns: the harness's own checks; m1 to m4: the acceptance scenarios.
-  { test_exes testbed netns m1 m2 m3 m4; test_exes polywan $kernel_tests; } \
+  # netns: the harness's own checks; m1 to m4: the acceptance scenarios;
+  # unit: those that need the packaged unit (run with --unit only).
+  { test_exes testbed netns m1 m2 m3 m4 unit; test_exes polywan $kernel_tests; } \
     | while read -r name exe; do cp "$exe" "$bindir/$name"; done
-  for t in netns m1 m2 m3 m4 $kernel_tests; do
+  for t in netns m1 m2 m3 m4 unit $kernel_tests; do
     [ -x "$bindir/$t" ] || { echo "test executable $t was not built" >&2; exit 1; }
   done
 fi
@@ -102,6 +104,8 @@ if [ -n "$unit" ]; then
   # systemd as PID 1 is needed: not in the virtme-ng guest.
   [ "$mode" = host ] || { echo "--unit runs on the host only" >&2; exit 2; }
   [ -z "$installed" ] || [ -x /usr/bin/polywan ] || { echo "--installed: the polywan package is not installed" >&2; exit 2; }
+  [ -x "$bindir/unit" ] || { echo "--unit: no unit test executable in $bindir" >&2; exit 2; }
+  scenarios="$scenarios unit"
   cd /tmp
   unit_file=$bindir/polywan.service
   if [ -n "$installed" ]; then
@@ -109,7 +113,7 @@ if [ -n "$unit" ]; then
   fi
   status=0
   for mask in ${POLYWAN_TEST_MASKS:-0x00ff0000}; do
-    echo "== M1 to M4 scenarios under the unit with fwmark_mask $mask"
+    echo "== M1 to M4 and unit scenarios under the unit with fwmark_mask $mask"
     m1 "$mask" "$@" || status=1
   done
   exit $status

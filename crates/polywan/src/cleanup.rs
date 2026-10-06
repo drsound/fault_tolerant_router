@@ -56,8 +56,11 @@ pub async fn run(cfg: &Config, state_dir: &StateDir) -> Result<()> {
         .system;
     let ops = reconcile::teardown(&system, &layouts);
     let n = ops.len();
-    // Without a pending table there is no nftables step (FR-REC-9); the
-    // protocol is the route deletions' own.
+    // Without a pending table there is no nftables step (FR-REC-9).
+    // Teardown emits only deletions, each carrying what it deletes (a
+    // rule's observed message, a route's own protocol): the protocol given
+    // to `execute`, for additions, is unused, and one pass over both
+    // layouts keeps every rule before every route (FR-REC-4).
     reconcile::execute(&client, &mut system, &scope, cfg.routing.route_protocol, ops)
         .await
         .map_err(|f| anyhow!("{}: {}", f.op, f.error))?;

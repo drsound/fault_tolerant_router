@@ -52,7 +52,7 @@ sudo tests/vm/build-rootfs.sh /var/tmp/rootfs-bookworm
 tests/vm/run-suite.sh --vm /var/tmp/rootfs-bookworm   # Linux 6.1 + nftables 1.0.6 in virtme-ng
 ```
 
-`tests/vm/run-suite.sh --host --unit` runs the M1 to M4 scenarios with the daemon under the packaged unit, once with the default `fwmark_mask` (systemd as PID 1 needed, so not in the virtual machine); with `--installed` the daemon and unit are those the polywan package installed.
+`tests/vm/run-suite.sh --host --unit` runs the M1 to M4 scenarios with the daemon under the packaged unit, then the scenarios that need it (`tests/unit.rs`, AS-34's own and the instance lock across failed starts, which fail when run without it), once with the default `fwmark_mask` (systemd as PID 1 needed, so not in the virtual machine); with `--installed` the daemon and unit are those the polywan package installed.
 
 `tests/package/lifecycle.sh [--hooks BINARY] [--suite BINDIR] DEB` exercises the package's lifecycle (DIST-1) on a disposable host: install, upgrades of a running, stopped, disabled and masked unit, `policy-rc.d` denials, removal with a valid, absent or invalid configuration, a cleanup failing midway (`--hooks`: the daemon built with the test hooks), the instance lock held during a start and a purge, custom state and socket paths, installation into an `mmdebstrap` chroot, and AS-34 against the installed package (`--suite`: the directory `run-suite.sh --build-only` prints). It installs and purges the package, so it refuses a host where polywan is installed or configured; the daemon runs in a network namespace of its own and the host's networking is never changed.
 

@@ -387,3 +387,36 @@ pub fn nft_wrapper(t: &Topology, f: &polywan::Polywan, matching: &[&str], action
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     Ok((wrapper, flag))
 }
+
+/// The exit status of a refused startup and its diagnostics, or a failure
+/// naming both.
+pub fn refused(out: &std::process::Output, status: i32, needle: &str) -> Result<()> {
+    let text = polywan::output_text(out);
+    anyhow::ensure!(
+        out.status.code() == Some(status) && text.contains(needle),
+        "expected exit status {status} with {needle:?}, got {:?}:\n{text}",
+        out.status
+    );
+    Ok(())
+}
+
+/// The rules (both families) and routes (every table) tagged with
+/// `protocol`, as `ip` shows them.
+pub fn tagged(t: &Topology, protocol: &str) -> Result<usize> {
+    let mut n = 0;
+    for args in [
+        "-4 -d rule show",
+        "-6 -d rule show",
+        "-4 route show table all",
+        "-6 route show table all",
+    ] {
+        let v = t.router().ip_json(args)?;
+        n += v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o["protocol"].as_str() == Some(protocol))
+            .count();
+    }
+    Ok(n)
+}
