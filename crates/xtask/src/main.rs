@@ -1,6 +1,9 @@
 //! Build-time tools: the man page and the shell completions of the
 //! packages (DIST-1), generated from the command line definitions so that
-//! they cannot drift from the CLI. Never part of a release binary.
+//! they cannot drift from the CLI, and the third-party notices. Never part
+//! of a release binary.
+
+mod licenses;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,8 @@ enum Task {
     Man { dir: PathBuf },
     /// Write the bash, zsh and fish completions into DIR.
     Completions { dir: PathBuf },
+    /// Write the third-party notices of the release binaries into DIR.
+    Licenses { dir: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -34,6 +39,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Task::Licenses { dir } => licenses::write(&dir),
     }
 }
 

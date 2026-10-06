@@ -13,6 +13,7 @@ authors.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete = "4"
+serde_json.workspace = true
 roff = "1"
 polywan = { path = "../polywan" }
 

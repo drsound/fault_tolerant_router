@@ -241,6 +241,7 @@ gid=$(getent group polywan | cut -d: -f3)
 check "the polywan group is a system group" test "${gid:-1000}" -lt 1000
 for f in /usr/bin/polywan /usr/lib/systemd/system/$UNIT /usr/lib/sysusers.d/polywan.conf \
 	/usr/share/man/man8/polywan.8.gz /usr/share/doc/polywan/copyright \
+	/usr/share/doc/polywan/changelog.gz /usr/share/doc/polywan/THIRD-PARTY-LICENSES.gz \
 	/usr/share/bash-completion/completions/polywan; do
 	check "$f installed" test -f $f
 done

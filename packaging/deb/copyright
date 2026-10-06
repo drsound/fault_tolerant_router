@@ -2,6 +2,10 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: polywan
 Upstream-Contact: Alessandro Zarrilli <alessandro@zarrilli.net>
 Source: https://github.com/drsound/polywan
+Comment: The binary is statically linked with the Rust standard library,
+ musl libc and the crates of Cargo.lock. Their notices are in
+ /usr/share/doc/polywan/THIRD-PARTY-LICENSES.gz and, for the Rust standard
+ library, /usr/share/doc/polywan/rust-std-copyright.html.gz.
 
 Files: *
 Copyright: 2026 Alessandro Zarrilli

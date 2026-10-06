@@ -3,8 +3,9 @@
 # armhf) from the static BINARY of that architecture (SPEC.md DIST-1),
 # written to OUTDIR. A plain dpkg-deb build: every file of the package is
 # listed here, and the maintainer scripts next to this one supply the
-# lifecycle that debhelper would. Needs cargo (the man page and the shell
-# completions come from `cargo xtask`), dpkg-deb, gzip and GNU coreutils.
+# lifecycle that debhelper would. Needs cargo (the man page, the shell
+# completions and the third-party notices come from `cargo xtask`), dpkg-deb,
+# gzip and GNU coreutils.
 # Timestamps come from SOURCE_DATE_EPOCH, or the last commit's.
 set -eu
 
@@ -42,11 +43,16 @@ install -D -m 0644 "$root/packaging/sysusers.d/polywan.conf" "$pkg/usr/lib/sysus
 install -D -m 0644 "$root/crates/polywan/src/config/example.toml" "$doc/examples/config.toml"
 install -D -m 0644 "$root/packaging/deb/copyright" "$doc/copyright"
 install -D -m 0644 "$root/packaging/deb/lintian-overrides" "$pkg/usr/share/lintian/overrides/polywan"
+# The upstream change log, and a Debian entry pointing to it.
+gzip -9n <"$root/CHANGELOG.md" >"$doc/changelog.gz"
 date=$(date -u -d "@$SOURCE_DATE_EPOCH" -R)
-printf 'polywan (%s) unstable; urgency=medium\n\n  * PolyWAN %s: https://github.com/drsound/polywan/releases\n\n -- %s  %s\n' \
+printf 'polywan (%s) unstable; urgency=medium\n\n  * PolyWAN %s; its changes are in changelog.gz.\n\n -- %s  %s\n' \
 	"$debversion" "$version" "$maintainer" "$date" | gzip -9n >"$doc/changelog.Debian.gz"
 
-(cd "$root" && cargo xtask man "$work/gen" && cargo xtask completions "$work/gen")
+(cd "$root" && cargo xtask man "$work/gen" && cargo xtask completions "$work/gen" && cargo xtask licenses "$work/gen")
+# The notices of the statically linked third-party software (P8 of M4).
+gzip -9n <"$work/gen/THIRD-PARTY-LICENSES" >"$doc/THIRD-PARTY-LICENSES.gz"
+gzip -9n <"$work/gen/rust-std-copyright.html" >"$doc/rust-std-copyright.html.gz"
 install -D -m 0644 "$work/gen/polywan.8" "$pkg/usr/share/man/man8/polywan.8"
 gzip -9n "$pkg/usr/share/man/man8/polywan.8"
 install -D -m 0644 "$work/gen/polywan" "$pkg/usr/share/bash-completion/completions/polywan"
