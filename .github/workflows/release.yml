@@ -2,7 +2,9 @@
 # the build workflow, their SHA-256 checksums and GitHub artifact
 # attestations, the third-party notices and the build provenance, in a
 # draft GitHub release that the maintainer reviews and publishes. The crate
-# is published on crates.io by hand, with the maintainer's token.
+# is published on crates.io by hand, with the maintainer's token. Every
+# action is pinned by commit (its version in the comment): a tag or a
+# branch can be moved, and what the build runs ends up attested.
 name: Release
 
 on:
@@ -23,8 +25,8 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # branch stable
       - name: CI passed on the tagged commit
         # The quality gates of §14.4 run on the branch push (CI skips
         # tags): a release needs a successful CI run of the same commit.
@@ -72,8 +74,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: polywan-*
           path: dist
@@ -98,7 +100,7 @@ jobs:
           done
           sha256sum polywan-* polywan_*.deb THIRD-PARTY-LICENSES rust-std-copyright.html PROVENANCE.txt >SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/polywan-*

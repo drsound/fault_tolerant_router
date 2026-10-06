@@ -3,6 +3,7 @@
 # release is built and checked as every push is. The binaries are pure
 # Rust; rust-lld links them against the self-contained musl objects of each
 # target, so no cross C toolchain is needed.
+# Actions are pinned by commit, as in release.yml.
 name: Build
 
 on:
@@ -42,11 +43,11 @@ jobs:
       # not for seccomp or capabilities (the Raspberry Pi measurement, M4).
       RUN: ${{ matrix.qemu }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # branch stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: inputs.cache
         with:
           key: ${{ matrix.target }}
@@ -105,7 +106,7 @@ jobs:
             echo
           } >dist/provenance-${{ matrix.target }}.txt
           cat dist/provenance-${{ matrix.target }}.txt
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: polywan-${{ matrix.target }}
           path: dist/
