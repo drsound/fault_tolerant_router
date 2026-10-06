@@ -1,0 +1,110 @@
+# The release binaries and Debian packages of every PLAT-3 target (SPEC.md
+# DIST-1, §14.4), called by CI and by the release workflow, so that a
+# release is built and checked as every push is. The binaries are pure
+# Rust; rust-lld links them against the self-contained musl objects of each
+# target, so no cross C toolchain is needed.
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      cache:
+        description: Use the Cargo cache (a release builds without it)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: release build (${{ matrix.target }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            qemu: qemu-aarch64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armhf
+            qemu: qemu-arm
+    env:
+      BIN: target/${{ matrix.target }}/release/polywan
+      # The arm binaries run under qemu-user: enough for the command line,
+      # not for seccomp or capabilities (the Raspberry Pi measurement, M4).
+      RUN: ${{ matrix.qemu }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.cache
+        with:
+          key: ${{ matrix.target }}
+      - name: Install the packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lintian qemu-user mmdebstrap nftables
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p polywan \
+            --config 'target.${{ matrix.target }}.linker="rust-lld"'
+          file "$BIN"
+          file "$BIN" | grep -Eq 'statically linked|static-pie linked'
+      - name: Check the binary
+        # Without the test hooks: --version marks a build with them, and
+        # their environment variables are only named by their code.
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$($RUN "$BIN" --version)" = "polywan $version"
+          if grep -aq POLYWAN_TEST_ "$BIN"; then
+            echo "::error::$BIN contains the test hooks"
+            exit 1
+          fi
+          $RUN "$BIN" generate-config >"$RUNNER_TEMP/example.toml"
+          $RUN "$BIN" check-config --offline --config "$RUNNER_TEMP/example.toml"
+      - name: Debian package
+        # The example the package installs must be the text that its
+        # binary's generate-config prints.
+        run: |
+          packaging/deb/build.sh ${{ matrix.arch }} "$BIN" target/deb
+          lintian --fail-on error,warning target/deb/*.deb
+          dpkg-deb -x target/deb/*.deb target/deb/root
+          cmp <($RUN target/deb/root/usr/bin/polywan generate-config) target/deb/root/usr/share/doc/polywan/examples/config.toml
+      - name: Package lifecycle
+        # Install, upgrade, removal and purge on the runner (DIST-1); the
+        # daemon runs in a network namespace of its own.
+        if: matrix.arch == 'amd64'
+        run: sudo tests/package/lifecycle.sh target/deb/*.deb
+      - name: Collect the release files
+        # The toolchain and the sources are recorded with the release.
+        run: |
+          mkdir dist
+          cp "$BIN" dist/polywan-${{ matrix.target }}
+          cp target/deb/*.deb dist/
+          {
+            echo "target: ${{ matrix.target }}"
+            echo "commit: $GITHUB_SHA ($GITHUB_REF)"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "runner: $ImageOS $ImageVersion"
+            echo "Cargo.lock: $(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+            rustc -vV
+            cargo -V
+            (cd dist && sha256sum -- polywan-* *.deb)
+            echo
+          } >dist/provenance-${{ matrix.target }}.txt
+          cat dist/provenance-${{ matrix.target }}.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: polywan-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error

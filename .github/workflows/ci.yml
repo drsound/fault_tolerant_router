@@ -35,6 +35,8 @@ jobs:
         run: |
           sudo install -m 0755 target/debug/polywan /usr/bin/polywan
           systemd-analyze verify --man=no packaging/polywan.service
+      - name: The crate as crates.io would receive it
+        run: cargo publish -p polywan --locked --dry-run
 
   deny:
     name: cargo deny
@@ -127,53 +129,6 @@ jobs:
           VM_TEST_THREADS: 3
 
   release-targets:
-    # Static release builds for every PLAT-3 target (§14.4). The binaries are
-    # pure Rust; rust-lld links them against the self-contained musl objects
-    # of each target, so no cross C toolchain is needed.
-    name: release build (${{ matrix.target }})
-    runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: Build
-        run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p polywan \
-            --config 'target.${{ matrix.target }}.linker="rust-lld"'
-          file target/${{ matrix.target }}/release/polywan
-          file target/${{ matrix.target }}/release/polywan | grep -Eq 'statically linked|static-pie linked'
-      - name: Debian package
-        # DIST-1. The example the package installs must be the text that
-        # its binary's generate-config prints (checked where it runs).
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lintian
-          case ${{ matrix.target }} in
-            x86_64-*) arch=amd64 ;;
-            aarch64-*) arch=arm64 ;;
-            armv7-*) arch=armhf ;;
-          esac
-          packaging/deb/build.sh "$arch" target/${{ matrix.target }}/release/polywan target/deb
-          lintian --fail-on error,warning target/deb/*.deb
-          if [ "$arch" = amd64 ]; then
-            dpkg-deb -x target/deb/*.deb target/deb/root
-            cmp <(target/deb/root/usr/bin/polywan generate-config) target/deb/root/usr/share/doc/polywan/examples/config.toml
-          fi
-      - uses: actions/upload-artifact@v7
-        with:
-          name: polywan-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/polywan
-            target/deb/*.deb
-          if-no-files-found: error
+    # Static release builds and packages for every PLAT-3 target (§14.4),
+    # as the release workflow makes them.
+    uses: ./.github/workflows/build.yml

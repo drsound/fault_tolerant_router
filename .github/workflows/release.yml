@@ -1,0 +1,113 @@
+# A release from a v2.* tag (SPEC.md DIST-1): the binaries and packages of
+# the build workflow, their SHA-256 checksums and GitHub artifact
+# attestations, the third-party notices and the build provenance, in a
+# draft GitHub release that the maintainer reviews and publishes. The crate
+# is published on crates.io by hand, with the maintainer's token.
+name: Release
+
+on:
+  push:
+    tags: ["v2.*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: tag, change log and crate
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The tag names the workspace version
+        # A pre-release (2.0.0-rc.1) takes the change log section of its
+        # release; a release needs that section dated.
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not name the version $version"
+            exit 1
+          fi
+          heading=$(grep -E "^## ${version%%-*} \(" CHANGELOG.md || true)
+          case $version in
+          *-*) pattern='^## [^ ]+ \(' ;;
+          *) pattern='^## [^ ]+ \([0-9]{4}-[0-9]{2}-[0-9]{2}\)$' ;;
+          esac
+          if ! printf %s "$heading" | grep -Eq "$pattern"; then
+            echo "::error::CHANGELOG.md has no section for $version (or it is not dated)"
+            exit 1
+          fi
+      - name: The crate as crates.io would receive it
+        run: cargo publish -p polywan --locked --dry-run
+
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
+    with:
+      cache: false
+
+  release:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: polywan-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble the release files
+        # The notices are the packages' own, the same in every package.
+        run: |
+          cd dist
+          for f in THIRD-PARTY-LICENSES rust-std-copyright.html; do
+            for deb in polywan_*.deb; do
+              dpkg-deb --fsys-tarfile "$deb" | tar -xO "./usr/share/doc/polywan/$f.gz" | gunzip >"$f.$deb"
+            done
+            for copy in "$f".polywan_*.deb; do cmp "$f".polywan_*_amd64.deb "$copy"; done
+            mv "$f".polywan_*_amd64.deb "$f"
+            rm "$f".polywan_*.deb
+          done
+          cat provenance-*.txt >PROVENANCE.txt
+          rm provenance-*.txt
+          # GitHub would rename a pre-release's 2.0.0~rc.1 in an asset name.
+          for deb in polywan_*~*.deb; do
+            [ -e "$deb" ] && mv "$deb" "${deb//\~/.}"
+          done
+          sha256sum polywan-* polywan_*.deb THIRD-PARTY-LICENSES rust-std-copyright.html PROVENANCE.txt >SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/polywan-*
+            dist/polywan_*.deb
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          {
+            case $version in
+            *-*)
+              echo "Release candidate $version of PolyWAN ${version%%-*}, for testing; not for production use."
+              echo
+              prerelease=--prerelease
+              ;;
+            esac
+            # The section of CHANGELOG.md without its heading.
+            awk -v v="${version%%-*}" '/^## / { on = index($0, "## " v " (") == 1; next } on' CHANGELOG.md
+            echo
+            echo "Verify a download with \`sha256sum --check --ignore-missing SHA256SUMS\` and \`gh attestation verify FILE --repo $GITHUB_REPOSITORY\`."
+          } >"$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag ${prerelease:+"$prerelease"} \
+            --title "PolyWAN $version" --notes-file "$RUNNER_TEMP/notes.md" dist/*
+          # SHA256SUMS names the files as published.
+          diff <(LC_ALL=C ls dist) <(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | LC_ALL=C sort)
