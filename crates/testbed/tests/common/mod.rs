@@ -360,7 +360,17 @@ pub fn assert_refused(t: &Topology, config: &str, needle: &str) -> Result<()> {
     assert!(!check.status.success() && text.contains(needle), "check-config: {text}");
     f.start(t)?;
     f.wait_exit(t, Duration::from_secs(10))?;
-    assert!(f.log().contains(needle), "expected {needle:?} in:\n{}", f.log());
+    // Waited for: once (2026-10-06, under the unit) the log was read empty
+    // after the exit; the units' record shows how the start went.
+    let logged = t.wait_for("the refusal in the daemon log", Duration::from_secs(5), || {
+        Ok(f.log().contains(needle))
+    });
+    assert!(
+        logged.is_ok(),
+        "expected {needle:?} in:\n{}\nunits:\n{}",
+        f.log(),
+        std::fs::read_to_string(t.dir().join("units.log")).unwrap_or_default()
+    );
     Ok(())
 }
 
