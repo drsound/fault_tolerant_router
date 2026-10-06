@@ -158,6 +158,9 @@ enum AgentCommand {
         #[arg(long, default_value = "")]
         body: String,
     },
+    /// The test SMTP server of AS-34 (`testbed::smtp`): its certificate,
+    /// key and password in DIR, its events appended to DIR/events.
+    Smtp { dir: PathBuf },
     UdpSend {
         #[arg(long)]
         src_port: u16,
@@ -316,6 +319,7 @@ fn run(cli: Cli) -> Result<()> {
                 let (code, text) = agent::http(&socket, &method, &path, &body)?;
                 println!("{code}\n{text}");
             }
+            AgentCommand::Smtp { dir } => testbed::smtp::serve(&dir)?,
             AgentCommand::UdpSend {
                 src_port,
                 count,

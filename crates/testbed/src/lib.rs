@@ -19,6 +19,7 @@ pub mod netns;
 pub mod plan;
 pub mod polywan;
 pub mod sendmail;
+pub mod smtp;
 pub mod topology;
 pub mod traffic;
 pub mod unit;

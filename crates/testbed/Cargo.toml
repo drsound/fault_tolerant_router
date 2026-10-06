@@ -20,6 +20,10 @@ serde.workspace = true
 serde_json.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 nix.workspace = true
+# The test SMTP server of AS-34 (src/smtp.rs): STARTTLS with a test
+# certificate authority.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [lints]
 workspace = true
