@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["multi-wan", "failover", "load-balancing", "policy-routing", "nftables"]
+categories = ["command-line-utilities", "network-programming"]
 
 [features]
 # Hooks for the acceptance scenarios (src/test_hooks.rs); never in releases.
