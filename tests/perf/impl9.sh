@@ -127,11 +127,13 @@ fi
 exe=$(readlink "/proc/$pid/exe")
 status=$("$bin" status --socket "$status_socket" | sed -n 1p)
 
-# A Raspberry Pi's operating conditions, before and after.
+# A Raspberry Pi's operating conditions, before and after. get_throttled's
+# history bits last until a reboot; the kernel logs every under-voltage.
 pi() {
   command -v vcgencmd >/dev/null || return 0
   echo "$1: $(vcgencmd measure_temp), $(vcgencmd measure_clock arm), $(vcgencmd get_throttled)," \
-    "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+    "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)," \
+    "$(dmesg | grep -c 'Undervoltage detected') under-voltages logged since boot"
 }
 before=$(pi "Pi before")
 
