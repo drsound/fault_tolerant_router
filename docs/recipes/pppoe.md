@@ -10,6 +10,7 @@ A DSL or fibre line that needs a PPPoE session from the router, next to other up
 plugin pppoe.so
 nic-wan2
 user "customer@provider.example"
+noauth
 unit 0
 noipdefault
 nodefaultroute
@@ -31,6 +32,7 @@ The password goes in `/etc/ppp/chap-secrets` (or `pap-secrets`), readable by roo
 
 Start it with `pon dsl`, or at boot from `/etc/network/interfaces` (`auto dsl` / `iface dsl inet ppp` / `provider dsl`) or a systemd unit of your own.
 
+- `noauth`: the router authenticates itself to the provider with the password below, but does not ask the provider to authenticate itself, which providers normally do not do. Without it, pppd demands that authentication whenever the router already has a default route, as it has through the other uplinks, and the session never comes up.
 - `unit 0` names the interface `ppp0`, so that the name in PolyWAN's configuration stays right across reconnections; another PPP link on the router takes another unit number.
 - `nodefaultroute`: PolyWAN needs no default route for IPv4 over a point-to-point link; it routes through `ppp0` directly. pppd's `defaultroute` is harmless if you want one, for the router's own use when PolyWAN is stopped.
 - `persist`, `maxfail 0` and `holdoff` make pppd reconnect forever; `lcp-echo-interval` and `lcp-echo-failure` make it notice a dead session in about 30 seconds. PolyWAN's probes usually notice it first and take the uplink out of use.

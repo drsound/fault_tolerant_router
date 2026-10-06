@@ -44,11 +44,18 @@ msmtp's AppArmor profile, which Debian and Ubuntu ship disabled, was also tested
    account default : polywan
    ```
 
-3. Put the password in `/etc/netrc`, readable by root only, where msmtp looks for it when the configuration has none:
+3. Put the password in `/etc/netrc`, readable by root only, where msmtp looks for it when the configuration has none. Create the file if it does not exist, without emptying one that holds other accounts:
 
    ```sh
-   install -m 0600 /dev/null /etc/netrc
-   echo 'machine smtp.example.com login router@example.com password SECRET' >> /etc/netrc
+   [ -e /etc/netrc ] || install -m 0600 /dev/null /etc/netrc
+   chown root:root /etc/netrc
+   chmod 0600 /etc/netrc
+   ```
+
+   Then add this line to it with an editor, or change the password of an existing line for the same server and login:
+
+   ```text
+   machine smtp.example.com login router@example.com password SECRET
    ```
 
 4. Configure PolyWAN to use msmtp directly:
