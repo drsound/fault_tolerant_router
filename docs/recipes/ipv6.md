@@ -14,6 +14,7 @@ interface = "wan0"
 priority = 1
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 nat = "masquerade"
@@ -42,6 +43,7 @@ interface = "wan1"
 priority = 1
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 source = "2001:db8:20:1::1"

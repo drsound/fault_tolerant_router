@@ -98,6 +98,10 @@ The unit expects the binary at `/usr/bin/polywan`; elsewhere, replace `ExecStart
 
 To upgrade, replace the binary and restart the service. To uninstall, follow [removing PolyWAN](#removing-polywan), then delete the binary, the unit, the group and `/etc/polywan`.
 
+## From crates.io
+
+With a Rust toolchain (1.89 or later), `cargo install polywan` builds the latest release for the machine it runs on. That binary uses the system's C library rather than musl, so account lookups also go through the system's name services. Install it as `/usr/bin/polywan` (`install -m 0755 ~/.cargo/bin/polywan /usr/bin/polywan`) and continue as for the static binary above.
+
 ## Without systemd
 
 `polywan run` runs the daemon in the foreground, logging to standard error; it creates `/var/lib/polywan` and `/run/polywan` if they are missing. Under another service manager, run it as root, restart it when it exits with a status other than 0 and 78, and send SIGTERM to stop it and SIGHUP to reload its configuration (`polywan reload` reloads and waits for the result). It behaves the same as under systemd except for the sandbox, which only the unit provides. `polywan run --dry-run` is not a service mode: it computes one plan, logs it and exits.

@@ -22,9 +22,9 @@ PolyWAN runs on a general-purpose Linux distribution (Debian, Ubuntu, Fedora, Ar
 
 How it works is explained in [docs/how-it-works.md](docs/how-it-works.md).
 
-## Status
+## Releases
 
-PolyWAN 2.0 is a ground-up rewrite in Rust, developed on this branch (`v2`) and close to its release: [release candidates](https://github.com/drsound/polywan/releases) with packages and static binaries are published while 2.0.0 is prepared. The contract the code is built and tested against is [SPEC.md](SPEC.md); the changes are in [CHANGELOG.md](CHANGELOG.md).
+PolyWAN 2.0 is a ground-up rewrite of Fault Tolerant Router in Rust. Debian packages and static binaries are on the [releases page](https://github.com/drsound/polywan/releases), and the crate is on crates.io. The changes of each release are in [CHANGELOG.md](CHANGELOG.md); the specification the code is built and tested against is [SPEC.md](SPEC.md).
 
 Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
 
@@ -62,7 +62,7 @@ Other distributions use the static binary; see [installation](docs/installation.
 
 ## Building
 
-With a Rust toolchain (1.89 or later):
+With a Rust toolchain (1.89 or later), `cargo install polywan` builds and installs the latest release from crates.io. From the source:
 
 ```sh
 cargo build --release -p polywan

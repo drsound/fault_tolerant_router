@@ -46,6 +46,7 @@ interface = "wan0"
 priority = 1
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 nat = "masquerade"
@@ -57,6 +58,7 @@ interface = "wan1"
 priority = 2
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 nat = "masquerade"

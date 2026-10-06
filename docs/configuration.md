@@ -22,27 +22,36 @@ Changes of the API sockets and of the metrics listener are prepared before the n
 ## A minimal configuration
 
 ```toml
+# The LAN, whose traffic goes out through the uplinks.
 [[downlink]]
 interface = "lan0"
 
+# The main line.
 [[uplink]]
 id = 1
 name = "fiber"
 interface = "wan0"
 priority = 1
 
+# IPv4 on the main line, translated to its address.
 [uplink.ipv4]
+nat = "masquerade"
 
+# The backup line, used only when the main line fails.
 [[uplink]]
 id = 2
 name = "lte"
 interface = "wwan0"
 priority = 2
 
+# IPv4 on the backup line, translated to its address.
 [uplink.ipv4]
+nat = "masquerade"
 ```
 
-Two IPv4 uplinks, the second used only when the first fails, with masquerade, discovered addresses and gateways, and default health checks. Everything else has defaults.
+Two IPv4 uplinks, the second used only when the first fails, with addresses and gateways discovered from the operating system and default health checks. Everything else has defaults.
+
+How the tables nest: each `[[uplink]]` (double brackets) starts a new uplink, and the `[uplink.ipv4]` (single brackets) that follows it belongs to that uplink, the one just started. That is why every uplink has its own `[uplink.ipv4]`, and `[uplink.ipv6]` when it carries IPv6: the table enables that family on the uplink and holds its settings. `[uplink.health]` belongs to the uplink just started in the same way. `[[downlink]]` and `[[policy]]` repeat like `[[uplink]]`, once per downlink or policy.
 
 ## routing
 
@@ -203,6 +212,7 @@ interface = "wan2"
 priority = 2
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.health]
 timeout = "2s"

@@ -82,6 +82,7 @@ priority = 1
 weight = 10
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 nat = "masquerade"
@@ -94,6 +95,7 @@ priority = 1
 weight = 5
 
 [uplink.ipv4]
+nat = "masquerade"
 
 [uplink.ipv6]
 nat = "masquerade"
