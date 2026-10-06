@@ -30,14 +30,14 @@ const HEADER_LEN: usize = 16;
 /// advertisements of the window are reported once.
 const WINDOW: Duration = Duration::from_millis(100);
 
-/// Packets read before the other tasks run.
-const BATCH: usize = 64;
-
 /// Starts the listener; it reports the interface index of every
 /// advertisement on `tx`.
 pub fn spawn(tx: mpsc::UnboundedSender<u32>) -> io::Result<JoinHandle<()>> {
     let s = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))?;
     s.set_nonblocking(true)?;
+    // Only advertisements reach the socket: other ICMPv6 messages, probe
+    // replies and neighbour discovery included, are dropped in the kernel.
+    s.attach_filter(&crate::probe::icmp_filter(false, ROUTER_ADVERTISEMENT))?;
     // A raw socket is a datagram socket for recv_from (see probe.rs).
     let fd = AsyncFd::new(UdpSocket::from(s))?;
     Ok(tokio::spawn(listen(fd, tx)))
@@ -55,7 +55,7 @@ async fn listen(fd: AsyncFd<UdpSocket>, tx: mpsc::UnboundedSender<u32>) {
                     return;
                 };
                 let mut read = 0;
-                while read < BATCH
+                while read < crate::probe::BATCH
                     && let Ok(Ok((len, from))) = guard.try_io(|fd| fd.get_ref().recv_from(&mut buf))
                 {
                     read += 1;
@@ -64,7 +64,7 @@ async fn listen(fd: AsyncFd<UdpSocket>, tx: mpsc::UnboundedSender<u32>) {
                         due.get_or_insert_with(|| Instant::now() + WINDOW);
                     }
                 }
-                if read == BATCH {
+                if read == crate::probe::BATCH {
                     tokio::task::yield_now().await;
                 }
             }
@@ -79,10 +79,16 @@ async fn listen(fd: AsyncFd<UdpSocket>, tx: mpsc::UnboundedSender<u32>) {
 }
 
 /// The receiving interface of a Router Advertisement: the scope of its
-/// link-local source (the kernel accepts no other source).
+/// link-local source (the kernel accepts no other source). The code must be
+/// 0 (RFC 4861 §6.1.2).
 fn advertisement(packet: &[u8], from: SocketAddr) -> Option<u32> {
     match from {
-        SocketAddr::V6(a) if packet.len() == HEADER_LEN && packet[0] == ROUTER_ADVERTISEMENT && a.scope_id() != 0 => {
+        SocketAddr::V6(a)
+            if packet.len() == HEADER_LEN
+                && packet[0] == ROUTER_ADVERTISEMENT
+                && packet[1] == 0
+                && a.scope_id() != 0 =>
+        {
             Some(a.scope_id())
         }
         _ => None,
@@ -109,10 +115,14 @@ mod tests {
         let mut ra = [0u8; HEADER_LEN];
         ra[0] = ROUTER_ADVERTISEMENT;
         assert_eq!(advertisement(&ra, from(7)), Some(7));
-        // Neighbour discovery, a truncated advertisement, no scope.
+        // Neighbour discovery, another code, a truncated advertisement, no
+        // scope.
         let mut ns = ra;
         ns[0] = 135;
         assert_eq!(advertisement(&ns, from(7)), None);
+        let mut code = ra;
+        code[1] = 1;
+        assert_eq!(advertisement(&code, from(7)), None);
         assert_eq!(advertisement(&ra[..8], from(7)), None);
         assert_eq!(advertisement(&ra, from(0)), None);
     }
