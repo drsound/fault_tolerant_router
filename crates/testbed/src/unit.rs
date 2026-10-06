@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -33,10 +33,26 @@ pub fn shipped_unit() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// What a scenario of AS-34 changes in the drop-in and the start.
+#[derive(Clone, Debug, Default)]
+pub struct UnitOptions {
+    /// Keeps the packaged `Restart=always`: the main process changes.
+    pub restart: bool,
+    /// More `[Service]` settings, one per line (`TimeoutStopSec=3s`).
+    pub extra: String,
+    /// `systemctl start --no-block`: returns before the readiness.
+    pub no_block: bool,
+}
+
 /// A started unit of a run: its name and the main process it started.
 pub struct Unit {
     name: String,
-    pid: Option<u32>,
+    /// The main process as of the start or the last [`Unit::systemctl`]
+    /// (0: none).
+    pid: AtomicU32,
+    /// The main process is read from systemd each time: it can restart,
+    /// or not have started yet.
+    live: bool,
     /// The mount point of the binary, created by systemd.
     bound: PathBuf,
 }
@@ -53,6 +69,7 @@ impl Topology {
         args: &[&str],
         reload: &[&str],
         env: &[(String, String)],
+        options: &UnitOptions,
     ) -> Result<Unit> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -64,18 +81,25 @@ impl Topology {
         // exist outside (a file there without the execute bit fails the
         // start), and creates it as the mount point.
         let bound = self.exec_dir()?.join(format!("polywan-{seq}"));
-        let dropin = self.dropin(binary, &bound, args, reload, env)?;
+        let dropin = self.dropin(binary, &bound, args, reload, env, options)?;
         fs::copy(unit, &path).with_context(|| format!("installing {}", path.display()))?;
         let dir = dropin_dir(&name);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("harness.conf"), &dropin)?;
         let start = std::process::Command::new("systemctl")
-            .args(["start", &name])
+            .arg("start")
+            .args(options.no_block.then_some("--no-block"))
+            .arg(&name)
             .stdin(std::process::Stdio::null())
             .output()
             .context("systemctl start")?;
-        let mut unit = Unit { name, pid: None, bound };
-        unit.pid = unit.property("MainPID")?.parse().ok().filter(|p| *p != 0);
+        let unit = Unit {
+            name,
+            pid: AtomicU32::new(0),
+            live: options.restart || options.no_block,
+            bound,
+        };
+        unit.pid.store(unit.main_pid()?.unwrap_or(0), Ordering::Relaxed);
         let mut record = format!("== {}\n{dropin}", unit.name);
         let _ = writeln!(
             record,
@@ -96,6 +120,7 @@ impl Topology {
         args: &[&str],
         reload: &[&str],
         env: &[(String, String)],
+        options: &UnitOptions,
     ) -> Result<String> {
         let run = self.run_id();
         let exec = |args: &[&str]| {
@@ -139,23 +164,58 @@ impl Topology {
             }
         }
         let _ = writeln!(s, "StandardOutput=append:{log}\nStandardError=append:{log}");
-        let _ = writeln!(
-            s,
-            "# Scenarios end the daemon on purpose (refused startups, SIGKILL, the crash hook)\n# and start it themselves; restarts are a subject of AS-34 alone."
-        );
-        let _ = writeln!(s, "Restart=no");
+        if !options.restart {
+            let _ = writeln!(
+                s,
+                "# Scenarios end the daemon on purpose (refused startups, SIGKILL, the crash hook)\n# and start it themselves; restarts are a subject of AS-34 alone."
+            );
+            let _ = writeln!(s, "Restart=no");
+        }
+        if !options.extra.is_empty() {
+            let _ = writeln!(s, "# The scenario's settings.\n{}", options.extra.trim_end());
+        }
         Ok(s)
     }
 }
 
 impl Unit {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn pid(&self) -> Option<u32> {
-        self.pid
+        if self.live {
+            self.main_pid().ok().flatten()
+        } else {
+            Some(self.pid.load(Ordering::Relaxed)).filter(|p| *p != 0)
+        }
+    }
+
+    /// Its main process according to systemd.
+    pub fn main_pid(&self) -> Result<Option<u32>> {
+        Ok(self.property("MainPID")?.parse().ok().filter(|p| *p != 0))
     }
 
     /// Whether its main process has ended.
     pub fn exited(&self) -> bool {
-        self.pid.is_none_or(netns::exited)
+        self.pid().is_none_or(netns::exited)
+    }
+
+    /// `systemctl VERB... NAME`, for example `reload` or `restart`; the
+    /// main process is read again afterwards.
+    pub fn systemctl(&self, verb: &[&str]) -> Result<std::process::Output> {
+        let out = std::process::Command::new("systemctl")
+            .args(verb)
+            .arg(&self.name)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        self.pid.store(self.main_pid()?.unwrap_or(0), Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// `ActiveState` and `SubState`, for example `active` and `running`.
+    pub fn active_state(&self) -> Result<(String, String)> {
+        Ok((self.property("ActiveState")?, self.property("SubState")?))
     }
 
     /// `systemctl stop` (SIGTERM to the main process, IMPL-10's
@@ -172,7 +232,8 @@ impl Unit {
         })
     }
 
-    fn property(&self, name: &str) -> Result<String> {
+    /// A property, as `systemctl show --value` prints it.
+    pub fn property(&self, name: &str) -> Result<String> {
         Ok(netns::host("systemctl", ["show", "--value", "-p", name, &self.name])?
             .trim()
             .to_owned())
@@ -185,7 +246,7 @@ impl Unit {
             [
                 "show",
                 "-p",
-                "ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus",
+                "ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus,NRestarts",
                 &self.name,
             ],
         )

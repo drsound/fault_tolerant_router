@@ -216,6 +216,7 @@ pub struct Polywan {
     /// The shipped unit file the daemon starts as (`POLYWAN_TEST_UNIT`),
     /// or `None` to start it as a child of the test.
     unit: Option<PathBuf>,
+    unit_options: crate::unit::UnitOptions,
 }
 
 impl Topology {
@@ -250,6 +251,7 @@ impl Topology {
             router_ns: self.router().name().to_owned(),
             env: Vec::new(),
             unit: crate::unit::shipped_unit(),
+            unit_options: Default::default(),
         };
         f.write_config(config)?;
         Ok(f)
@@ -301,7 +303,7 @@ impl Polywan {
                 let socket = self.control_socket().display().to_string();
                 let reload = self.args(&["reload", "--socket", &socket]);
                 let reload: Vec<&str> = reload.iter().map(String::as_str).collect();
-                t.start_daemon_unit(unit, &self.bin, &args, &reload, &self.env)?
+                t.start_daemon_unit(unit, &self.bin, &args, &reload, &self.env, &self.unit_options)?
             }
             None => t.start_daemon(&self.bin, &args, &self.env)?,
         });
@@ -312,6 +314,16 @@ impl Polywan {
     /// under the unit: scenarios about running without systemd.
     pub fn direct(&mut self) {
         self.unit = None;
+    }
+
+    /// The drop-in and start options of the next starts under the unit.
+    pub fn set_unit_options(&mut self, options: crate::unit::UnitOptions) {
+        self.unit_options = options;
+    }
+
+    /// The unit the daemon runs as, if it was started under one.
+    pub fn unit(&self) -> Option<&crate::unit::Unit> {
+        self.daemon.as_ref()?.unit()
     }
 
     /// Sets an environment variable for the next starts, for the daemon's

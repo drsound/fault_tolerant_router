@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use crate::netns;
 use crate::plan::{self, Node, Uplink};
 use crate::topology::Topology;
-use crate::unit::Unit;
+use crate::unit::{Unit, UnitOptions};
 
 impl Topology {
     /// Carrier loss on the router's uplink interface: the provider side of
@@ -247,9 +247,10 @@ impl Topology {
         args: &[&str],
         reload: &[&str],
         env: &[(String, String)],
+        options: &UnitOptions,
     ) -> Result<Daemon> {
         Ok(Daemon {
-            process: Process::Unit(self.start_unit(unit, binary, args, reload, env)?),
+            process: Process::Unit(self.start_unit(unit, binary, args, reload, env, options)?),
         })
     }
 
@@ -287,6 +288,14 @@ impl Daemon {
             Process::Child(c) => Some(c.id()),
             Process::Unit(u) => u.pid(),
             Process::Stopped => None,
+        }
+    }
+
+    /// The unit it runs as, if any.
+    pub fn unit(&self) -> Option<&Unit> {
+        match &self.process {
+            Process::Unit(u) => Some(u),
+            _ => None,
         }
     }
 
