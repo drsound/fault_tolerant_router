@@ -26,3 +26,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Release binaries without symbols (DIST-1); panic messages stay.
+[profile.release]
+strip = true
