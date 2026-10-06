@@ -736,3 +736,108 @@ fn as34_unit_restarts() -> Result<()> {
     assert_eq!(unit.property("ExecMainStatus")?, "78");
     Ok(())
 }
+
+/// The inode of `path`, which must exist.
+fn inode(path: &std::path::Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::symlink_metadata(path)
+        .with_context(|| path.display().to_string())?
+        .ino())
+}
+
+/// IMPL-6 and IMPL-10 under the packaged unit: while an offline `cleanup`
+/// holds the instance lock (an `nft` wrapper keeps it waiting), a start of
+/// the service fails with 1 and leaves the lock file and its runtime
+/// directory in place (`RuntimeDirectoryPreserve=yes`), so a second offline
+/// command is still refused; the `cleanup` then completes. With the
+/// packaged `Restart=always`, restarts fail likewise while the lock is held
+/// and the service starts once it is released; its stop keeps the lock too.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn impl6_lock_held_across_failed_starts_of_the_unit() -> Result<()> {
+    if !under_unit() {
+        return Ok(());
+    }
+    let t = build();
+    let mut f = t.prepare_polywan("")?;
+    // The wrapper's flag, also the condition of its wait.
+    let armed = f.dir.join("nft-armed");
+    let held = f.dir.join("nft-held");
+    let wait = format!(
+        "touch {}; while [ -e {} ]; do sleep 0.1; done",
+        held.display(),
+        armed.display()
+    );
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"], &wait)?;
+    assert_eq!(flag, armed);
+    let more = format!("[firewall]\nnft_path = \"{}\"\n", wrapper.display());
+    f.write_config(&polywan::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", &more))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    f.stop()?;
+    assert!(f.state.join("manifest.json").exists());
+    let identity = |f: &polywan::Polywan| -> Result<(u64, u64)> { Ok((inode(&f.lock)?, inode(&f.dir)?)) };
+    let before = identity(&f)?;
+    let config = f.config.display().to_string();
+    // A `cleanup` in its nftables step, holding the lock.
+    let hold = |f: &polywan::Polywan| -> Result<std::process::Child> {
+        let _ = std::fs::remove_file(&held);
+        std::fs::write(&flag, "")?;
+        let child = f.cli_child(&["cleanup", "--config", &config])?;
+        t.wait_for(
+            "cleanup holding the lock",
+            Duration::from_secs(10),
+            || Ok(held.exists()),
+        )?;
+        Ok(child)
+    };
+    let release = |child: std::process::Child| -> Result<()> {
+        std::fs::remove_file(&flag)?;
+        let out = child.wait_with_output()?;
+        anyhow::ensure!(out.status.success(), "cleanup: {}", polywan::output_text(&out));
+        Ok(())
+    };
+    let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+
+    // A start without restarts fails; the lock stays and still excludes.
+    let cleanup = hold(&f)?;
+    f.start(&t)?;
+    let unit = f.unit().context("under the unit")?;
+    assert_eq!(unit.active_state()?, pair("failed", "failed"), "{}", f.log());
+    assert_eq!(unit.property("ExecMainStatus")?, "1");
+    assert!(f.log().contains("instance lock"), "{}", f.log());
+    assert_eq!(identity(&f)?, before, "the lock and its directory are kept");
+    let second = f.cli_config(&["cleanup"])?;
+    assert!(
+        !second.status.success() && polywan::output_text(&second).contains("held by another instance"),
+        "{}",
+        polywan::output_text(&second)
+    );
+    release(cleanup)?;
+    assert_eq!(tagged(&t, "249")?, 0, "the cleanup completed");
+    assert!(!f.state.join("manifest.json").exists());
+    assert_eq!(identity(&f)?, before);
+
+    // The packaged restarts fail while the lock is held, then one starts
+    // (sooner than `RestartSec=5s`: `cleanup` waits 10 s for nft).
+    f.set_unit_options(testbed::unit::UnitOptions {
+        restart: true,
+        no_block: true,
+        extra: "RestartSec=1s\n".into(),
+    });
+    let cleanup = hold(&f)?;
+    f.start(&t)?;
+    let unit = f.unit().context("under the unit")?;
+    t.wait_for("two failed restarts", Duration::from_secs(8), || {
+        Ok(unit.property("NRestarts")?.parse::<u32>()? >= 2)
+    })?;
+    assert_eq!(identity(&f)?, before, "the lock and its directory are kept");
+    release(cleanup)?;
+    t.wait_for("the service started", Duration::from_secs(30), || {
+        Ok(unit.active_state()? == pair("active", "running"))
+    })?;
+    f.wait_installed(&t)?;
+    assert!(unit.stop()?.success(), "{}", f.log());
+    assert_eq!(identity(&f)?, before, "kept by the stop");
+    Ok(())
+}

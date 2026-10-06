@@ -336,11 +336,25 @@ impl Polywan {
     /// Runs a CLI command in the router namespace (with this run's lock and
     /// the environment set by [`Polywan::set_env`]).
     pub fn cli(&self, rest: &[&str]) -> Result<Output> {
-        Ok(Ns::new(self.router_ns.as_str())
-            .command(&self.bin)
-            .args(self.args(rest))
-            .envs(self.env.iter().map(|(k, v)| (k, v)))
-            .output()?)
+        Ok(self.cli_command(rest).output()?)
+    }
+
+    /// [`Polywan::cli`] in the background: a command that runs while the
+    /// test acts, its output collected by `wait_with_output`.
+    pub fn cli_child(&self, rest: &[&str]) -> Result<std::process::Child> {
+        use std::process::Stdio;
+        Ok(self
+            .cli_command(rest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
+    }
+
+    fn cli_command(&self, rest: &[&str]) -> std::process::Command {
+        let mut c = Ns::new(self.router_ns.as_str()).command(&self.bin);
+        c.args(self.args(rest)).envs(self.env.iter().map(|(k, v)| (k, v)));
+        c
     }
 
     /// Runs `run --config` with more `run` options in the foreground until
