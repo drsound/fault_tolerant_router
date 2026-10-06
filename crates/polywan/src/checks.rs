@@ -622,9 +622,14 @@ pub fn networkd(root: &Path) -> Findings {
     f
 }
 
-/// Whether systemd-networkd runs in this network namespace (by process
-/// name; an instance in another namespace manages other interfaces).
+/// Whether systemd-networkd runs in this network namespace: a process with
+/// its name and running as its account, `systemd-network`. Any user can
+/// name a process so; only the account's processes are networkd's. An
+/// instance in another namespace manages other interfaces.
 pub fn networkd_running() -> bool {
+    let Ok(Some(account)) = crate::identity::user("systemd-network") else {
+        return false;
+    };
     let Some(own) = netns_identity(Path::new("/proc/self")) else {
         return false;
     };
@@ -634,8 +639,22 @@ pub fn networkd_running() -> bool {
     entries.flatten().any(|e| {
         e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit())
             && fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "systemd-network")
+            && fs::read_to_string(e.path().join("status")).is_ok_and(|s| real_uid(&s) == Some(account.uid))
             && netns_identity(&e.path()) == Some(own)
     })
+}
+
+/// The real UID in the text of `/proc/PID/status` (`Uid:` real, effective,
+/// saved, file system). Unlike the owner of `/proc/PID`, it does not turn
+/// into root for a process that is not dumpable.
+fn real_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The network namespace of a `/proc/PID` directory, as the inode of its
@@ -650,6 +669,16 @@ fn netns_identity(proc: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_uid_is_the_first_field_of_uid() {
+        assert_eq!(
+            real_uid("Name:\tx\nUmask:\t0022\nUid:\t998\t998\t998\t998\nGid:\t0\t0\t0\t0\n"),
+            Some(998)
+        );
+        assert_eq!(real_uid("Uid:\t1000\t0\t0\t0\n"), Some(1000));
+        assert_eq!(real_uid("Name:\tx\n"), None);
+    }
     use crate::model::UplinkId;
 
     #[test]

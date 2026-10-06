@@ -556,17 +556,20 @@ fn foreign_objects(t: &Topology) -> Result<String> {
 /// AS-33, systemd-networkd (FR-COEX-1): a networkd in the router's namespace
 /// with foreign-rule or foreign-route management enabled (both default to
 /// yes) makes online `check-config` fail and startup be refused, naming each
-/// setting; a networkd in another namespace is not considered; a drop-in
-/// disabling both lets PolyWAN start. The networkd process is a stand-in with its
-/// name, and the configuration is the router namespace's `/etc/systemd`
-/// (`ip netns exec` mounts it): the check is by process and configuration.
+/// setting; a networkd in another namespace is not considered, nor a
+/// process of another user that takes networkd's name; a drop-in disabling
+/// both lets PolyWAN start. The networkd process is a stand-in with its
+/// name, run as the `systemd-network` account, and the configuration is the
+/// router namespace's `/etc/systemd` (`ip netns exec` mounts it): the check
+/// is by process, account and configuration.
 #[test]
 #[ignore = "needs root and network namespaces"]
 fn as33_networkd_foreign_management() -> Result<()> {
     let t = build();
     // A script's process name is its file name. (A copy of `sleep` is not
     // enough: uutils' multicall binary picks the utility by its own name.)
-    let fake = t.dir().join("systemd-networkd");
+    // In the executables' directory: the stand-in also runs as other users.
+    let fake = t.exec_dir()?.join("systemd-networkd");
     std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n")?;
     std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let fake = fake.display().to_string();
@@ -599,7 +602,38 @@ fn as33_networkd_foreign_management() -> Result<()> {
     other.kill()?;
     other.wait()?;
 
-    let mut networkd = t.router().spawn(&fake, [""; 0], &t.dir().join("networkd-router.log"))?;
+    // Any user can name a process like networkd's.
+    let as_user = |user: &str, group: &str| {
+        [
+            format!("--reuid={user}"),
+            format!("--regid={group}"),
+            "--clear-groups".to_owned(),
+            fake.clone(),
+        ]
+    };
+    let mut decoy = t.router().spawn(
+        "setpriv",
+        as_user("nobody", "65534"),
+        &t.dir().join("networkd-decoy.log"),
+    )?;
+    started(&t.router())?;
+    let (ok, text) = check(&f)?;
+    assert!(ok, "{text}");
+    decoy.kill()?;
+    decoy.wait()?;
+
+    if !std::fs::read_to_string("/etc/passwd")?
+        .lines()
+        .any(|l| l.starts_with("systemd-network:"))
+    {
+        eprintln!("as33: no systemd-network account on this system; networkd's own process not exercised");
+        return Ok(());
+    }
+    let mut networkd = t.router().spawn(
+        "setpriv",
+        as_user("systemd-network", "systemd-network"),
+        &t.dir().join("networkd-router.log"),
+    )?;
     started(&t.router())?;
     // Defaults: both enabled.
     let (ok, text) = check(&f)?;
