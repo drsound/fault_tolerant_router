@@ -1,4 +1,7 @@
 # Not uploaded to Debian: there are no Debian bugs to close.
 polywan: initial-upload-closes-no-bugs
-# A static-pie executable (SPEC.md PLAT-3), not a shared library.
-polywan: shared-library-lacks-prerequisites [usr/bin/polywan]
+# Static executables (SPEC.md PLAT-3): rust-lld links a static-pie one on
+# amd64, which lintian takes for a shared library, and a non-PIE one on arm64
+# and armhf.
+polywan [amd64]: shared-library-lacks-prerequisites [usr/bin/polywan]
+polywan [arm64 armhf]: statically-linked-binary [usr/bin/polywan]
