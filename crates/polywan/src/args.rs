@@ -7,10 +7,17 @@ use clap::{Parser, Subcommand};
 
 use crate::{config, state};
 
+/// `polywan --version`; a build with the test hooks says so, which the
+/// release workflow checks (they are never released).
+#[cfg(not(feature = "test-hooks"))]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "test-hooks")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (test hooks)");
+
 #[derive(Parser)]
 #[command(
     name = "polywan",
-    version,
+    version = VERSION,
     about = "Multi-uplink policy routing daemon for Linux routers"
 )]
 pub struct Cli {
