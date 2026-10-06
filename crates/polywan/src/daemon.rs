@@ -1583,12 +1583,14 @@ impl Daemon {
         let wall = std::time::SystemTime::now();
         let boot_now = now_ms();
         let since = |ms: u64| events::rfc3339(wall - Duration::from_millis(boot_now.saturating_sub(ms)));
+        // Every managed family, also before its set first changes, and none
+        // that a reload stopped managing.
         let mut active = BTreeMap::new();
-        for (family, set) in &self.active {
+        for family in Family::ALL.into_iter().filter(|f| self.cfg.manages(*f)) {
+            let set = self.active.get(&family).into_iter().flatten();
             active.insert(
                 family.key(),
-                set.iter()
-                    .filter_map(|id| self.cfg.uplink(*id).map(|u| u.name.clone()))
+                set.filter_map(|id| self.cfg.uplink(*id).map(|u| u.name.clone()))
                     .collect(),
             );
         }
