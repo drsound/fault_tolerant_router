@@ -21,6 +21,8 @@ status_group = "monitoring"
 
 To disable it, set `status_socket = ""`; `polywan status` and `polywan events` then need `--socket /run/polywan/api.sock` and membership of `api.group`.
 
+Like every listener, the status socket serves at most 16 connections at once (see [limits](#limits-and-overload)), and a client following the events holds one for up to a minute: any local user can therefore occupy it and keep other status clients waiting. The routing and the control socket are not affected. Where untrusted users log in on the router, restrict the status socket with `status_group`.
+
 The metrics endpoint has no access control: bind it to a loopback or management address, and filter it in your firewall if needed.
 
 Which socket answers decides what a request may do: authorisation does not depend on headers or methods, and the status socket answers 404 to every control endpoint, as if it did not exist.
