@@ -113,15 +113,18 @@ pub struct StateDir {
 }
 
 impl StateDir {
-    /// Creates the directory (mode 0700) if needed.
+    /// Creates the directory, and any missing parent, with mode 0700 (the
+    /// umask can only remove bits). An existing directory keeps its mode:
+    /// FR-CFG-5 already refused it if others can write it, and changing it
+    /// would lock out of a directory like /var/lib whoever else uses it,
+    /// after a mistyped `state_dir`.
     pub fn open(path: &Path) -> Result<StateDir, StateError> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(path)
             .map_err(io_err(path))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_err(path))?;
         Ok(StateDir { path: path.to_owned() })
     }
 
@@ -572,6 +575,26 @@ interface = "wanb"
         assert_eq!(dir.drain().unwrap(), DrainState::default());
         assert!(dir.manifest().unwrap().is_some(), "reset never discards the manifest");
         fs::remove_dir_all(&dir.path).unwrap();
+    }
+
+    #[test]
+    fn open_creates_0700_and_leaves_an_existing_directory_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempdir();
+        let new = base.join("a/b");
+        StateDir::open(&new).unwrap();
+        for d in [&base.join("a"), &new] {
+            assert_eq!(
+                fs::metadata(d).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                d.display()
+            );
+        }
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        StateDir::open(&base).unwrap();
+        assert_eq!(fs::metadata(&base).unwrap().permissions().mode() & 0o777, 0o755);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -606,7 +606,7 @@ Reconciliation rules:
 
 ### 12.3 State directory, ownership and lifecycle
 
-- **IMPL-5** The state directory (`state_dir`, mode 0700) contains versioned files, each written atomically (temporary file, fsync, rename, fsync of the directory):
+- **IMPL-5** The state directory (`state_dir`, created with mode 0700; an existing directory keeps its mode, and FR-CFG-5 refuses one that others can write) contains versioned files, each written atomically (temporary file, fsync, rename, fsync of the directory):
   - the **manifest**: structural settings, owned table and priority ranges, protocol, nftables table name, uplink id/name bindings (including reserved ids of removed uplinks), and the **baseline** of every sysctl PolyWAN has changed, recorded the first time PolyWAN changes it and kept across restarts until cleanup. The manifest is written before the kernel objects it describes are created (write-ahead);
   - the **drain state**;
   - the **health checkpoint**: boot identifier (`/proc/sys/kernel/random/boot_id`), `CLOCK_BOOTTIME` timestamp, configuration digest, and per path its identity (uplink id, family, ifindex, source, gateway), state, state-since, hysteresis counters, plus the active set of each family. It is written at every transition and at least every 30 s. A checkpoint is valid only with the same boot identifier, an age under 10 min and the same structural settings; a path's entry is used only if its uplink id, family, ifindex, source and gateway are unchanged, otherwise that path starts cold.
