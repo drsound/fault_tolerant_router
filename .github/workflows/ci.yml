@@ -3,6 +3,8 @@ name: CI
 
 on:
   push:
+    # A tag's commit was built on its branch; release.yml builds it again.
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
