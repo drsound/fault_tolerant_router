@@ -716,7 +716,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "polywan"
-version = "2.0.0-dev"
+version = "2.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "testbed"
-version = "2.0.0-dev"
+version = "2.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "2.0.0-dev"
+version = "2.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
