@@ -319,6 +319,101 @@ fn fr_disc_5_lifetime_shortened_without_prefix_information() -> Result<()> {
     Ok(())
 }
 
+/// FR-DISC-5, carried over from M2: A's default route is created again
+/// (notified) with a short router lifetime, which advertisements without
+/// prefix information then refresh before each expiry. The kernel notifies
+/// no refresh: A stays ready across every previously known expiry, and is
+/// not ready within a second of the last one once the refreshes stop.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn fr_disc_5_lifetime_refreshed_without_a_notification() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    let t = build();
+    let f = t.start_polywan(&polywan::family(&ab(), Family::V6))?;
+    f.wait_installed(&t)?;
+    wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
+    // As in the scenario above: only advertisements without options.
+    for p in [Node::IspA, Node::IspB] {
+        t.ns(p).nft(
+            "table inet tb_ra {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    icmpv6 type nd-router-advert meta length != 56 drop\n  }\n}\n",
+        )?;
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let advertise = || -> Result<()> {
+        t.ns(Node::IspA).run(
+            &t.agent_bin().to_string_lossy(),
+            [
+                "agent",
+                "send-ra",
+                "--device",
+                "wan",
+                "--lifetime",
+                "6",
+                "--flags",
+                "192",
+            ],
+        )?;
+        Ok(())
+    };
+    // The route's creation is notified with its expiry; its refreshes, every
+    // 3 s, are not.
+    drop_ra_default_routes(&t, "wana")?;
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| -> Result<()> {
+        let refresher = s.spawn(|| -> Result<()> {
+            let mut last: Option<Instant> = None;
+            while !stop.load(Ordering::Relaxed) {
+                if last.is_none_or(|l| l.elapsed() >= Duration::from_secs(3)) {
+                    advertise()?;
+                    last = Some(Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let watched = (|| -> Result<()> {
+            wait_members(&t, Family::V6, &["wana", "wanb"], Duration::from_secs(10))?;
+            assert!(ra_expiry(&t, "wana")?.is_some_and(|s| s <= 6));
+            let cursor = f.latest_event()?;
+            // 15 s cross four expiries of 6 s.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(15) {
+                anyhow::ensure!(
+                    !path_route(&t, Family::V6, 1001)?.is_empty(),
+                    "A withdrawn {:?} into the refreshes",
+                    start.elapsed()
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let changes: Vec<_> = f
+                .events()?
+                .into_iter()
+                .filter(|(seq, kind, _)| *seq > cursor && kind == "path_state_changed")
+                .collect();
+            anyhow::ensure!(changes.is_empty(), "{changes:?}");
+            Ok(())
+        })();
+        stop.store(true, Ordering::Relaxed);
+        refresher.join().expect("refresher")?;
+        watched
+    })?;
+    // No more refreshes: A goes at the last expiry.
+    let since = Instant::now();
+    let left = ra_expiry(&t, "wana")?.unwrap_or(0);
+    t.wait_for("A's path route withdrawn", Duration::from_secs(left + 5), || {
+        Ok(path_route(&t, Family::V6, 1001)?.is_empty())
+    })?;
+    let took = since.elapsed();
+    assert!(
+        took <= Duration::from_secs(left + 2) && took + Duration::from_secs(1) >= Duration::from_secs(left),
+        "withdrawn after {took:?}, expiry in {left} s"
+    );
+    wait_members(&t, Family::V6, &["wanb"], Duration::from_secs(2))?;
+    Ok(())
+}
+
 /// FR-DISC-5 under a flood of advertisements with prefix information on
 /// A, 5,000 a second for three seconds, each renewing the lifetimes of A's
 /// SLAAC address: the daemon gathers them, re-reading its tables a bounded
