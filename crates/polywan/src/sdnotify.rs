@@ -76,9 +76,62 @@ impl Notifier {
     }
 }
 
+/// What a running daemon tells systemd: `READY=1` once, `STATUS=` when the
+/// summary differs from the one last delivered. A message that found the
+/// queue full stays pending; it is rebuilt from the current state, so a
+/// summary that returns to the delivered one leaves nothing to send.
+pub struct Notifications {
+    notifier: Notifier,
+    ready_sent: bool,
+    status_sent: String,
+}
+
+impl Notifications {
+    pub fn new(notifier: Notifier) -> Notifications {
+        Notifications {
+            notifier,
+            ready_sent: false,
+            status_sent: String::new(),
+        }
+    }
+
+    /// Sends what changed: readiness when `ready` and not sent yet, the
+    /// status line when it changed. Returns whether a message is pending.
+    pub fn update(&mut self, ready: bool, status: &str) -> bool {
+        let ready = ready && !self.ready_sent;
+        let mut message = String::new();
+        if ready {
+            message += "READY=1\n";
+        }
+        if status != self.status_sent {
+            message += &format!("STATUS={status}\n");
+        }
+        if message.is_empty() {
+            return false;
+        }
+        match self.notifier.send(&message) {
+            Sent::Done => {
+                self.ready_sent |= ready;
+                status.clone_into(&mut self.status_sent);
+                false
+            }
+            Sent::Again => true,
+        }
+    }
+
+    pub fn stopping(&mut self) {
+        self.notifier.send("STOPPING=1\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receive_blocking(r: &UnixDatagram) -> String {
+        r.set_nonblocking(false).unwrap();
+        receive(r)
+    }
 
     fn receive(r: &UnixDatagram) -> String {
         let mut buf = [0; 512];
@@ -121,5 +174,32 @@ mod tests {
         drop(r);
         assert_eq!(n.send("READY=1\n"), Sent::Done);
         assert!(Notifier::new("relative").is_err());
+    }
+
+    #[test]
+    fn notifications_send_changes_and_keep_only_what_is_still_pending() {
+        let name = format!("polywan-sdnotify-session-{}", std::process::id());
+        let r = UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let mut n = Notifications::new(Notifier::new(&format!("@{name}")).unwrap());
+        assert!(!n.update(false, "status ok"));
+        assert_eq!(receive(&r), "STATUS=status ok\n");
+        assert!(!n.update(false, "status ok"), "nothing changed");
+        assert!(!n.update(true, "status ok"));
+        assert_eq!(receive(&r), "READY=1\n");
+        assert!(!n.update(true, "status ok"), "readiness once");
+        // A full queue: the change stays pending until it can be sent...
+        let mut sent = 0;
+        while n.notifier.send("x") == Sent::Done {
+            sent += 1;
+            assert!(sent < 100_000, "the queue never filled");
+        }
+        assert!(n.update(true, "status degraded (apply_failed)"));
+        // ...and nothing is pending once the summary is back to the one
+        // delivered.
+        assert!(!n.update(true, "status ok"));
+        r.set_nonblocking(true).unwrap();
+        while r.recv(&mut [0; 16]).is_ok() {}
+        assert!(!n.update(true, "status degraded (apply_failed)"));
+        assert_eq!(receive_blocking(&r), "STATUS=status degraded (apply_failed)\n");
     }
 }

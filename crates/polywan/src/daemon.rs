@@ -244,14 +244,11 @@ struct Daemon {
     installing: bool,
     /// IMPL-10: systemd's notification socket; none without `NOTIFY_SOCKET`
     /// and in a dry run.
-    notifier: Option<sdnotify::Notifier>,
+    notifier: Option<sdnotify::Notifications>,
     /// The initial reconciliation attempt completed or reported a failure.
     attempted: bool,
-    /// `READY=1` was sent.
-    ready_sent: bool,
-    /// The `STATUS=` line of the latest snapshot, and the one last sent.
+    /// The `STATUS=` line of the latest snapshot.
     status_line: String,
-    status_sent: String,
     /// A notification found systemd's queue full: it is sent again then.
     notify_retry: Option<Instant>,
     hand_back: Option<(u64, String)>,
@@ -563,9 +560,7 @@ pub async fn run(opts: Options) -> Result<()> {
         installing: true,
         notifier: None,
         attempted: false,
-        ready_sent: false,
         status_line: String::new(),
-        status_sent: String::new(),
         notify_retry: None,
         hand_back: None,
         reload: None,
@@ -627,7 +622,7 @@ pub async fn run(opts: Options) -> Result<()> {
     if opts.dry_run {
         return d.dry_run();
     }
-    d.notifier = sdnotify::Notifier::from_env();
+    d.notifier = sdnotify::Notifier::from_env().map(sdnotify::Notifications::new);
     // The API sockets (FR-API-1), served on the I/O runtime.
     let endpoints = crate::api::endpoints(&d.cfg).map_err(|e| anyhow::anyhow!("api: {e}"))?;
     let (orders, orders_rx) = mpsc::channel(crate::api::ORDER_QUEUE);
@@ -1574,30 +1569,13 @@ impl Daemon {
         let Some(n) = self.notifier.as_mut() else {
             return;
         };
-        let ready = !self.ready_sent
-            && self.attempted
+        let ready = self.attempted
             && !self.installing
             && self.nft_flight.is_none()
             && self.hand_back.is_none()
             && self.sysctls_flight.is_empty();
-        let mut message = String::new();
-        if ready {
-            message += "READY=1\n";
-        }
-        if self.status_line != self.status_sent {
-            message += &format!("STATUS={}\n", self.status_line);
-        }
-        if message.is_empty() {
-            return;
-        }
-        match n.send(&message) {
-            sdnotify::Sent::Done => {
-                self.ready_sent |= ready;
-                self.status_sent.clone_from(&self.status_line);
-                self.notify_retry = None;
-            }
-            sdnotify::Sent::Again => self.notify_retry = Some(Instant::now() + NOTIFY_RETRY),
-        }
+        let pending = n.update(ready, &self.status_line);
+        self.notify_retry = pending.then(|| Instant::now() + NOTIFY_RETRY);
     }
 
     /// The status of FR-API-2.
@@ -2724,7 +2702,7 @@ impl Daemon {
         self.pending_events
             .push(NewEvent::new("daemon_stopping", "polywan is stopping"));
         if let Some(n) = self.notifier.as_mut() {
-            n.send("STOPPING=1\n");
+            n.stopping();
         }
         self.flush_events();
         // The batch holding `daemon_stopping` and the email still waiting
