@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+description = "Build-time tools of PolyWAN: the man page and the shell completions"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete = "4"
+roff = "1"
+polywan = { path = "../polywan" }
+
+[lints]
+workspace = true

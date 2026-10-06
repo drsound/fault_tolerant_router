@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod args;
 pub mod checks;
 pub mod cleanup;
 pub mod cli;

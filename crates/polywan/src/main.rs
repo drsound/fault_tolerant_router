@@ -2,122 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use polywan::args::{Cli, Command};
 use polywan::{cleanup, config, daemon, nft, state};
 use tracing::error;
-
-#[derive(Parser)]
-#[command(
-    name = "polywan",
-    version,
-    about = "Multi-uplink policy routing daemon for Linux routers"
-)]
-struct Cli {
-    /// Instance lock (tests run several daemons on one host).
-    #[arg(long, global = true, hide = true, default_value = state::LOCK_PATH)]
-    lock: PathBuf,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Run the daemon in the foreground.
-    Run {
-        #[arg(long, default_value = config::DEFAULT_PATH)]
-        config: PathBuf,
-        /// Compute and log every artifact change without applying it.
-        #[arg(long)]
-        dry_run: bool,
-        /// Discard the drain state and health checkpoints, and a corrupt or
-        /// unknown-version manifest (never a valid one).
-        #[arg(long)]
-        reset_state: bool,
-    },
-    /// Validate the configuration and, without --offline, the system prerequisites.
-    CheckConfig {
-        #[arg(long, default_value = config::DEFAULT_PATH)]
-        config: PathBuf,
-        /// Only validate the file.
-        #[arg(long)]
-        offline: bool,
-    },
-    /// Print a commented example configuration.
-    GenerateConfig,
-    /// Print the nftables ruleset that the managed firewall mode installs.
-    ExportNft {
-        #[arg(long, default_value = config::DEFAULT_PATH)]
-        config: PathBuf,
-    },
-    /// Remove every PolyWAN artifact (refused while the daemon runs).
-    Cleanup {
-        #[arg(long, default_value = config::DEFAULT_PATH)]
-        config: PathBuf,
-    },
-    /// Show the daemon's status (through the status socket by default).
-    Status {
-        /// The raw JSON of `GET /v1/status`.
-        #[arg(long)]
-        json: bool,
-        #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
-        socket: PathBuf,
-    },
-    /// Show recent events (through the status socket by default).
-    Events {
-        /// Keep waiting for new events.
-        #[arg(long)]
-        follow: bool,
-        /// One JSON object per line.
-        #[arg(long)]
-        json: bool,
-        #[arg(long, default_value = polywan::config::DEFAULT_STATUS_SOCKET)]
-        socket: PathBuf,
-    },
-    /// Drain an uplink: no new connections through it (through the
-    /// control socket).
-    Drain {
-        name: String,
-        /// Drain even the last candidate of a family.
-        #[arg(long)]
-        force: bool,
-        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
-        socket: PathBuf,
-    },
-    /// Undrain an uplink.
-    Undrain {
-        name: String,
-        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
-        socket: PathBuf,
-    },
-    /// Reload the configuration (through the control socket).
-    Reload {
-        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
-        socket: PathBuf,
-    },
-    /// Test every configured notification channel through the daemon;
-    /// --offline tests them here, as root, outside the service's sandbox.
-    NotifyTest {
-        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET, conflicts_with = "offline")]
-        socket: PathBuf,
-        /// Test locally while the daemon is stopped (holds the instance lock).
-        #[arg(long)]
-        offline: bool,
-        #[arg(long, default_value = config::DEFAULT_PATH, requires = "offline")]
-        config: PathBuf,
-    },
-    /// Release the persisted id binding of a removed uplink: through the
-    /// control socket while the daemon runs, offline otherwise.
-    ForgetUplink {
-        name: String,
-        #[arg(long, default_value = polywan::config::DEFAULT_API_SOCKET)]
-        socket: PathBuf,
-        #[arg(long, default_value = config::DEFAULT_PATH)]
-        config: PathBuf,
-    },
-}
 
 fn init_logging() {
     let level = match std::env::var("POLYWAN_LOG").as_deref() {
