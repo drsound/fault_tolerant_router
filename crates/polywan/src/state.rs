@@ -52,22 +52,24 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StateError + '_ {
 }
 
 /// Writes a file atomically: temporary file, fsync, rename, fsync of the
-/// directory (IMPL-5). The file is readable and writable by its owner only,
-/// whatever the umask and whatever a temporary file left behind allowed:
-/// the state directory may be readable by others (an existing one keeps
-/// its mode).
+/// directory (IMPL-5). The temporary file is always a new one, created
+/// with mode 0600 (the umask can only remove bits): the state directory may
+/// be readable by others (an existing one keeps its mode), and a file left
+/// behind could be open elsewhere.
 pub fn write_atomic(path: &Path, content: &[u8]) -> Result<(), StateError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = path.with_extension("tmp");
+    if let Err(e) = fs::remove_file(&tmp)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(io_err(&tmp)(e));
+    }
     let mut f = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
-        .map_err(io_err(&tmp))?;
-    f.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(io_err(&tmp))?;
     f.write_all(content).map_err(io_err(&tmp))?;
     f.sync_all().map_err(io_err(&tmp))?;
@@ -605,15 +607,25 @@ interface = "wanb"
     }
 
     #[test]
-    fn state_files_are_private_whatever_a_leftover_temporary_file_allowed() {
+    fn a_leftover_temporary_file_is_replaced_not_reused() {
+        use std::io::{Seek, SeekFrom};
         use std::os::unix::fs::PermissionsExt;
         let dir = StateDir::open(&tempdir()).unwrap();
         let tmp = dir.path.join("drain.tmp");
         fs::write(&tmp, "").unwrap();
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).unwrap();
-        dir.write_drain(&DrainState::of(["a".to_owned()])).unwrap();
+        let mut held = OpenOptions::new().write(true).open(&tmp).unwrap();
+        let drain = DrainState::of(["a".to_owned()]);
+        dir.write_drain(&drain).unwrap();
         let mode = fs::metadata(dir.path.join(DRAIN)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        held.seek(SeekFrom::Start(0)).unwrap();
+        held.write_all(b"forged").unwrap();
+        assert_eq!(
+            dir.drain().unwrap(),
+            drain,
+            "the held descriptor is not the published file"
+        );
         fs::remove_dir_all(&dir.path).unwrap();
     }
 
