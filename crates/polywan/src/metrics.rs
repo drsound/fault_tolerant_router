@@ -16,8 +16,10 @@ use crate::status::Status;
 /// The totals of FR-MET-2 that the State task counts. They change with
 /// every probe round but only a scrape reads them, so they are shared with
 /// the scrape instead of being copied into each status snapshot; uplinks
-/// are named when rendered.
-#[derive(Debug, Default)]
+/// are named when rendered. A scrape copies them under the lock and
+/// formats the copy, so that the State task never waits for a rendering
+/// (IMPL-4).
+#[derive(Clone, Debug, Default)]
 pub struct Totals {
     /// Health transitions by path and new state.
     pub transitions: BTreeMap<(UplinkId, Family, &'static str), u64>,
@@ -169,7 +171,7 @@ pub fn render(status: &Status, totals: &Mutex<Totals>, failures: &Failures) -> S
             .collect()
     }
     {
-        let c = totals.lock().unwrap_or_else(|e| e.into_inner());
+        let c = totals.lock().unwrap_or_else(|e| e.into_inner()).clone();
         family(
             "polywan_path_transitions_total",
             "counter",
