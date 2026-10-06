@@ -8,14 +8,14 @@ Do you have several internet connections, from different providers, on one Linux
 
 ## Status
 
-PolyWAN 2.0 is a ground-up rewrite in Rust, under development on this branch (`v2`). It has not been released yet: there are no packages, and configuration, command line and paths may still change until 2.0.0. The contract the code is built and tested against is [SPEC.md](SPEC.md); the milestones are recorded in [milestones/](milestones/).
+PolyWAN 2.0 is a ground-up rewrite in Rust, under development on this branch (`v2`). It has not been released yet: there are no packages, and configuration, command line and paths may still change until 2.0.0. The contract the code is built and tested against is [SPEC.md](SPEC.md).
 
 | Milestone | Scope | State |
 |---|---|---|
 | M1 | IPv4 core: configuration, discovery, probes, health, routing, nftables, `run`, `check-config`, `export-nft`, `cleanup`, `forget-uplink` | complete |
 | M2 | IPv6 | complete |
 | M3 | Operations: status API and the rest of the command line, drain, policies, events, email, hooks, Prometheus metrics, quality gates | complete |
-| M4 | Release: packages, documentation | planned |
+| M4 | Release: packages, documentation | in progress |
 
 Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
 
