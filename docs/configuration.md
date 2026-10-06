@@ -317,9 +317,9 @@ The endpoint serves Prometheus metrics at `/metrics`, without access control: bi
 
 | Key | Default | Values |
 |---|---|---|
-| `state_dir` | `"/var/lib/polywan"` | absolute path |
+| `state_dir` | `"/var/lib/polywan"` | absolute path of a directory owned by root, not writable by group or others, as is every directory above it |
 
-`state_dir` is a top-level key: in TOML it must come before the first table of the file. It holds the manifest of what PolyWAN installed, the drain state and the health checkpoint (see [the state directory](how-it-works.md#the-state-directory)). It cannot change on reload. To move it:
+`state_dir` is a top-level key: in TOML it must come before the first table of the file. It holds the manifest of what PolyWAN installed, the drain state and the health checkpoint (see [the state directory](how-it-works.md#the-state-directory)). Because `cleanup` removes and restores, as root, what the manifest records, the directory is trusted like the configuration: when it, or a directory above it, is not owned by root or is writable by group or others, startup, reload, online `check-config`, `cleanup` and offline `forget-uplink` refuse it; a directory that does not exist yet is checked through the one that will hold it. It cannot change on reload. To move it:
 
 1. Stop the daemon, with `routing.on_shutdown = "keep"` so that routing stays in place.
 2. Move the whole directory, keeping its ownership (root), permissions (0700) and contents.

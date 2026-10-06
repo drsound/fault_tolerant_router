@@ -94,14 +94,31 @@ pub fn desired(config: &Config) -> Vec<Setting> {
     v
 }
 
+/// Whether `key` can name a setting PolyWAN manages: a path below
+/// `/proc/sys/net` of plain components. Keys also come from the manifest,
+/// and a key must never name a file elsewhere.
+pub fn valid_key(key: &str) -> bool {
+    key.strip_prefix("net/")
+        .is_some_and(|rest| rest.split('/').all(|c| !c.is_empty() && c != "." && c != ".."))
+}
+
+fn path(key: &str) -> io::Result<PathBuf> {
+    if valid_key(key) {
+        Ok(PathBuf::from("/proc/sys").join(key))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{key:?} is not a network setting"),
+        ))
+    }
+}
+
 pub fn read(key: &str) -> io::Result<String> {
-    Ok(fs::read_to_string(PathBuf::from("/proc/sys").join(key))?
-        .trim()
-        .to_owned())
+    Ok(fs::read_to_string(path(key)?)?.trim().to_owned())
 }
 
 pub fn write(key: &str, value: &str) -> io::Result<()> {
-    fs::write(PathBuf::from("/proc/sys").join(key), value)
+    fs::write(path(key)?, value)
 }
 
 /// A setting that differs from what PolyWAN wants.
@@ -246,6 +263,34 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn keys_stay_below_proc_sys_net() {
+        for key in [
+            "net/ipv4/ip_forward",
+            "net/ipv4/conf/wan0.100/rp_filter",
+            "net/ipv6/conf/all/forwarding",
+        ] {
+            assert!(valid_key(key), "{key}");
+        }
+        for key in [
+            "/etc/passwd",
+            "kernel/core_pattern",
+            "net/../kernel/core_pattern",
+            "net/ipv4/conf/./rp_filter",
+            "net//ipv4",
+            "net/",
+            "net",
+        ] {
+            assert!(!valid_key(key), "{key}");
+            assert_eq!(read(key).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{key}");
+            assert_eq!(
+                write(key, "1").unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{key}"
+            );
+        }
+    }
     use crate::config;
 
     const CONFIG: &str = r#"[[downlink]]

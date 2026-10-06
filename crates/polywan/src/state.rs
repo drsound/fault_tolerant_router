@@ -129,8 +129,24 @@ impl StateDir {
         self.path.join(name)
     }
 
+    /// The manifest; one whose sysctl keys name anything but network
+    /// settings is corrupt: cleanup writes the baselines it records.
     pub fn manifest(&self) -> Result<Option<Manifest>, StateError> {
-        read_json(&self.file(MANIFEST))
+        let path = self.file(MANIFEST);
+        let m: Option<Manifest> = read_json(&path)?;
+        if let Some(m) = &m
+            && let Some(key) = m
+                .sysctl_baseline
+                .keys()
+                .chain(m.sysctl_set.keys())
+                .find(|k| !crate::sysctl::valid_key(k))
+        {
+            return Err(StateError::Corrupt {
+                path,
+                message: format!("{key:?} is not a network setting"),
+            });
+        }
+        Ok(m)
     }
 
     pub fn write_manifest(&self, m: &Manifest) -> Result<(), StateError> {
@@ -535,13 +551,13 @@ interface = "wanb"
         let cfg = config::parse(CONFIG).unwrap();
         assert_eq!(dir.manifest().unwrap(), None);
         let mut m = Manifest::new(&cfg);
-        m.record_sysctl("net.ipv4.ip_forward", "0", "1");
-        m.record_sysctl("net.ipv4.ip_forward", "1", "1");
+        m.record_sysctl("net/ipv4/ip_forward", "0", "1");
+        m.record_sysctl("net/ipv4/ip_forward", "1", "1");
         dir.write_manifest(&m).unwrap();
         let back = dir.manifest().unwrap().unwrap();
         assert_eq!(back, m);
         assert_eq!(
-            back.sysctl_baseline["net.ipv4.ip_forward"], "0",
+            back.sysctl_baseline["net/ipv4/ip_forward"], "0",
             "the first baseline is kept"
         );
         assert_eq!(back.families, ["ipv4"]);
@@ -565,6 +581,11 @@ interface = "wanb"
         assert!(matches!(dir.drain(), Err(StateError::Corrupt { .. })));
         fs::write(dir.path.join(CHECKPOINT), "not json").unwrap();
         assert!(matches!(dir.checkpoint(), Err(StateError::Corrupt { .. })));
+        // A manifest whose sysctl key leaves /proc/sys/net.
+        let mut m = Manifest::new(&config::parse(CONFIG).unwrap());
+        m.record_sysctl("/etc/passwd", "root::0:0::/root:/bin/sh", "x");
+        dir.write_manifest(&m).unwrap();
+        assert!(matches!(dir.manifest(), Err(StateError::Corrupt { .. })));
         fs::remove_dir_all(&dir.path).unwrap();
     }
 

@@ -43,6 +43,18 @@ pub fn load(path: &Path) -> Result<crate::config::Config> {
     crate::config::load(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// [`load`] for the offline commands that act as root on what the
+/// configuration names (`cleanup`, `forget-uplink`): the configuration,
+/// the state directory and nft_path trusted as at startup (FR-CFG-5).
+pub fn load_trusted(path: &Path) -> Result<crate::config::Config> {
+    let cfg = load(path)?;
+    let trust = crate::checks::trusted(path, &cfg);
+    if let Some(e) = trust.errors.first() {
+        bail!("{e}");
+    }
+    Ok(cfg)
+}
+
 /// The server's message in an error response.
 fn error_text(v: &Value) -> &str {
     v.get("error").and_then(Value::as_str).unwrap_or("request failed")
@@ -338,7 +350,7 @@ pub async fn forget(socket: &Path, name: &str, config: &Path, lock: &Path) -> Re
 
 /// Offline: root, the configuration and the instance lock (FR-MARK-4).
 fn forget_offline(path: &Path, name: &str, lock: &Path) -> Result<()> {
-    let cfg = load(path)?;
+    let cfg = load_trusted(path)?;
     let _lock = crate::state::InstanceLock::acquire(lock).map_err(|e| anyhow::anyhow!("{e}; stop the daemon first"))?;
     let dir = crate::state::StateDir {
         path: cfg.state_dir.clone(),

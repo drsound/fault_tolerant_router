@@ -106,14 +106,34 @@ impl Runnable {
     }
 }
 
-/// FR-CFG-5 for the configuration file and the binaries PolyWAN runs as
-/// root, `firewall.nft_path` and, with email, `notify.email.sendmail`:
-/// checked before anything configured runs.
+/// FR-CFG-5 for the configuration file, the state directory and the
+/// binaries PolyWAN runs as root, `firewall.nft_path` and, with email,
+/// `notify.email.sendmail`: checked before anything configured runs.
 pub fn trusted(config_path: &Path, config: &Config) -> Findings {
     let mut f = ownership(config_path, "configuration");
+    f.extend(state_directory(&config.state_dir));
     f.extend(executable(&config.firewall.nft_path, "firewall.nft_path"));
     if let Some(e) = &config.notify.email {
         f.extend(executable(&e.sendmail, "notify.email.sendmail"));
+    }
+    f
+}
+
+/// FR-CFG-5 for `state_dir`: its manifest drives what cleanup removes and
+/// restores as root, so it is trusted like the configuration. A directory
+/// not created yet is checked through the existing directory that will
+/// hold it.
+fn state_directory(path: &Path) -> Findings {
+    let mut existing = path;
+    while fs::symlink_metadata(existing).is_err()
+        && let Some(parent) = existing.parent()
+    {
+        existing = parent;
+    }
+    let mut f = ownership(existing, "state_dir");
+    if f.errors.is_empty() && existing == path && !fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+        f.errors
+            .push(format!("state_dir: {} is not a directory", path.display()));
     }
     f
 }

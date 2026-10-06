@@ -62,7 +62,7 @@ fn main() -> ExitCode {
                 Ok(())
             }
             Command::Cleanup { config } => {
-                let cfg = polywan::cli::load(&config)?;
+                let cfg = polywan::cli::load_trusted(&config)?;
                 let _lock = state::InstanceLock::acquire(&cli.lock)?;
                 let dir = state::StateDir {
                     path: cfg.state_dir.clone(),

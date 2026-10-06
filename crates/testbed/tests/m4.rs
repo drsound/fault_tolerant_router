@@ -22,7 +22,8 @@ mod common;
 use common::*;
 
 /// §9 and IMPL-10: `run` exits with 78 when the configuration cannot be
-/// read, parsed or validated, a configured path fails FR-CFG-5, a
+/// read, parsed or validated, a configured path fails FR-CFG-5 (also the
+/// state directory, refused by the offline commands too), a
 /// configured account is absent or prohibited, or the configuration
 /// conflicts with the manifest's structural settings or uplink identities;
 /// with 1 for other startup failures (a held instance lock, corrupt drain
@@ -55,6 +56,21 @@ fn impl10_configuration_exit_status() -> Result<()> {
     f.write_config(&config)?;
     std::fs::set_permissions(&f.config, std::fs::Permissions::from_mode(0o666))?;
     refused(&f.run_refused(&[])?, 78, "writable by group or others")?;
+    // FR-CFG-5: the state directory writable by others, for startup and
+    // for the offline commands that act on its manifest.
+    f.write_config(&config)?;
+    std::fs::create_dir_all(&f.state)?;
+    std::fs::set_permissions(&f.state, std::fs::Permissions::from_mode(0o777))?;
+    refused(&f.run_refused(&[])?, 78, "state_dir")?;
+    for command in [&["cleanup"][..], &["forget-uplink", "gone"]] {
+        let out = f.cli_config(command)?;
+        let text = polywan::output_text(&out);
+        assert!(
+            !out.status.success() && text.contains("state_dir"),
+            "{command:?}: {text}"
+        );
+    }
+    std::fs::set_permissions(&f.state, std::fs::Permissions::from_mode(0o700))?;
     // Accounts: an absent API group, a hook user with UID 0.
     let api = |group: &str| f.api_table(group, None);
     f.write_config(&format!("{config}{}", api("polywan-no-such-group")))?;
