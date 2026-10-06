@@ -188,6 +188,18 @@ fn defaults_follow_the_schema() {
 }
 
 #[test]
+fn state_dir_is_absolute_without_parent_components() {
+    for (dir, message) in [
+        ("var/lib/polywan", "must be an absolute path"),
+        ("/var/lib/polywan/new/../../../../dev/shm/pw", "must not contain `..`"),
+    ] {
+        let d = errors(&format!("state_dir = \"{dir}\"\n{MINIMAL}"));
+        assert!(d[0].message.contains(message), "{dir}: {d:?}");
+    }
+    assert!(parse(&format!("state_dir = \"/srv/polywan/./state\"\n{MINIMAL}")).is_ok());
+}
+
+#[test]
 fn there_is_no_version_key() {
     // FR-CFG-1: an unknown key like any other.
     let d = errors(&format!("version = 2\n{MINIMAL}"));

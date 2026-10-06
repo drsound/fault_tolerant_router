@@ -318,6 +318,10 @@ pub fn validate(text: &str, raw: raw::Config) -> Result<Config, Vec<Diagnostic>>
             let p = s.into_inner();
             if !p.is_absolute() {
                 cx.err(Some(&span), "state_dir", "must be an absolute path");
+            } else if p.components().any(|c| c == std::path::Component::ParentDir) {
+                // FR-CFG-5 checks a directory not created yet through the
+                // existing one that will hold it, which `..` would escape.
+                cx.err(Some(&span), "state_dir", "must not contain `..`");
             }
             p
         }
