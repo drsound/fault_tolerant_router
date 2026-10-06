@@ -463,6 +463,12 @@ fn kernel_at_least(major: u32, minor: u32) -> Result<bool> {
 }
 
 fn nft_block(page: &str) -> String {
+    nft_block_in(page, "")
+}
+
+/// The first nft block after `heading`.
+fn nft_block_in(page: &str, heading: &str) -> String {
+    let page = &page[page.find(heading).expect("the heading")..];
     let start = page.find("```nft\n").expect("an nft block") + "```nft\n".len();
     let end = page[start..].find("```").expect("a closing fence");
     page[start..start + end].to_owned()
@@ -561,6 +567,45 @@ fn dist3_recipe_port_forwarding(fam: Family) -> Result<()> {
     Ok(())
 }
 
+/// DIST-3: the IPv4 rule of the reverse-path recipe, with the topology's
+/// uplinks and LAN in place of the page's: a packet arriving on A with a LAN
+/// source reaches the router despite loose mode, and the rule drops it.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn dist3_recipe_ipv4_internal_sources() -> Result<()> {
+    let t = build();
+    let f = t.start_polywan(&polywan::ipv4(&ab()))?;
+    f.wait_installed(&t)?;
+    t.router().nft(
+        "table inet t_spoof {\n  counter c {}\n  chain input {\n    type filter hook input priority 0; policy accept;\n    ip saddr 198.51.100.99 icmp type echo-request counter name c\n  }\n}\n",
+    )?;
+    let a = address(&t, Family::V4, Uplink::A)?;
+    t.ns(Node::IspA).ip("addr add 198.51.100.99/32 dev wan")?;
+    let spoof = || -> Result<u64> {
+        let _ = t
+            .ns(Node::IspA)
+            .output("ping", ["-n", "-c", "2", "-W", "1", "-I", "198.51.100.99", &a])?;
+        t.router().counter("inet", "t_spoof", "c")
+    };
+    assert!(
+        spoof()? >= 2,
+        "loose mode lets a LAN source arriving on an uplink through"
+    );
+    let mut ruleset = nft_block_in(REVERSE_PATH_FILTER, "## IPv4");
+    for (page, here) in [
+        ("\"wan0\"", "\"wana\""),
+        ("\"wan1\"", "\"wanb\""),
+        ("192.168.1.0/24", "198.51.100.0/24"),
+    ] {
+        anyhow::ensure!(ruleset.contains(page), "the recipe has no {page}");
+        ruleset = ruleset.replace(page, here);
+    }
+    t.router().nft(&ruleset)?;
+    let before = t.router().counter("inet", "t_spoof", "c")?;
+    assert_eq!(spoof()?, before, "the rule drops a LAN source arriving on an uplink");
+    Ok(())
+}
+
 /// DIST-3: the IPv6 reverse-path filter recipe, loaded as published, with an
 /// empty active set and no operating-system default route, as AS-30: ICMP
 /// and TCP probe replies, connections forwarded to the LAN server and to a
@@ -628,7 +673,7 @@ fn dist3_recipe_reverse_path_filter() -> Result<()> {
 
     let mut f = t.start_polywan(&config(None))?;
     f.wait_installed(&t)?;
-    let recipe = nft_block(REVERSE_PATH_FILTER);
+    let recipe = nft_block_in(REVERSE_PATH_FILTER, "## IPv6");
     t.router().nft(&recipe)?;
     let before = t.router().counter("inet", "t_spoof", "c")?;
     assert_eq!(spoof()?, before, "the filter drops a LAN source arriving on an uplink");

@@ -8,6 +8,17 @@ For IPv4, PolyWAN sets the kernel's filter on each uplink to loose mode (`rp_fil
 
 The `from` rules that PolyWAN installs for every uplink address also serve this check: replies to the probes carry no mark, and pass the check through the rule of the probe's source address. Do not remove or override those rules.
 
+Loose mode does not stop spoofed internal addresses: a packet arriving on an uplink with the source address of a LAN host passes, because a route leads back to that address, through the LAN. Drop such packets with nftables, naming your uplinks and the IPv4 networks of your downlinks:
+
+```nft
+table inet antispoof {
+	chain prerouting {
+		type filter hook prerouting priority -140; policy accept;
+		iifname { "wan0", "wan1" } ip saddr { 192.168.1.0/24 } drop
+	}
+}
+```
+
 ## IPv6: an nftables filter
 
 The kernel has no reverse-path filter for IPv6; nftables provides one with a `fib` lookup. It must include the packet mark in the lookup, and run after PolyWAN's prerouting chain (priority −150), which sets that mark:
@@ -34,4 +45,4 @@ On Linux 7.1, use the filter only with no IPv6 default route in the main table: 
 
 ## What was tested
 
-This exact ruleset runs in the acceptance suite on Linux 6.1, 7.0 and 7.1, with static gateways, an empty active set and no default route of the operating system through PolyWAN's uplinks, the case where a wrong lookup shows. Other IPv6 default routes stay in the main table, except on 7.1, where none is left, as described above. Connections forwarded to a LAN server and connections to a service of the router through an uplink, ICMP and TCP probe replies, Router Advertisements and duplicate address detection on the uplinks, and outgoing connections from the LAN once an uplink is active again, all pass, and a packet arriving on an uplink with a LAN source address is dropped.
+This exact ruleset runs in the acceptance suite on Linux 6.1, 7.0 and 7.1, with static gateways, an empty active set and no default route of the operating system through PolyWAN's uplinks, the case where a wrong lookup shows. Other IPv6 default routes stay in the main table, except on 7.1, where none is left, as described above. Connections forwarded to a LAN server and connections to a service of the router through an uplink, ICMP and TCP probe replies, Router Advertisements and duplicate address detection on the uplinks, and outgoing connections from the LAN once an uplink is active again, all pass, and a packet arriving on an uplink with a LAN source address is dropped. The IPv4 rule above runs in the suite too: a packet arriving on an uplink with a LAN source address reaches the router without it, loose mode notwithstanding, and is dropped with it.
