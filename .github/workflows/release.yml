@@ -19,9 +19,24 @@ jobs:
   check:
     name: tag, change log and crate
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: CI passed on the tagged commit
+        # The quality gates of §14.4 run on the branch push (CI skips
+        # tags): a release needs a successful CI run of the same commit.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
+            --json conclusion --jq '[.[] | select(.conclusion == "success")] | length')
+          if [ "$passed" = 0 ]; then
+            echo "::error::no successful CI run for $GITHUB_SHA: wait for it (or fix it), then re-run this workflow"
+            exit 1
+          fi
       - name: The tag names the workspace version
         # A pre-release (2.0.0-rc.1) takes the change log section of its
         # release; a release needs that section dated.
