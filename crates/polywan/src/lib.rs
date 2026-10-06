@@ -1,6 +1,11 @@
 //! PolyWAN 2.0: a multi-uplink policy routing daemon for Linux
 //! routers. The behaviour is specified in SPEC.md; requirement identifiers
 //! (for example FR-ROUTE-3) in comments refer to it.
+//!
+//! This library is the implementation of the `polywan` binary, published
+//! with it for `cargo install`; it is not a stable API, and a release may
+//! change any of it. The binary's interfaces (configuration, command line,
+//! HTTP API) are the compatible ones.
 
 #![forbid(unsafe_code)]
 
