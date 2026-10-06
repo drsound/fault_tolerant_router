@@ -988,6 +988,48 @@ fn api_events_follow_across_a_restart_and_an_eviction() -> Result<()> {
     Ok(())
 }
 
+per_family!(fr_probe_2_targets_of_the_router_or_a_downlink_network_are_refused);
+
+/// FR-PROBE-2: a probe target that is an address of the router, or inside
+/// the network of a downlink, makes online `check-config` fail and startup
+/// refuse, and a reload that introduces one is rejected, the running
+/// configuration kept.
+fn fr_probe_2_targets_of_the_router_or_a_downlink_network_are_refused(fam: Family) -> Result<()> {
+    let t = build();
+    let local = address(&t, fam, Uplink::A)?;
+    let (lan, public) = match fam {
+        Family::V4 => ("198.51.100.77", "1.1.1.1"),
+        Family::V6 => ("2001:db8:1::77", "2606:4700:4700::1111"),
+    };
+    let config = |target: &str| {
+        let health = HealthSpec::fast().with(&format!(
+            "required_reachable = 1\n[health.{fam}]\ntargets = [\"icmp:{target}\", \"icmp:{public}\"]\n"
+        ));
+        polywan::config(&ab(), &[fam], &health, "", "")
+    };
+    assert_refused(&t, &config(&local), "is an address of the router (wana)")?;
+    assert_refused(&t, &config(lan), "the network of downlink lan")?;
+
+    let f = t.start_polywan(&polywan::family(&ab(), fam))?;
+    f.wait_installed(&t)?;
+    let digest = f.status()?["config_digest"].clone();
+    for (target, needle) in [
+        (local.as_str(), "is an address of the router"),
+        (lan, "the network of downlink lan"),
+    ] {
+        f.write_config(&config(target))?;
+        let out = f.reload_cli()?;
+        let text = polywan::output_text(&out);
+        assert!(!out.status.success() && text.contains(needle), "{text}");
+        assert_eq!(
+            f.status()?["config_digest"],
+            digest,
+            "the running configuration is kept"
+        );
+    }
+    Ok(())
+}
+
 /// The recipes of the documentation that make packet-level claims (DIST-3):
 /// their scenarios load the first `nft` block of the page as it is
 /// published.

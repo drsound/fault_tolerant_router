@@ -291,6 +291,8 @@ pub struct ReloadContext {
     pub structural: Structural,
     pub state_dir: PathBuf,
     pub nft_path: PathBuf,
+    /// The router's addresses when the reload was requested (FR-PROBE-2).
+    pub local_addresses: Vec<checks::LocalAddress>,
 }
 
 async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> ReloadOutcome {
@@ -315,6 +317,10 @@ async fn validate(seq: u64, path: &std::path::Path, running: ReloadContext) -> R
         }
         // FR-CFG-5: nothing configured runs before its ownership is verified.
         let errors = checks::runnable(&path_owned, &new, &crate::subprocess::inherited_descriptors()).errors();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let errors = checks::targets(&running.local_addresses, &new);
         if !errors.is_empty() {
             return Err(errors);
         }

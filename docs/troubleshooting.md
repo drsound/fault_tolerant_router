@@ -27,6 +27,7 @@ What PolyWAN installed can be read with `ip rule show`, `ip -6 rule show`, `ip r
 - systemd-networkd runs with `ManageForeignRoutingPolicyRules` or `ManageForeignRoutes` enabled (the default): it would delete PolyWAN's rules and routes. The message gives the fix, a drop-in `/etc/systemd/networkd.conf.d/polywan.conf` with both set to `no` in `[Network]`, followed by a restart of systemd-networkd.
 - A collision: a rule in PolyWAN's priority range, or a route in its table range, that another tool installed. Move PolyWAN's range (`rule_priority_base`, `table_base`) or the other tool's.
 - A flowtable that covers a configured uplink or downlink.
+- A probe target that is an address of the router, or inside the network of a downlink.
 - PolyWAN rules that do not match the configuration, left by an earlier installation whose manifest is gone: run `polywan cleanup` with the current configuration, as the message says, then start.
 - The instance lock is held: another `polywan run`, or a `cleanup`, `forget-uplink` or `notify-test --offline`, is running.
 - A state file in `/var/lib/polywan` is corrupt or of an unknown version, for example after a downgrade. `polywan run --reset-state` discards the drain state and the health checkpoints, and a corrupt manifest; see [upgrades and downgrades](installation.md#upgrades-and-downgrades).

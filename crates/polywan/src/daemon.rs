@@ -525,6 +525,9 @@ pub async fn run(opts: Options) -> Result<()> {
         findings.extend(checks::adoptable(&system, layout, cfg.routing.route_protocol));
     }
     findings.extend(checks::downlinks(&system, &cfg));
+    findings
+        .errors
+        .extend(checks::targets(&checks::local_addresses(&system), &cfg));
     findings.extend(checks::accept_ra(&cfg, sysctl::read));
     if checks::networkd_running() {
         findings.extend(checks::networkd(Path::new("/")));
@@ -759,6 +762,7 @@ pub async fn check_system(path: &Path, cfg: &Config) -> Result<checks::Findings>
     let families: Vec<Family> = Family::ALL.into_iter().filter(|x| cfg.manages(*x)).collect();
     f.extend(checks::routing(&system, layout, cfg.routing.route_protocol, &families));
     f.extend(checks::downlinks(&system, cfg));
+    f.errors.extend(checks::targets(&checks::local_addresses(&system), cfg));
     f.extend(checks::accept_ra(cfg, sysctl::read));
     if checks::networkd_running() {
         f.extend(checks::networkd(Path::new("/")));
@@ -2388,6 +2392,7 @@ impl Daemon {
             structural: self.cfg.structural(),
             state_dir: self.cfg.state_dir.clone(),
             nft_path: self.cfg.firewall.nft_path.clone(),
+            local_addresses: checks::local_addresses(&self.system),
         };
         self.lanes.validate_reload(seq, self.config_path.clone(), context);
         self.reload = Some(ReloadPhase::Validating(seq));

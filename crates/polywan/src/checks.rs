@@ -1,6 +1,6 @@
 //! Prerequisite checks of startup and `check-config` (SPEC.md PLAT-1,
 //! PLAT-2, FR-CFG-5, FR-ROUTE-6, FR-COEX-1, FR-CT-1, FR-CT-2, FR-NAT-4,
-//! FR-DISC-8). Errors refuse startup; warnings are logged.
+//! FR-DISC-8, FR-PROBE-2). Errors refuse startup; warnings are logged.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -409,6 +409,65 @@ pub fn gateway_causes(interface: &str, read: impl Fn(&str) -> std::io::Result<St
     }
 }
 
+/// An address of the router, with its prefix length and interface: what
+/// the probe-target check (FR-PROBE-2) compares against, also for a reload
+/// validated away from the observed system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAddress {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+    pub interface: String,
+}
+
+/// Every address of the router in `system`.
+pub fn local_addresses(system: &System) -> Vec<LocalAddress> {
+    system
+        .addresses
+        .values()
+        .filter_map(|a| {
+            Some(LocalAddress {
+                address: a.address,
+                prefix_len: a.prefix_len,
+                interface: system.links.get(&a.index)?.name.clone(),
+            })
+        })
+        .collect()
+}
+
+/// FR-PROBE-2: a probe target that is an address of the router would be
+/// answered by the router itself, and one inside a downlink's network
+/// would test the LAN rather than the internet. Checked against the
+/// addresses present when the configuration is validated.
+pub fn targets(locals: &[LocalAddress], config: &Config) -> Vec<String> {
+    let mut errors = Vec::new();
+    for u in &config.uplinks {
+        for family in u.families() {
+            for t in u.health.targets(family) {
+                let a = t.addr();
+                if let Some(l) = locals.iter().find(|l| l.address == a) {
+                    errors.push(format!(
+                        "uplink {}: the {family} probe target {t} is an address of the router ({}): the router would answer its probes itself (FR-PROBE-2)",
+                        u.name, l.interface
+                    ));
+                } else if let Some(l) = locals.iter().find(|l| {
+                    config.downlinks.contains(&l.interface)
+                        && l.address.is_ipv4() == a.is_ipv4()
+                        && network(l.address, l.prefix_len) == network(a, l.prefix_len)
+                }) {
+                    errors.push(format!(
+                        "uplink {}: the {family} probe target {t} is inside {}/{}, the network of downlink {}: its probes would test the LAN, not the internet (FR-PROBE-2)",
+                        u.name,
+                        network(l.address, l.prefix_len),
+                        l.prefix_len,
+                        l.interface
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// FR-DISC-8: connected prefixes of the downlinks must be in main.
 pub fn downlinks(system: &System, config: &Config) -> Findings {
     let mut f = Findings::default();
@@ -695,6 +754,48 @@ mod tests {
             ..layout
         };
         assert!(!adoptable(&s, other_tables, 249).errors.is_empty());
+    }
+
+    #[test]
+    fn probe_targets_are_neither_local_nor_in_a_downlink_network() {
+        let cfg = crate::config::parse(
+            "[[downlink]]\ninterface = \"lan\"\n\
+             [[uplink]]\nid = 1\nname = \"a\"\ninterface = \"wana\"\npriority = 1\n\
+             [uplink.ipv4]\n[uplink.ipv6]\nnat = \"masquerade\"\n\
+             [uplink.health.ipv4]\ntargets = [\"icmp:198.51.100.7\", \"tcp:192.0.2.9:443\", \"icmp:1.1.1.1\"]\n\
+             [[uplink]]\nid = 2\nname = \"b\"\ninterface = \"wanb\"\npriority = 1\n\
+             [uplink.ipv4]\n",
+        )
+        .unwrap();
+        let local = |a: &str, len, i: &str| LocalAddress {
+            address: a.parse().unwrap(),
+            prefix_len: len,
+            interface: i.into(),
+        };
+        let mut locals = vec![
+            local("192.0.2.9", 24, "wana"),
+            local("198.51.100.1", 24, "lan"),
+            local("2001:db8:1::1", 64, "lan"),
+        ];
+        let errors = targets(&locals, &cfg);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].contains("icmp:198.51.100.7")
+                && errors[0].contains("198.51.100.0/24, the network of downlink lan")
+        );
+        assert!(errors[1].contains("tcp:192.0.2.9:443") && errors[1].contains("an address of the router (wana)"));
+        // Uplink b's default targets, and a's IPv6 ones, are neither.
+        locals.push(local("1.1.1.0", 24, "dmz"));
+        assert_eq!(
+            targets(&locals, &cfg).len(),
+            2,
+            "a network of an interface that is no downlink"
+        );
+        locals.push(local("2606:4700:4700::1111", 128, "lo"));
+        let errors = targets(&locals, &cfg);
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[2].contains("ipv6 probe target icmp:2606:4700:4700::1111"));
+        assert!(targets(&[], &cfg).is_empty());
     }
 
     #[test]
