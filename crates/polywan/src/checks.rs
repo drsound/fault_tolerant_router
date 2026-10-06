@@ -577,20 +577,41 @@ pub fn networkd(root: &Path) -> Findings {
 /// Whether systemd-networkd runs in this network namespace (by process
 /// name; an instance in another namespace manages other interfaces).
 pub fn networkd_running() -> bool {
-    let own = fs::read_link("/proc/self/ns/net").ok();
+    let Some(own) = netns_identity(Path::new("/proc/self")) else {
+        return false;
+    };
     let Ok(entries) = fs::read_dir("/proc") else {
         return false;
     };
     entries.flatten().any(|e| {
         e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit())
             && fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "systemd-network")
-            && fs::read_link(e.path().join("ns/net")).ok() == own
+            && netns_identity(&e.path()) == Some(own)
     })
+}
+
+/// The network namespace of a `/proc/PID` directory, as the inode of its
+/// `net/dev`: an entry every namespace registers anew. `ns/net` would name
+/// the namespace itself, but reading it needs ptrace access, which the
+/// packaged unit's capabilities deny for networkd (another user, other
+/// capabilities, no `CAP_SYS_PTRACE`).
+fn netns_identity(proc: &Path) -> Option<u64> {
+    fs::metadata(proc.join("net/dev")).ok().map(|m| m.ino())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_shares_its_own_network_namespace() {
+        let own = netns_identity(Path::new("/proc/self"));
+        assert!(own.is_some());
+        assert_eq!(
+            netns_identity(&Path::new("/proc").join(std::process::id().to_string())),
+            own
+        );
+    }
 
     #[test]
     fn ownership_follows_symbolic_links_and_their_directories() {
