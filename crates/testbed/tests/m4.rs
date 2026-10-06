@@ -841,3 +841,148 @@ fn impl6_lock_held_across_failed_starts_of_the_unit() -> Result<()> {
     assert_eq!(identity(&f)?, before, "kept by the stop");
     Ok(())
 }
+
+/// `polywan events --follow --json` running in the background: its output
+/// lines as JSON values (a string for a line that is not JSON) and its
+/// standard error; killed on drop.
+struct Follower {
+    child: std::process::Child,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+impl Follower {
+    fn start(f: &polywan::Polywan) -> Result<Follower> {
+        use std::io::{BufRead, Read};
+        let socket = f.status_socket().display().to_string();
+        let mut child = f.cli_child(&["events", "--follow", "--json", "--socket", &socket])?;
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stdout = std::io::BufReader::new(child.stdout.take().context("stdout")?);
+        let sink = lines.clone();
+        std::thread::spawn(move || {
+            for line in stdout.lines().map_while(std::io::Result::ok) {
+                let v = serde_json::from_str(&line).unwrap_or(serde_json::Value::String(line));
+                sink.lock().expect("lines").push(v);
+            }
+        });
+        let mut err = child.stderr.take().context("stderr")?;
+        let stderr = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = err.read_to_string(&mut s);
+            s
+        });
+        Ok(Follower {
+            child,
+            lines,
+            stderr: Some(stderr),
+        })
+    }
+
+    fn lines(&self) -> Vec<serde_json::Value> {
+        self.lines.lock().expect("lines").clone()
+    }
+
+    /// The sequence number of the last event printed.
+    fn last_seq(&self) -> Option<u64> {
+        self.lines().iter().rev().find_map(|l| l["seq"].as_u64())
+    }
+
+    fn signal(&self, sig: &str) -> Result<()> {
+        testbed::netns::host("kill", [sig, &self.child.id().to_string()]).map(|_| ())
+    }
+
+    /// Kills it and returns its standard error.
+    fn finish(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default()
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// FR-API-2 and §9, carried over from M3: `events --follow --json` keeps
+/// following while the daemon stops and starts again, then prints a
+/// `reset` notice with the new instance followed by the new history; and,
+/// stopped (SIGSTOP) while drains and undrains emit more than the ring's
+/// 1000 events, a `truncated` notice when it resumes, then the events that
+/// remain, up to the latest.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn api_events_follow_across_a_restart_and_an_eviction() -> Result<()> {
+    let t = build();
+    let mut f = t.start_polywan(&polywan::ipv4(&ab()))?;
+    f.wait_installed(&t)?;
+    let follower = Follower::start(&f)?;
+    let event = |l: &serde_json::Value, kind: &str| l["type"] == kind;
+    t.wait_for("the history", Duration::from_secs(10), || {
+        Ok(follower.lines().iter().any(|l| event(l, "daemon_started")))
+    })?;
+    let first = follower.lines()[0]["instance"]
+        .as_str()
+        .context("an instance")?
+        .to_owned();
+
+    // A restart: the follower waits, then reports the new instance.
+    f.stop()?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let reset = t.wait_for("the reset notice", Duration::from_secs(20), || {
+        Ok(follower.lines().iter().any(|l| l["notice"] == "reset"))
+    });
+    let lines = follower.lines();
+    reset.with_context(|| format!("{lines:#?}"))?;
+    let at = lines.iter().position(|l| l["notice"] == "reset").context("reset")?;
+    let second = lines[at]["instance"].as_str().context("its instance")?.to_owned();
+    assert_ne!(second, first);
+    assert!(
+        lines[at + 1..]
+            .iter()
+            .any(|l| event(l, "daemon_started") && l["instance"] == second.as_str()),
+        "{lines:#?}"
+    );
+    assert!(lines[at + 1..].iter().all(|l| l["instance"] == second.as_str()));
+
+    // An eviction while the follower does not read.
+    let latest = f.latest_event()?;
+    t.wait_for("the follower at the latest event", Duration::from_secs(10), || {
+        Ok(follower.last_seq() == Some(latest))
+    })?;
+    follower.signal("-STOP")?;
+    let control = f.control_socket();
+    let mut ops = 0;
+    while f.latest_event()? < latest + 1100 {
+        for _ in 0..100 {
+            for action in ["drain", "undrain"] {
+                let (code, body) = testbed::agent::http(&control, "POST", &format!("/v1/uplinks/b/{action}"), "")?;
+                anyhow::ensure!(code == 200, "{action}: {code} {body}");
+                ops += 1;
+            }
+        }
+    }
+    let before = follower.lines().len();
+    follower.signal("-CONT")?;
+    let end = f.latest_event()?;
+    t.wait_for("the follower at the latest event", Duration::from_secs(20), || {
+        Ok(follower.last_seq() == Some(end))
+    })?;
+    let lines = follower.lines()[before..].to_vec();
+    let at = lines
+        .iter()
+        .position(|l| l["notice"] == "truncated")
+        .with_context(|| format!("no truncated notice after {ops} drains and undrains: {lines:#?}"))?;
+    let seqs: Vec<u64> = lines.iter().filter_map(|l| l["seq"].as_u64()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    let resumed = lines[at + 1]["seq"].as_u64().context("an event after the notice")?;
+    assert!(resumed > latest + 1, "events were evicted: {resumed}");
+    assert!(lines.iter().all(|l| l["notice"] != "reset"));
+    let stderr = follower.finish();
+    assert_eq!(stderr.matches("waiting for the daemon").count(), 1, "{stderr}");
+    f.stop()?;
+    Ok(())
+}

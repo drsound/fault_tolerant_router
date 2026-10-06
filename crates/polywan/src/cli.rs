@@ -180,9 +180,12 @@ fn print_event(e: &Value) {
 /// `events`: the history, then with `follow` each new event; with `json`,
 /// one JSON object per line: the events as the API returns them, and a
 /// `notice` record for a restart (`reset`) or evicted events (`truncated`).
+/// A follower outlives the daemon's stops and restarts: while the socket
+/// does not answer, it asks again every second.
 pub async fn events(socket: &Path, follow: bool, json: bool) -> Result<()> {
     let mut instance: Option<String> = None;
     let mut after: Option<u64> = None;
+    let mut waiting = false;
     loop {
         let mut query = Vec::new();
         if let Some(i) = &instance {
@@ -200,7 +203,19 @@ pub async fn events(socket: &Path, follow: bool, json: bool) -> Result<()> {
             query.push(format!("wait={}", wait.as_secs()));
         }
         let path = format!("/v1/events?{}", query.join("&"));
-        let page = get(socket, &path, api::DEADLINE + wait).await?;
+        let page = match get(socket, &path, api::DEADLINE + wait).await {
+            Ok(page) => page,
+            Err(e) if follow && unavailable(&e) => {
+                if !waiting {
+                    eprintln!("polywan: {e:#}; waiting for the daemon");
+                    waiting = true;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        waiting = false;
         let notice = |kind: &str, text: &str| {
             if json {
                 crate::say!("{}", serde_json::json!({"notice": kind, "instance": page["instance"]}));
@@ -228,6 +243,18 @@ pub async fn events(socket: &Path, follow: bool, json: bool) -> Result<()> {
         if !follow && events.len() < crate::events::RING_EVENTS {
             return Ok(());
         }
+    }
+}
+
+/// Whether a request failed because no daemon answers on the socket (not
+/// listening, gone, or closed during the exchange) rather than because
+/// access was denied or the daemon refused it.
+fn unavailable(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    match e.downcast_ref::<client::Error>() {
+        Some(client::Error::Connect(e)) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused),
+        Some(client::Error::Exchange(_)) => true,
+        None => false,
     }
 }
 

@@ -72,7 +72,8 @@ pub enum Command {
     },
     /// Show recent events (through the status socket by default).
     Events {
-        /// Keep waiting for new events.
+        /// Keep waiting for new events, also while the daemon stops or
+        /// restarts.
         #[arg(long)]
         follow: bool,
         /// One JSON object per line.
