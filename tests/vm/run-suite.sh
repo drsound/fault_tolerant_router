@@ -4,7 +4,7 @@
 # machine booted with the kernel of a root filesystem made by build-rootfs.sh.
 #
 # Usage:
-#   tests/vm/run-suite.sh [--host | --vm ROOTFS | --build-only] [--bindir DIR] [--unit] [-- TEST-ARGS...]
+#   tests/vm/run-suite.sh [--host | --vm ROOTFS | --build-only] [--bindir DIR] [--unit [--installed]] [-- TEST-ARGS...]
 #
 # The build runs as the invoking user; running the suite needs root, so the
 # script uses sudo when it is not already root. Extra arguments after "--"
@@ -14,13 +14,16 @@
 # skips the build. --unit runs the M1 to M4 scenarios on this host with the
 # daemon started as the shipped packaging/polywan.service (AS-34; copied
 # next to the binaries), once, with the default fwmark_mask unless
-# POLYWAN_TEST_MASKS says otherwise.
+# POLYWAN_TEST_MASKS says otherwise. --installed starts the daemon and the
+# unit that the polywan package installed instead of the suite's (AS-34
+# against the package, tests/package/lifecycle.sh).
 set -eu
 
 mode=host
 rootfs=
 prebuilt=
 unit=
+installed=
 while [ $# -gt 0 ]; do
   case $1 in
     --host) mode=host; shift ;;
@@ -28,6 +31,7 @@ while [ $# -gt 0 ]; do
     --build-only) mode=build; shift ;;
     --bindir) prebuilt=${2:?--bindir needs a directory}; shift 2 ;;
     --unit) unit=1; shift ;;
+    --installed) installed=1; shift ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -77,15 +81,20 @@ fi
 if [ -n "$unit" ]; then
   # systemd as PID 1 is needed: not in the virtme-ng guest.
   [ "$mode" = host ] || { echo "--unit runs on the host only" >&2; exit 2; }
+  [ -z "$installed" ] || [ -x /usr/bin/polywan ] || { echo "--installed: the polywan package is not installed" >&2; exit 2; }
   sudo=
   [ "$(id -u)" -eq 0 ] || sudo=sudo
   cd /tmp
+  daemon=$bindir/polywan unit_file=$bindir/polywan.service
+  if [ -n "$installed" ]; then
+    daemon=/usr/bin/polywan unit_file=/usr/lib/systemd/system/polywan.service
+  fi
   status=0
   for mask in ${POLYWAN_TEST_MASKS:-0x00ff0000}; do
     echo "== M1 to M4 scenarios under the unit with fwmark_mask $mask"
     for s in m1 m2 m3 m4; do
-      $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$bindir/polywan" \
-        POLYWAN_TEST_UNIT="$bindir/polywan.service" POLYWAN_TEST_FWMARK_MASK="$mask" \
+      $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$daemon" \
+        POLYWAN_TEST_UNIT="$unit_file" POLYWAN_TEST_FWMARK_MASK="$mask" \
         "$bindir/$s" --ignored "$@" || status=1
     done
   done
