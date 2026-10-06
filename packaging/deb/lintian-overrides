@@ -1,0 +1,4 @@
+# Not uploaded to Debian: there are no Debian bugs to close.
+polywan: initial-upload-closes-no-bugs
+# A static-pie executable (SPEC.md PLAT-3), not a shared library.
+polywan: shared-library-lacks-prerequisites [usr/bin/polywan]

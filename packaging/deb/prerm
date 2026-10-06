@@ -1,0 +1,52 @@
+#!/bin/sh
+# prerm of the polywan package (SPEC.md DIST-1): removal requests the
+# service's stop, then runs `polywan cleanup` with the default
+# configuration while the executable still exists. Cleanup is skipped when
+# the daemon still runs or the networking is not the target system's (a
+# chroot or an alternative root); a skipped or failed cleanup is reported
+# with recovery instructions and never prevents the removal. An upgrade
+# leaves the daemon running: postinst restarts it.
+set -e
+
+STATE=/var/lib/polywan
+CONFIG=/etc/polywan/config.toml
+
+report() {
+	echo "polywan: $1; PolyWAN's rules, routes, nftables table and sysctl changes may remain." >&2
+	echo "polywan: to remove them, install PolyWAN again (the package or the static binary), make $CONFIG describe this installation and run: polywan cleanup" >&2
+}
+
+cleanup() {
+	chroot=0
+	ischroot || chroot=$?
+	# ischroot: 0 in a chroot, 1 outside, 2 when it cannot tell.
+	if [ -n "$DPKG_ROOT" ] || [ "$chroot" -ne 1 ]; then
+		if [ -e "$STATE/manifest.json" ]; then
+			report "cleanup skipped: the networking of this environment may not be the target system's (a chroot or an alternative root)"
+		fi
+		return 0
+	fi
+	if [ -d /run/systemd/system ] && systemctl is-active --quiet polywan.service; then
+		report "cleanup skipped: polywan.service is still running (its stop was denied or failed)"
+		return 0
+	fi
+	if [ ! -e "$CONFIG" ]; then
+		if [ -e "$STATE/manifest.json" ]; then
+			report "cleanup skipped: $CONFIG does not exist"
+		fi
+		return 0
+	fi
+	# The instance lock refuses cleanup while a daemon runs outside systemd.
+	if ! polywan cleanup --config "$CONFIG"; then
+		report "cleanup failed (see above); the manifest in $STATE is kept"
+	fi
+}
+
+if [ "$1" = remove ]; then
+	if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ]; then
+		deb-systemd-invoke stop polywan.service >/dev/null || true
+	fi
+	cleanup
+fi
+
+exit 0

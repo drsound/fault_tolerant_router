@@ -1,0 +1,30 @@
+#!/bin/sh
+# postinst of the polywan package (SPEC.md DIST-1): the polywan group; the
+# unit installed neither enabled nor started; an upgrade restarts only a
+# running daemon and keeps the administrator's enablement and masking. The
+# unit handling is what debhelper writes for dh_installsystemd --no-enable
+# --no-start with restart after upgrade; deb-systemd-invoke honours local
+# service policy (policy-rc.d).
+set -e
+
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ] || [ "$1" = abort-deconfigure ] || [ "$1" = abort-remove ]; then
+	# The basename, so that an administrator's /etc/sysusers.d/polywan.conf
+	# takes precedence.
+	systemd-sysusers ${DPKG_ROOT:+--root="$DPKG_ROOT"} polywan.conf
+
+	if deb-systemd-helper debian-installed polywan.service; then
+		if deb-systemd-helper --quiet was-enabled polywan.service; then
+			deb-systemd-helper enable polywan.service >/dev/null || true
+		fi
+	fi
+	deb-systemd-helper update-state polywan.service >/dev/null || true
+
+	if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null || true
+		if [ -n "$2" ]; then
+			deb-systemd-invoke try-restart polywan.service >/dev/null || true
+		fi
+	fi
+fi
+
+exit 0

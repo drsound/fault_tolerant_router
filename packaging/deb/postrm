@@ -1,0 +1,71 @@
+#!/bin/sh
+# postrm of the polywan package (SPEC.md DIST-1). Purge deletes
+# /var/lib/polywan only while holding the instance lock, which excludes the
+# daemon and the offline commands, and only when no manifest exists: a
+# manifest, also a corrupt or dangling one, means that PolyWAN's routing
+# may still be installed and that `polywan cleanup` needs it. Purge never
+# follows a symbolic link to the state directory and never deletes
+# /etc/polywan or configured paths elsewhere. The polywan group stays.
+set -e
+
+STATE=/var/lib/polywan
+LOCK=/run/polywan/lock
+
+kept() {
+	echo "polywan: $STATE is kept: $1" >&2
+}
+
+purge_state() {
+	if [ -n "$DPKG_ROOT" ]; then
+		[ -e "$DPKG_ROOT$STATE" ] && kept "purge does not handle an alternative root"
+		return 0
+	fi
+	if [ -L "$STATE" ]; then
+		kept "it is a symbolic link"
+		return 0
+	fi
+	[ -e "$STATE" ] || return 0
+	if [ -L /run/polywan ] || [ -L "$LOCK" ]; then
+		kept "the instance lock is a symbolic link"
+		return 0
+	fi
+	status=0
+	(
+		# The lock as the daemon creates it: a root file with mode 0600,
+		# held until the subshell exits.
+		umask 077
+		mkdir -p -m 0755 /run/polywan
+		exec 9>>"$LOCK"
+		flock -n 9 || exit 75
+		ls -A "$STATE" >/dev/null || exit 74
+		for name in manifest.json manifest.tmp; do
+			if [ -e "$STATE/$name" ] || [ -L "$STATE/$name" ]; then
+				exit 73
+			fi
+		done
+		rm -rf --one-file-system -- "$STATE"
+	) || status=$?
+	case $status in
+	0) ;;
+	73) kept "it holds a manifest: PolyWAN's routing may still be installed. Install PolyWAN again, run polywan cleanup, then delete $STATE" ;;
+	74) kept "it cannot be inspected" ;;
+	75) kept "the instance lock is held: a PolyWAN daemon or command is running" ;;
+	*) kept "purging it failed (status $status)" ;;
+	esac
+}
+
+case "$1" in
+remove)
+	if [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null || true
+	fi
+	;;
+purge)
+	if command -v deb-systemd-helper >/dev/null; then
+		deb-systemd-helper purge polywan.service >/dev/null || true
+	fi
+	purge_state
+	;;
+esac
+
+exit 0

@@ -149,8 +149,27 @@ jobs:
             --config 'target.${{ matrix.target }}.linker="rust-lld"'
           file target/${{ matrix.target }}/release/polywan
           file target/${{ matrix.target }}/release/polywan | grep -Eq 'statically linked|static-pie linked'
+      - name: Debian package
+        # DIST-1. The example the package installs must be the text that
+        # its binary's generate-config prints (checked where it runs).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lintian
+          case ${{ matrix.target }} in
+            x86_64-*) arch=amd64 ;;
+            aarch64-*) arch=arm64 ;;
+            armv7-*) arch=armhf ;;
+          esac
+          packaging/deb/build.sh "$arch" target/${{ matrix.target }}/release/polywan target/deb
+          lintian --fail-on error,warning target/deb/*.deb
+          if [ "$arch" = amd64 ]; then
+            dpkg-deb -x target/deb/*.deb target/deb/root
+            cmp <(target/deb/root/usr/bin/polywan generate-config) target/deb/root/usr/share/doc/polywan/examples/config.toml
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: polywan-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/polywan
+          path: |
+            target/${{ matrix.target }}/release/polywan
+            target/deb/*.deb
           if-no-files-found: error
