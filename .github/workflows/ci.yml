@@ -92,6 +92,10 @@ jobs:
         env:
           # The scenarios wait more than they compute.
           POLYWAN_PARALLEL_MASKS: 1
+      - name: The scenarios under the packaged unit (AS-34)
+        # With the binaries of the step above, also when it failed.
+        if: ${{ !cancelled() }}
+        run: tests/vm/run-suite.sh --host --bindir target/netns-suite --unit
 
   netns-minimum:
     name: namespace suite (Linux 6.1, nftables 1.0.6)

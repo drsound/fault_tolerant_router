@@ -21,6 +21,7 @@ pub mod polywan;
 pub mod sendmail;
 pub mod topology;
 pub mod traffic;
+pub mod unit;
 
 pub use netns::Ns;
 pub use plan::{Family, Node, Uplink};

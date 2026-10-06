@@ -157,6 +157,8 @@ fn impl10_notifications_without_systemd() -> Result<()> {
     let config = polywan::config(&ab(), &[Family::V4], &HealthSpec::fast(), "", &firewall);
     f.write_config(&config)?;
     f.set_env("NOTIFY_SOCKET", &path.display().to_string());
+    // Without systemd also when the suite runs under the unit.
+    f.direct();
     // A dry run is one-shot and never notifies.
     succeeded(f.cli_config(&["run", "--dry-run"])?)?;
     assert_eq!(notifications(&socket), Vec::<String>::new());

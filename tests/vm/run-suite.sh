@@ -4,25 +4,30 @@
 # machine booted with the kernel of a root filesystem made by build-rootfs.sh.
 #
 # Usage:
-#   tests/vm/run-suite.sh [--host | --vm ROOTFS | --build-only] [--bindir DIR] [-- TEST-ARGS...]
+#   tests/vm/run-suite.sh [--host | --vm ROOTFS | --build-only] [--bindir DIR] [--unit] [-- TEST-ARGS...]
 #
 # The build runs as the invoking user; running the suite needs root, so the
 # script uses sudo when it is not already root. Extra arguments after "--"
 # go to the test binary (for example a test name filter). --build-only
 # leaves the binaries in the suite directory; --bindir runs binaries built
 # earlier (copied to a machine without a Rust toolchain, for example) and
-# skips the build.
+# skips the build. --unit runs the M1 to M4 scenarios on this host with the
+# daemon started as the shipped packaging/polywan.service (AS-34; copied
+# next to the binaries), once, with the default fwmark_mask unless
+# POLYWAN_TEST_MASKS says otherwise.
 set -eu
 
 mode=host
 rootfs=
 prebuilt=
+unit=
 while [ $# -gt 0 ]; do
   case $1 in
     --host) mode=host; shift ;;
     --vm) mode=vm; rootfs=${2:?--vm needs a root filesystem}; shift 2 ;;
     --build-only) mode=build; shift ;;
     --bindir) prebuilt=${2:?--bindir needs a directory}; shift 2 ;;
+    --unit) unit=1; shift ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -57,6 +62,7 @@ else
   # Copied before the test builds: the daemon's integration tests rebuild
   # its executable without the hooks.
   cp "$target_dir/$target/debug/polywan-testbed" "$target_dir/$target/debug/polywan" "$bindir/"
+  cp packaging/polywan.service "$bindir/"
   # netns: the harness's own checks; m1 to m4: the acceptance scenarios.
   { test_exes testbed netns m1 m2 m3 m4; test_exes polywan $kernel_tests; } \
     | while read -r name exe; do cp "$exe" "$bindir/$name"; done
@@ -67,6 +73,23 @@ fi
 if [ "$mode" = build ]; then
   echo "$bindir"
   exit 0
+fi
+if [ -n "$unit" ]; then
+  # systemd as PID 1 is needed: not in the virtme-ng guest.
+  [ "$mode" = host ] || { echo "--unit runs on the host only" >&2; exit 2; }
+  sudo=
+  [ "$(id -u)" -eq 0 ] || sudo=sudo
+  cd /tmp
+  status=0
+  for mask in ${POLYWAN_TEST_MASKS:-0x00ff0000}; do
+    echo "== M1 to M4 scenarios under the unit with fwmark_mask $mask"
+    for s in m1 m2 m3 m4; do
+      $sudo env POLYWAN_TESTBED_BIN="$bindir/polywan-testbed" POLYWAN_DAEMON_BIN="$bindir/polywan" \
+        POLYWAN_TEST_UNIT="$bindir/polywan.service" POLYWAN_TEST_FWMARK_MASK="$mask" \
+        "$bindir/$s" --ignored "$@" || status=1
+    done
+  done
+  exit $status
 fi
 # The M1 to M4 scenarios run once per fwmark_mask (AS-43: offsets 16, 0
 # and 24); POLYWAN_TEST_MASKS narrows the list; on the host,

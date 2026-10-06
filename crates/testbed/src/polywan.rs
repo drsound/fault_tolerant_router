@@ -213,6 +213,9 @@ pub struct Polywan {
     router_ns: String,
     /// Environment of the next starts (test hooks of the daemon).
     env: Vec<(String, String)>,
+    /// The shipped unit file the daemon starts as (`POLYWAN_TEST_UNIT`),
+    /// or `None` to start it as a child of the test.
+    unit: Option<PathBuf>,
 }
 
 impl Topology {
@@ -246,6 +249,7 @@ impl Topology {
             bin: daemon_bin()?,
             router_ns: self.router().name().to_owned(),
             env: Vec::new(),
+            unit: crate::unit::shipped_unit(),
         };
         f.write_config(config)?;
         Ok(f)
@@ -292,8 +296,22 @@ impl Polywan {
         let args = self.args(&run);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.log_start = fs::metadata(&self.log).map(|m| m.len() as usize).unwrap_or(0);
-        self.daemon = Some(t.start_daemon(&self.bin, &args, &self.env)?);
+        self.daemon = Some(match &self.unit {
+            Some(unit) => {
+                let socket = self.control_socket().display().to_string();
+                let reload = self.args(&["reload", "--socket", &socket]);
+                let reload: Vec<&str> = reload.iter().map(String::as_str).collect();
+                t.start_daemon_unit(unit, &self.bin, &args, &reload, &self.env)?
+            }
+            None => t.start_daemon(&self.bin, &args, &self.env)?,
+        });
         Ok(())
+    }
+
+    /// Starts the daemon as a child of the test also when the suite runs
+    /// under the unit: scenarios about running without systemd.
+    pub fn direct(&mut self) {
+        self.unit = None;
     }
 
     /// Sets an environment variable for the next starts, for the daemon's

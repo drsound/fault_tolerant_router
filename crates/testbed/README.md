@@ -34,6 +34,7 @@ The router gets its uplink configuration the way an operating system would: `udh
 - Leak detection: every operating-system default route of the router carries realm 99, and the harness table `ip tb_observe` counts IPv4 packets routed by such a route (`ipv4_leaks`); any non-zero count while PolyWAN is installed violates INV-3. IPv6 routes have no realm, so for IPv6 the harness offers per-uplink egress counters (`egress_packets`, table `inet tb_egress`) for scenarios where no packet may leave, plus route lookups with `ip -6 route get`.
 - The daemon under test runs in the router namespace with `start_daemon(binary, args, env)`; the binary path is a parameter.
 - `testbed::polywan` runs the daemon under test (`POLYWAN_DAEMON_BIN`) for the acceptance scenarios (`tests/m1.rs`): configuration and state under `/run/polywan-tests/<run>`, start, reload, stop, kill, CLI commands, its log. `Polywan::set_env` passes environment variables to the daemon's test hooks, compiled with the `test-hooks` feature that `run-suite.sh` enables: `POLYWAN_TEST_BOOTTIME_SHIFT_MS` (boot-time clock moved forward), `POLYWAN_TEST_GATEWAY_WARNING_MS` (delay of the FR-SYS-3 warning about an IPv6 path without a discovered gateway, 30 s otherwise) and `POLYWAN_TEST_FAULTS` (a control file holding n lets the next n reconciler or cleanup steps succeed and fails the following ones until it is removed).
+- Under the packaged unit (AS-34, `src/unit.rs`): with `POLYWAN_TEST_UNIT` naming the shipped `packaging/polywan.service`, `Polywan::start` installs a copy of it under a new name (`polywan-tb-<run>-<n>.service` in `/run/systemd/system`, loaded without a `daemon-reload`) with a drop-in that overrides only the command line, the run's directories (`RuntimeDirectory=polywan-tests/<run>`, `StateDirectory=polywan-tests/<run>` with mode 0755), `NetworkNamespacePath=` of the router, the binary under test (bound read-only, since `ProtectHome=` hides build directories), the router's `/etc/netns` entries as `ip netns exec` mounts them, the test hooks' environment, the log (`daemon.log`) and `Restart=no` (scenarios end the daemon on purpose and start it again themselves). The start returns once the daemon sent `READY=1` or failed; signals go to the unit's main process, `stop` is `systemctl stop` with the main process's exit status. Each drop-in and the unit's state after the start are recorded in the run's `units.log`. `Polywan::direct` keeps a scenario about running without systemd as a child of the test.
 - `Topology::start_dhcpv6_client` runs the router's DHCPv6 client on B (dhcpcd in manager mode, which alone honours the server-unicast option, or ISC dhclient where dhcpcd is not installed; `POLYWAN_TEST_DHCPV6_CLIENT` chooses), asking for an address and a prefix whose first /64 goes to the LAN. dhcpcd gets private `/run/dhcpcd` and `/var/lib/dhcpcd` in the mount namespace of `ip netns exec`; kea-dhcp6 and dhclient run as copies outside their AppArmor profiles.
 - `Options::uplink_clients = false` builds the topology without starting `udhcpc` and `pppd`; `Topology::start_uplink_clients` starts them later. `Topology::netns_etc(node)` is the node's `/etc/netns/<namespace>` directory, whose entries `ip netns exec` mounts over `/etc`.
 - The harness's own checks (`tests/netns.rs`) run without the daemon: they steer LAN traffic through one uplink with a rule and a table outside PolyWAN's default ranges (priority 90, table 90) and masquerade it.
@@ -50,6 +51,8 @@ sudo tests/vm/build-rootfs.sh /var/tmp/rootfs-bookworm
 tests/vm/run-suite.sh --vm /var/tmp/rootfs-bookworm   # Linux 6.1 + nftables 1.0.6 in virtme-ng
 ```
 
+`tests/vm/run-suite.sh --host --unit` runs the M1 to M4 scenarios with the daemon under the packaged unit, once with the default `fwmark_mask` (systemd as PID 1 needed, so not in the virtual machine).
+
 `run-suite.sh` builds the test binaries as static musl executables, so the same binaries run on the host and inside the Debian 12 guest; arguments after `--` go to the test binary (for example a test name filter). The VM mode needs `virtme-ng` (validated with 1.35), `qemu-system-x86`, `busybox-static` and KVM.
 
 Manual use:
@@ -62,7 +65,7 @@ sudo target/debug/polywan-testbed exec RUN client ping 198.18.100.1
 sudo target/debug/polywan-testbed down RUN      # or: down --all
 ```
 
-Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to run the test agents inside namespaces), `POLYWAN_TESTBED_DIR` (root of the working directories, default `/tmp/polywan-testbed`), `POLYWAN_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection).
+Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to run the test agents inside namespaces), `POLYWAN_TESTBED_DIR` (root of the working directories, default `/tmp/polywan-testbed`), `POLYWAN_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection), `POLYWAN_TEST_UNIT` (the shipped unit file the daemon starts as).
 
 ## Environment notes
 
@@ -71,4 +74,4 @@ Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to
 - Only the router performs duplicate address detection; the other nodes disable it to start quickly. The router's `net.ipv4.conf.default.rp_filter` is 2 (the systemd default) and `all.rp_filter` is 0, set before its interfaces are created, because new namespaces inherit IPv4 settings from the host.
 - `udhcpc` is used instead of ISC `dhclient`, whose AppArmor profile on Debian and Ubuntu forbids the per-run script, lease and pid paths. The PPPoE server runs in user mode because the kernel-mode plugin path compiled into `pppoe-server` differs across rp-pppoe versions; the router side uses the kernel `pppoe.so` plugin.
 - Ubuntu confines dnsmasq with AppArmor; the CI workflow disables that profile on the runner, since dnsmasq keeps its files in the run directory.
-- The harness changes nothing in the host namespace except loading kernel modules.
+- The harness changes nothing in the host namespace except loading kernel modules and, under the unit, installing and removing the units of its runs.

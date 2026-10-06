@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use crate::netns;
 use crate::plan::{self, Node, Uplink};
 use crate::topology::Topology;
+use crate::unit::Unit;
 
 impl Topology {
     /// Carrier loss on the router's uplink interface: the provider side of
@@ -231,7 +232,25 @@ impl Topology {
     pub fn start_daemon(&self, binary: &Path, args: &[&str], env: &[(String, String)]) -> Result<Daemon> {
         let log = self.dir().join("daemon.log");
         let child = self.router().spawn_env(&binary.to_string_lossy(), args, env, &log)?;
-        Ok(Daemon { child: Some(child) })
+        Ok(Daemon {
+            process: Process::Child(child),
+        })
+    }
+
+    /// [`Topology::start_daemon`] as a copy of the shipped `unit` file
+    /// ([`Topology::start_unit`]), with `reload` as the arguments of its
+    /// `ExecReload=`.
+    pub fn start_daemon_unit(
+        &self,
+        unit: &Path,
+        binary: &Path,
+        args: &[&str],
+        reload: &[&str],
+        env: &[(String, String)],
+    ) -> Result<Daemon> {
+        Ok(Daemon {
+            process: Process::Unit(self.start_unit(unit, binary, args, reload, env)?),
+        })
     }
 
     /// Waits until `cond` holds, polling every 100 ms, or fails after `timeout`.
@@ -251,12 +270,24 @@ impl Topology {
 
 /// The daemon process under test; killed when dropped.
 pub struct Daemon {
-    child: Option<Child>,
+    process: Process,
+}
+
+enum Process {
+    /// A child of the test.
+    Child(Child),
+    /// The main process of a unit (`POLYWAN_TEST_UNIT`).
+    Unit(Unit),
+    Stopped,
 }
 
 impl Daemon {
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        match &self.process {
+            Process::Child(c) => Some(c.id()),
+            Process::Unit(u) => u.pid(),
+            Process::Stopped => None,
+        }
     }
 
     /// Sends a signal by name (`TERM`, `HUP`, `KILL`, ...).
@@ -269,20 +300,31 @@ impl Daemon {
 
     /// Whether the process has ended (a zombie counts as ended).
     pub fn exited(&self) -> bool {
-        self.child.as_ref().is_some_and(|c| netns::exited(c.id()))
+        match &self.process {
+            Process::Child(c) => netns::exited(c.id()),
+            Process::Unit(u) => u.exited(),
+            Process::Stopped => false,
+        }
     }
 
-    /// Sends SIGTERM and waits for the exit status.
+    /// Sends SIGTERM (a unit: `systemctl stop`) and waits for the exit
+    /// status.
     pub fn stop(mut self) -> Result<std::process::ExitStatus> {
-        self.signal("TERM")?;
-        let mut child = self.child.take().context("daemon already stopped")?;
-        Ok(child.wait()?)
+        match std::mem::replace(&mut self.process, Process::Stopped) {
+            Process::Child(mut child) => {
+                netns::host("kill", ["-TERM".to_owned(), child.id().to_string()])?;
+                Ok(child.wait()?)
+            }
+            Process::Unit(unit) => unit.stop(),
+            Process::Stopped => anyhow::bail!("daemon already stopped"),
+        }
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
+        // A unit kills and removes itself when dropped.
+        if let Process::Child(c) = &mut self.process {
             let _ = c.kill();
             let _ = c.wait();
         }
