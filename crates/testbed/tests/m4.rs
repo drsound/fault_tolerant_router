@@ -281,3 +281,458 @@ fn impl7_cleanup_covers_the_installed_and_the_configured_layout() -> Result<()> 
     }
     Ok(())
 }
+
+/// Whether the scenarios run under the packaged unit (`run-suite.sh
+/// --unit`): AS-34's own scenarios need systemd.
+fn under_unit() -> bool {
+    let unit = testbed::unit::shipped_unit().is_some();
+    if !unit {
+        eprintln!("skipped: AS-34 runs under the packaged unit (run-suite.sh --unit)");
+    }
+    unit
+}
+
+/// The numeric id of a group in `/etc/group`.
+fn gid(name: &str) -> Result<u32> {
+    let groups = std::fs::read_to_string("/etc/group")?;
+    groups
+        .lines()
+        .find_map(|l| {
+            let mut w = l.split(':');
+            (w.next() == Some(name)).then(|| w.nth(1)?.parse().ok())?
+        })
+        .with_context(|| format!("group {name}"))
+}
+
+/// The processes of a unit's control group: (pid, comm).
+fn unit_processes(unit: &testbed::unit::Unit) -> Result<Vec<(u32, String)>> {
+    let cgroup = unit.property("ControlGroup")?;
+    let procs = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/cgroup.procs")).unwrap_or_default();
+    Ok(procs
+        .lines()
+        .filter_map(|p| p.parse().ok())
+        .map(|p: u32| {
+            let comm = std::fs::read_to_string(format!("/proc/{p}/comm")).unwrap_or_default();
+            (p, comm.trim().to_owned())
+        })
+        .collect())
+}
+
+/// msmtp's AppArmor profile in enforce mode for the guard's lifetime,
+/// unloaded afterwards unless it was loaded before. The profile is given
+/// on standard input: `apparmor_parser` skips a file named in
+/// `/etc/apparmor.d/disable` (Debian disables this one by default), which
+/// the harness leaves as it is.
+struct Enforced {
+    loaded_before: bool,
+}
+
+const MSMTP_PROFILE: &str = "/etc/apparmor.d/usr.bin.msmtp";
+
+/// `apparmor_parser OPTION` with msmtp's profile on standard input.
+fn apparmor_parser(option: &str) -> Result<Output> {
+    succeeded(
+        std::process::Command::new("apparmor_parser")
+            .arg(option)
+            .stdin(std::fs::File::open(MSMTP_PROFILE)?)
+            .output()?,
+    )
+}
+
+/// The kernel's line of the msmtp profile, if loaded.
+fn msmtp_profile() -> Option<String> {
+    std::fs::read_to_string("/sys/kernel/security/apparmor/profiles")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("msmtp "))
+        .map(str::to_owned)
+}
+
+impl Enforced {
+    /// `None` without AppArmor.
+    fn new() -> Result<Option<Enforced>> {
+        let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled").unwrap_or_default();
+        if enabled.trim() != "Y" || !std::path::Path::new(MSMTP_PROFILE).exists() {
+            return Ok(None);
+        }
+        let guard = Enforced {
+            loaded_before: msmtp_profile().is_some(),
+        };
+        apparmor_parser("-r")?;
+        anyhow::ensure!(
+            msmtp_profile().is_some_and(|p| p.contains("(enforce)")),
+            "msmtp's profile not enforced"
+        );
+        Ok(Some(guard))
+    }
+}
+
+impl Drop for Enforced {
+    fn drop(&mut self) {
+        if !self.loaded_before {
+            let _ = apparmor_parser("-R");
+        }
+    }
+}
+
+/// The password of the router's account on the test SMTP server.
+const SMTP_PASSWORD: &str = "polywan-secret-7c1e";
+
+/// AS-34, email (FR-MAIL-1, FR-MAIL-4, IMPL-10, DIST-3) and access
+/// (FR-API-1): under the packaged unit, with `/usr/bin/msmtp` and its
+/// system configuration (STARTTLS with certificate checking against the
+/// system's trusted certificates, AUTH PLAIN with the password in the
+/// root-only `/etc/netrc`), `notify-test` reaches the test SMTP server with
+/// the configured sender, recipients and content; a certificate of
+/// another authority and a wrong password fail with msmtp's diagnostics,
+/// which carry no credentials; a stop during a submission lets it
+/// complete, then sends `daemon_stopping`; the same submission succeeds
+/// with msmtp's AppArmor profile in enforce mode (the process's
+/// confinement checked). The control socket has the group `adm`, the
+/// status socket the group `sys`, both mode 0660.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as34_notifications_through_msmtp() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !under_unit() {
+        return Ok(());
+    }
+    let t = build();
+    let mut f = t.prepare_polywan("")?;
+    anyhow::ensure!(
+        std::path::Path::new("/usr/bin/msmtp").exists(),
+        "AS-34 needs msmtp (/usr/bin/msmtp)"
+    );
+    let evidence = std::process::Command::new("dpkg-query")
+        .args(["-W", "msmtp", "systemd"])
+        .output()?;
+    eprintln!(
+        "AS-34 evidence: {}",
+        polywan::output_text(&evidence).replace('\n', "; ")
+    );
+    let pki = testbed::smtp::Pki::new("PolyWAN test authority")?;
+    let server = t.start_smtp_server(&pki, SMTP_PASSWORD)?;
+    t.msmtp_system(&pki.ca, SMTP_PASSWORD)?;
+    let to = ["admin@example.com", "noc@example.org"];
+    let api = format!(
+        "[api]\nsocket = \"{}\"\ngroup = \"adm\"\nstatus_socket = \"{}\"\nstatus_group = \"sys\"\n",
+        f.control_socket().display(),
+        f.status_socket().display()
+    );
+    let email = format!(
+        "[notify]\ncoalesce = \"1s\"\n[notify.email]\nfrom = \"router@example.com\"\nto = [\"{}\"]\nsendmail = \"/usr/bin/msmtp\"\nevents = [\"daemon_stopping\"]\n",
+        to.join("\", \"")
+    );
+    f.write_config(&polywan::config(
+        &ab(),
+        &[Family::V4],
+        &HealthSpec::fast(),
+        "",
+        &format!("{api}{email}"),
+    ))?;
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    for (socket, group) in [(f.control_socket(), "adm"), (f.status_socket(), "sys")] {
+        let m = std::fs::metadata(&socket)?;
+        assert_eq!(
+            (m.mode() & 0o777, m.uid(), m.gid()),
+            (0o660, 0, gid(group)?),
+            "{}",
+            socket.display()
+        );
+    }
+
+    // Received with the envelope and the content.
+    let test = |f: &polywan::Polywan| -> Result<(bool, String)> {
+        let out = f.notify_test()?;
+        Ok((out.status.success(), polywan::output_text(&out)))
+    };
+    let (ok, text) = test(&f)?;
+    assert!(ok, "{text}");
+    let messages = server.wait(&t, "message", 1, Duration::from_secs(10))?;
+    let m = &messages[0];
+    assert_eq!(m.from.as_deref(), Some("router@example.com"));
+    assert_eq!(m.rcpt, to);
+    let mail = testbed::sendmail::Mail::parse(m.data.as_deref().unwrap_or_default())?;
+    assert!(
+        mail.header("Subject")
+            .is_some_and(|s| s.starts_with("PolyWAN notification test")),
+        "{mail:?}"
+    );
+    assert_eq!(mail.header("To"), Some(to.join(",\n ").as_str()));
+    assert_eq!(server.of("tls")?.len(), 1);
+    assert_eq!(server.of("auth")?.len(), 1);
+
+    // Diagnostics: an untrusted certificate, a wrong password.
+    let secrets = |text: &str| !text.contains(SMTP_PASSWORD) && !text.contains("wrong-password-41");
+    server.serve(&testbed::smtp::Pki::new("Another authority")?)?;
+    let (ok, text) = test(&f)?;
+    assert!(!ok && text.contains("email: failed, exit status"), "{text}");
+    assert!(text.to_lowercase().contains("certificate"), "{text}");
+    // With TLS 1.3 the client checks the certificate after the server's
+    // side of the handshake: the session ends without authentication.
+    server.wait(&t, "end", 2, Duration::from_secs(5))?;
+    assert_eq!(server.of("auth")?.len(), 1);
+    server.serve(&pki)?;
+    server.password("wrong-password-41")?;
+    let (ok, text) = test(&f)?;
+    assert!(!ok && text.contains("authentication failed"), "{text}");
+    assert!(secrets(&text), "{text}");
+    server.wait(&t, "auth_failed", 1, Duration::from_secs(5))?;
+    assert!(secrets(&f.log()), "{}", f.log());
+    assert_eq!(server.of("message")?.len(), 1);
+
+    // Enforced by AppArmor: msmtp runs confined and succeeds.
+    server.password(SMTP_PASSWORD)?;
+    server.delay(Duration::from_secs(2))?;
+    match Enforced::new()? {
+        None => eprintln!("AS-34: AppArmor unavailable, the enforced run skipped"),
+        Some(_enforced) => {
+            eprintln!("AS-34: AppArmor profile {:?}", msmtp_profile());
+            let unit = f.unit().context("under the unit")?;
+            let datas = server.of("data")?.len();
+            let confinement = std::thread::scope(|s| -> Result<String> {
+                let h = s.spawn(|| test(&f));
+                server.wait(&t, "data", datas + 1, Duration::from_secs(10))?;
+                let (pid, _) = unit_processes(unit)?
+                    .into_iter()
+                    .find(|(_, comm)| comm == "msmtp")
+                    .context("msmtp in the unit")?;
+                let label = std::fs::read_to_string(format!("/proc/{pid}/attr/current")).unwrap_or_default();
+                let (ok, text) = h.join().expect("notify-test")?;
+                assert!(ok, "{text}");
+                Ok(label.trim().to_owned())
+            })?;
+            eprintln!("AS-34: msmtp confined as {confinement:?}");
+            assert_eq!(confinement, "msmtp (enforce)");
+            server.wait(&t, "message", 2, Duration::from_secs(10))?;
+        }
+    }
+
+    // A stop while a submission runs: it completes, then daemon_stopping.
+    let before = server.of("message")?.len();
+    let datas = server.of("data")?.len();
+    std::thread::scope(|s| -> Result<()> {
+        let h = s.spawn(|| test(&f));
+        server.wait(&t, "data", datas + 1, Duration::from_secs(10))?;
+        let status = f.unit().context("under the unit")?.stop()?;
+        assert!(status.success(), "{status:?}\n{}", f.log());
+        let _ = h.join();
+        Ok(())
+    })?;
+    let messages = server.wait(&t, "message", before + 2, Duration::from_secs(10))?;
+    let subject = |e: &testbed::smtp::Event| {
+        testbed::sendmail::Mail::parse(e.data.as_deref().unwrap_or_default())
+            .ok()
+            .and_then(|m| m.header("Subject").map(str::to_owned))
+            .unwrap_or_default()
+    };
+    assert!(subject(&messages[before]).starts_with("PolyWAN notification test"));
+    let stopping = testbed::sendmail::Mail::parse(messages[before + 1].data.as_deref().unwrap_or_default())?;
+    assert!(stopping.body.contains("daemon_stopping"), "{stopping:?}");
+    Ok(())
+}
+
+/// Whether a process has ended (or never existed).
+fn gone(pid: &str) -> bool {
+    pid.trim().parse().is_ok_and(testbed::netns::exited)
+}
+
+/// AS-34, the unit's life (IMPL-10, FR-API-1, FR-HOOK-2): with
+/// `--no-block`, the unit stays `activating` while an `nft` wrapper holds
+/// the first application, becomes `active` with the daemon's summary as
+/// `StatusText`; `systemctl reload` succeeds, fails on an invalid
+/// configuration (the unit stays active) and fails with an unknown outcome
+/// when the control socket's group changes, `config_reloaded` recording
+/// the outcome; a stop during a hung hook leaves no process of it, an
+/// escaped one included, and cleans up (`on_shutdown = "cleanup"`); a
+/// restart replaces the main process; a stop whose cleanup outlasts
+/// `TimeoutStopSec=` is `deactivating` until systemd kills the daemon,
+/// keeps the manifest, and an offline `cleanup` then succeeds.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as34_unit_states_reload_and_stop() -> Result<()> {
+    if !under_unit() {
+        return Ok(());
+    }
+    let t = build();
+    let mut f = t.prepare_polywan("")?;
+    let (wrapper, flag) = nft_wrapper(&t, &f, &["-f"], "sleep 6")?;
+    let out = t.exec_dir()?.join("hook");
+    std::fs::create_dir_all(&out)?;
+    // Hooks run as nobody.
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o777))?;
+    let o = out.display();
+    // The hook's shell, a child, and a child that leaves its process group.
+    let script =
+        format!("echo $$ > {o}/shell; sleep 300 & echo $! > {o}/child; setsid sleep 300 & echo $! > {o}/escaped; wait");
+    let (control, status) = (f.control_socket(), f.status_socket());
+    let config = |group: &str, weight: u16| {
+        let api = format!(
+            "[api]\nsocket = \"{}\"\ngroup = \"{group}\"\nstatus_socket = \"{}\"\n",
+            control.display(),
+            status.display()
+        );
+        let more = format!(
+            "[firewall]\nnft_path = \"{}\"\n{api}[[notify.hook]]\ncommand = [\"/bin/sh\", \"-c\", {script:?}]\nevents = [\"uplink_drained\"]\ntimeout = \"120s\"\n",
+            wrapper.display()
+        );
+        let uplinks = [
+            UplinkSpec::new(Uplink::A, 1),
+            UplinkSpec::new(Uplink::B, 2).weight(weight),
+        ];
+        polywan::config(
+            &uplinks,
+            &[Family::V4],
+            &HealthSpec::fast(),
+            "on_shutdown = \"cleanup\"\n",
+            &more,
+        )
+    };
+    f.write_config(&config("root", 1))?;
+
+    // Readiness as unit states.
+    std::fs::write(&flag, "")?;
+    f.set_unit_options(testbed::unit::UnitOptions {
+        no_block: true,
+        ..Default::default()
+    });
+    f.start(&t)?;
+    let state =
+        |f: &polywan::Polywan| -> Result<(String, String)> { f.unit().context("under the unit")?.active_state() };
+    let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+    t.wait_for("activating", Duration::from_secs(10), || {
+        Ok(state(&f)? == pair("activating", "start"))
+    })?;
+    t.wait_for("the status socket", Duration::from_secs(10), || Ok(f.status().is_ok()))?;
+    assert_eq!(state(&f)?, pair("activating", "start"), "not ready while nft runs");
+    t.wait_for("active", Duration::from_secs(30), || {
+        Ok(state(&f)? == pair("active", "running"))
+    })?;
+    std::fs::remove_file(&flag)?;
+    assert!(f.log().contains("applied"), "{}", f.log());
+    let unit = f.unit().context("under the unit")?;
+    t.wait_for("StatusText", Duration::from_secs(15), || {
+        Ok(unit.property("StatusText")? == "status ok; active ipv4: a, b")
+    })?;
+
+    // systemctl reload: applied, refused, unknown.
+    let reload = |config: &str| -> Result<Output> {
+        f.write_config(config)?;
+        f.unit().context("under the unit")?.systemctl(&["reload"])
+    };
+    let cursor = f.latest_event()?;
+    assert!(reload(&config("root", 2))?.status.success(), "{}", f.log());
+    f.wait_event(cursor, "config_reloaded", "", 1, Duration::from_secs(10))?;
+    let cursor = f.latest_event()?;
+    let failed = reload("[[uplink]\n")?;
+    assert!(!failed.status.success());
+    f.wait_event(cursor, "reload_failed", "", 1, Duration::from_secs(10))?;
+    assert_eq!(state(&f)?, pair("active", "running"));
+    let cursor = f.latest_event()?;
+    let unknown = reload(&config("adm", 2))?;
+    assert!(!unknown.status.success());
+    assert!(f.log().contains("the outcome of the reload is unknown"), "{}", f.log());
+    f.wait_event(cursor, "config_reloaded", "", 1, Duration::from_secs(10))?;
+    assert_eq!(state(&f)?, pair("active", "running"));
+
+    // A stop during a hung hook.
+    succeeded(f.drain("a", true, false)?)?;
+    t.wait_for("the hook's processes", Duration::from_secs(10), || {
+        Ok(out.join("escaped").exists())
+    })?;
+    let pids: Vec<String> = ["shell", "child", "escaped"]
+        .iter()
+        .map(|n| std::fs::read_to_string(out.join(n)))
+        .collect::<std::io::Result<_>>()?;
+    assert!(pids.iter().all(|p| !gone(p)), "{pids:?}");
+    let status = f.unit().context("under the unit")?.stop()?;
+    assert!(status.success(), "{status:?}\n{}", f.log());
+    assert!(
+        pids.iter().all(|p| gone(p)),
+        "no process of the hook survives: {pids:?}"
+    );
+    assert_eq!(tagged(&t, "249")?, 0, "on_shutdown = \"cleanup\"");
+    assert!(!f.state.join("manifest.json").exists());
+
+    // A restart, then a stop timeout during cleanup.
+    f.set_unit_options(testbed::unit::UnitOptions {
+        extra: "TimeoutStopSec=2s\n".into(),
+        ..Default::default()
+    });
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let unit = f.unit().context("under the unit")?;
+    let first = unit.main_pid()?;
+    assert!(unit.systemctl(&["restart"])?.status.success(), "{}", f.log());
+    assert_eq!(unit.active_state()?, pair("active", "running"));
+    assert!(unit.main_pid()?.is_some() && unit.main_pid()? != first);
+    f.wait_installed(&t)?;
+    std::fs::write(&flag, "")?;
+    let (status, states) = std::thread::scope(|s| -> Result<_> {
+        let stop = s.spawn(|| unit.stop());
+        let mut states = Vec::new();
+        while !stop.is_finished() {
+            let st = unit.active_state()?;
+            if states.last() != Some(&st) {
+                states.push(st);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok((stop.join().expect("stop")?, states))
+    })?;
+    std::fs::remove_file(&flag)?;
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+    assert!(states.contains(&pair("deactivating", "stop-sigterm")), "{states:?}");
+    assert_eq!(unit.property("Result")?, "timeout");
+    assert!(f.state.join("manifest.json").exists(), "kept until cleanup succeeds");
+    succeeded(f.cli_config(&["cleanup"])?)?;
+    assert_eq!(tagged(&t, "249")?, 0);
+    assert!(!f.state.join("manifest.json").exists());
+    Ok(())
+}
+
+/// AS-34, restarts (IMPL-10, §9): with the packaged `Restart=always`, a
+/// daemon killed by SIGKILL is restarted after `RestartSec=`; one that
+/// refuses its configuration (exit status 78) is not.
+#[test]
+#[ignore = "needs root and network namespaces"]
+fn as34_unit_restarts() -> Result<()> {
+    if !under_unit() {
+        return Ok(());
+    }
+    let t = build();
+    let mut f = t.prepare_polywan(&polywan::ipv4(&ab()))?;
+    f.set_unit_options(testbed::unit::UnitOptions {
+        restart: true,
+        ..Default::default()
+    });
+    f.start(&t)?;
+    f.wait_installed(&t)?;
+    let unit = f.unit().context("under the unit")?;
+    let kill = || -> Result<u32> {
+        let pid = unit.main_pid()?.context("a main process")?;
+        testbed::netns::host("kill", ["-KILL", &pid.to_string()])?;
+        Ok(pid)
+    };
+    let killed = kill()?;
+    t.wait_for("a restart", Duration::from_secs(20), || {
+        Ok(unit.property("NRestarts")? == "1"
+            && unit.active_state()? == ("active".to_owned(), "running".to_owned())
+            && unit.main_pid()?.is_some_and(|p| p != killed))
+    })?;
+    f.wait_installed(&t)?;
+    f.write_config("[[uplink]\n")?;
+    kill()?;
+    t.wait_for("the refused restart", Duration::from_secs(20), || {
+        Ok(unit.property("ActiveState")? == "failed")
+    })?;
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(unit.property("ActiveState")?, "failed");
+    assert_eq!(unit.property("NRestarts")?, "2");
+    assert_eq!(unit.property("Result")?, "exit-code");
+    assert_eq!(unit.property("ExecMainStatus")?, "78");
+    Ok(())
+}

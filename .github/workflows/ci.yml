@@ -57,7 +57,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools jq iproute2 nftables dnsmasq-base ppp pppoe udhcpc iputils-ping conntrack tcpdump kea-dhcp6-server dhcpcd-base
+          sudo apt-get install -y --no-install-recommends musl-tools jq iproute2 nftables dnsmasq-base ppp pppoe udhcpc iputils-ping conntrack tcpdump kea-dhcp6-server dhcpcd-base msmtp
           sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
           # The harness runs its own kea-dhcp6 inside a namespace (AS-44).
           sudo systemctl disable --now kea-dhcp6-server || true
