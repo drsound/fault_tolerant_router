@@ -63,8 +63,8 @@ pub fn spec(hook: &Hook, event: &Event, user: (u32, u32)) -> Option<Spec> {
 }
 
 /// The uid and gid of the hook user, looked up on the blocking pool. An
-/// account with UID 0 is refused: it would keep the daemon's capabilities
-/// (FR-HOOK-3).
+/// account with UID 0 is refused: it would keep the daemon's capabilities;
+/// so is one whose primary group is GID 0, root's group (FR-HOOK-3).
 pub async fn resolve_user(name: &str) -> Result<(u32, u32), String> {
     let owned = name.to_owned();
     let (uid, gid) = tokio::task::spawn_blocking(move || crate::identity::user(&owned))
@@ -76,12 +76,22 @@ pub async fn resolve_user(name: &str) -> Result<(u32, u32), String> {
     if uid == 0 {
         return Err(uid_zero(name));
     }
+    if gid == 0 {
+        return Err(gid_zero(name));
+    }
     Ok((uid, gid))
 }
 
 /// Why a hook user with UID 0 is refused.
 pub fn uid_zero(name: &str) -> String {
     format!("hook user {name:?} has UID 0, which keeps capabilities; hooks run without any (FR-HOOK-3)")
+}
+
+/// Why a hook user whose primary group is GID 0 is refused.
+pub fn gid_zero(name: &str) -> String {
+    format!(
+        "hook user {name:?} has GID 0 as its primary group, root's group; hooks run without root's privileges (FR-HOOK-3)"
+    )
 }
 
 /// Runs a hook and logs how it ended, with its output (FR-HOOK-3).

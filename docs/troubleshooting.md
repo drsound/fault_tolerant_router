@@ -17,7 +17,7 @@ What PolyWAN installed can be read with `ip rule show`, `ip -6 rule show`, `ip r
 
 - The file cannot be read, parsed or validated: the message gives the file, line and key. Unknown keys are errors, often a misspelling or a key in the wrong table.
 - The file, a directory above it, `state_dir`, `firewall.nft_path` or `notify.email.sendmail` is not owned by root or is writable by group or others: fix ownership and mode (`chown root:root`, `chmod go-w`), also of the targets of symbolic links.
-- A group (`api.group`, `api.status_group`) or the hook user does not exist, or `notify.hook_user` has UID 0. The `polywan` group comes with the package; from the static binary it must be created (see [installation](installation.md)). Accounts must be local (see [users and groups](api.md#users-and-groups)).
+- A group (`api.group`, `api.status_group`) or the hook user does not exist, or `notify.hook_user` has UID 0 or primary group GID 0. The `polywan` group comes with the package; from the static binary it must be created (see [installation](installation.md)). Accounts must be local (see [users and groups](api.md#users-and-groups)).
 - The configuration changes a structural setting (`fwmark_mask`, `table_base`, `rule_priority_base`, `route_protocol`, `firewall.mode`) against what is installed: run `polywan cleanup`, which removes the installed objects with the recorded settings, then start.
 - The configuration reuses the id of an uplink for another name, or changes an uplink's id: give the uplink its old id back, or, if the old uplink is gone for good, run `polywan forget-uplink OLDNAME` (see [forget-uplink](api.md#forget-uplink)).
 

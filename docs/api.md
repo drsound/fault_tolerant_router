@@ -326,6 +326,6 @@ With `metrics.listen` set, `GET /metrics` serves, in the Prometheus text format:
 
 ## Users and groups
 
-PolyWAN looks up three kinds of accounts by name: `api.group` (default `polywan`), `api.status_group` (when set) and `notify.hook_user` (default `nobody`, the user hooks run as; it must not have UID 0). They are looked up at startup and at every reload, outside the routing. An account that does not exist refuses startup with exit status 78, or rejects the reload.
+PolyWAN looks up three kinds of accounts by name: `api.group` (default `polywan`), `api.status_group` (when set) and `notify.hook_user` (default `nobody`, the user hooks run as; it must not have UID 0, nor GID 0 as its primary group). They are looked up at startup and at every reload, outside the routing. An account that does not exist refuses startup with exit status 78, or rejects the reload.
 
 Define these accounts **locally**, in `/etc/passwd` and `/etc/group`. The release binaries are statically linked with musl, which does not load NSS modules: accounts of LDAP, SSSD, NIS or systemd-userdb (including `DynamicUser=` users) are not visible to PolyWAN unless the local name service cache daemon (nscd) provides them, and that is not supported. The package creates the `polywan` group with `systemd-sysusers`; to give someone control, add them to it (`usermod -a -G polywan NAME`) and have them log in again.

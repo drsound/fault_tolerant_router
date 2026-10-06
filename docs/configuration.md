@@ -261,7 +261,7 @@ A policy sends new forwarded connections that match all of its conditions throug
 | Key | Default | Values |
 |---|---|---|
 | `notify.coalesce` | `"30s"` | a duration |
-| `notify.hook_user` | `"nobody"` | an existing local user other than UID 0 |
+| `notify.hook_user` | `"nobody"` | an existing local user other than UID 0, whose primary group is not GID 0 |
 | `notify.email` | absent | see [email](email.md) |
 | `notify.email.from` | required | one plain address, `local-part@domain` |
 | `notify.email.to` | required | a non-empty list of plain addresses |

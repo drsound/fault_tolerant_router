@@ -189,6 +189,10 @@ fn accounts(config: &Config) -> (Vec<String>, Vec<String>) {
                 "notify.hook_user: {}",
                 crate::hooks::uid_zero(&config.notify.hook_user)
             )),
+            Ok(Some(u)) if u.gid == 0 => refused.push(format!(
+                "notify.hook_user: {}",
+                crate::hooks::gid_zero(&config.notify.hook_user)
+            )),
             Ok(Some(_)) => {}
             Ok(None) => refused.push(format!(
                 "notify.hook_user: user {:?} does not exist",
