@@ -261,6 +261,54 @@ fn teardown_covers_the_union_of_layouts_and_keeps_other_protocols() {
     assert_eq!(teardown(&s, &[layouts[0], layouts[0]]).len(), once);
 }
 
+/// IMPL-7 with overlapping priority ranges and one protocol: a rule in the
+/// overlap is removed in the order of the role it has in the layout that
+/// installed it (FR-REC-4), not in the order of its priority's role in the
+/// other layout.
+#[test]
+fn teardown_orders_overlapping_layouts_by_each_rules_own_role() {
+    let installed = config::parse(CONFIG).unwrap();
+    let configured = config::parse(&format!("[routing]\nrule_priority_base = 700\n{CONFIG}")).unwrap();
+    let layouts = [(Layout::of(&installed), 249), (Layout::of(&configured), 249)];
+    let mut s = System::default();
+    let mut desired_rules = Vec::new();
+    for cfg in [&installed, &configured] {
+        let desired = plan::plan(cfg, &input(&[1, 2]));
+        apply(
+            &mut s,
+            cfg,
+            &diff_for(&System::default(), cfg, &desired, &desired, true),
+        );
+        desired_rules.extend(desired.rules);
+    }
+    // The role of every deleted rule in the layout that installed it.
+    type Role = (RuleKind, Option<(IpAddr, u8)>, u32);
+    let roles: Vec<Role> = teardown(&s, &layouts)
+        .iter()
+        .filter_map(|op| match op {
+            Op::DeleteRule(o) => {
+                let r = desired_rules.iter().find(|r| o.is(r, 249)).expect("a rule of a layout");
+                Some((r.kind, o.source, o.priority))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roles.len(), desired_rules.len(), "every rule once");
+    let ranks: Vec<u8> = roles.iter().map(|(k, _, _)| removal_rank(Some(*k))).collect();
+    assert!(ranks.is_sorted(), "removal order of FR-REC-4: {roles:?}");
+    for (i, (kind, source, priority)) in roles.iter().enumerate() {
+        if let RuleKind::SourceLookup(_) = kind {
+            // The guard of the same address in the same layout comes first.
+            let guard = priority - priority % 100 + 64;
+            let g = roles
+                .iter()
+                .position(|(k, s, p)| *k == RuleKind::SourceGuard && s == source && *p == guard)
+                .unwrap();
+            assert!(g < i, "source guard {guard} before source rule {priority}: {roles:?}");
+        }
+    }
+}
+
 #[test]
 fn a_replaced_only_uplink_leaves_the_balancing_route_before_its_assignments() {
     let block = |n: u8, name: &str| {

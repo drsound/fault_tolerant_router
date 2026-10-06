@@ -236,19 +236,49 @@ fn removal_key(layout: Layout, o: &ObservedRule) -> impl Ord + use<> {
     )
 }
 
+/// Whether `o` is the rule that its priority's role in `layout` installs:
+/// the same fwmark, source and action.
+fn has_role(layout: Layout, o: &ObservedRule) -> bool {
+    let Some(kind) = classify(layout, o.priority) else {
+        return false;
+    };
+    let shaped = |r: &Rule| r.kind == kind && o.is(r, o.protocol);
+    match (kind, o.source) {
+        (RuleKind::SourceLookup(id), Some((address, _))) => {
+            layout.source_rules(o.family, id, address).iter().any(shaped)
+        }
+        (RuleKind::SourceGuard, Some((address, _))) => {
+            // The guard does not depend on the uplink.
+            UplinkId::new(1).is_some_and(|id| layout.source_rules(o.family, id, address).iter().any(shaped))
+        }
+        _ => {
+            let ids: Vec<_> = (1..=63).filter_map(UplinkId::new).collect();
+            layout.static_rules(o.family, &ids).iter().any(shaped)
+        }
+    }
+}
+
 /// Cleanup's operations (FR-REC-4, IMPL-7) over the union of `layouts`,
 /// each with its route protocol: the rules of every layout in removal
 /// order, then every route; an object that two layouts share is removed
 /// once, and objects tagged with another protocol are kept (FR-ROUTE-6).
+/// A rule in the ranges of two layouts with one protocol is ordered by the
+/// role it has in the layout whose rule it is, by its shape.
 pub fn teardown(system: &System, layouts: &[(Layout, u8)]) -> Vec<Op> {
     let mut rules: Vec<(_, &ObservedRule)> = Vec::new();
+    for o in &system.rules {
+        let mut owners = layouts
+            .iter()
+            .filter(|(l, protocol)| o.protocol == *protocol && l.priorities().contains(&o.priority))
+            .map(|(l, _)| *l);
+        let Some(first) = owners.clone().next() else {
+            continue;
+        };
+        let layout = owners.find(|l| has_role(*l, o)).unwrap_or(first);
+        rules.push((removal_key(layout, o), o));
+    }
     let mut routes = BTreeSet::new();
     for &(layout, protocol) in layouts {
-        for o in observed_rules(system, layout, protocol) {
-            if !rules.iter().any(|(_, r)| std::ptr::eq(*r, o)) {
-                rules.push((removal_key(layout, o), o));
-            }
-        }
         for (family, table) in observed_tables(system, layout, protocol) {
             routes.insert((protocol, family, table));
         }
