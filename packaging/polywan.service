@@ -1,0 +1,45 @@
+# The PolyWAN service (SPEC.md IMPL-10). Change it with a drop-in
+# (systemctl edit polywan), not by editing this file: a non-default
+# api.socket needs ExecReload= replaced with the matching --socket, other
+# state or socket directories need provisioned directories and sandbox
+# exceptions.
+
+[Unit]
+Description=PolyWAN multi-uplink policy routing
+Documentation=man:polywan(8) https://github.com/drsound/polywan
+After=nftables.service network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/polywan run
+ExecReload=/usr/bin/polywan reload
+Restart=always
+RestartSec=5s
+RestartPreventExitStatus=78
+TimeoutStartSec=90s
+TimeoutStopSec=30s
+# The first SIGTERM goes to the daemon alone, so that it can finish the
+# email it is sending; what remains is killed when it exits.
+KillMode=mixed
+
+# The instance lock lives in the runtime directory: keeping it across stops
+# and failed starts lets an offline command keep holding it.
+StateDirectory=polywan
+StateDirectoryMode=0700
+RuntimeDirectory=polywan
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# CAP_SETUID and CAP_SETGID run hooks as notify.hook_user, CAP_KILL stops
+# their process groups, CAP_CHOWN gives the API sockets their groups.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_KILL CAP_CHOWN
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

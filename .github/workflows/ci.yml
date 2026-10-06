@@ -30,6 +30,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - name: Verify the unit file
+        # systemd-analyze checks that ExecStart= names an executable.
+        run: |
+          sudo install -m 0755 target/debug/polywan /usr/bin/polywan
+          systemd-analyze verify --man=no packaging/polywan.service
 
   deny:
     name: cargo deny
