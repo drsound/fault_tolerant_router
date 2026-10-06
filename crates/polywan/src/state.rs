@@ -52,15 +52,22 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StateError + '_ {
 }
 
 /// Writes a file atomically: temporary file, fsync, rename, fsync of the
-/// directory (IMPL-5).
+/// directory (IMPL-5). The file is readable and writable by its owner only,
+/// whatever the umask and whatever a temporary file left behind allowed:
+/// the state directory may be readable by others (an existing one keeps
+/// its mode).
 pub fn write_atomic(path: &Path, content: &[u8]) -> Result<(), StateError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = path.with_extension("tmp");
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .open(&tmp)
+        .map_err(io_err(&tmp))?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(io_err(&tmp))?;
     f.write_all(content).map_err(io_err(&tmp))?;
     f.sync_all().map_err(io_err(&tmp))?;
@@ -595,6 +602,19 @@ interface = "wanb"
         StateDir::open(&base).unwrap();
         assert_eq!(fs::metadata(&base).unwrap().permissions().mode() & 0o777, 0o755);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn state_files_are_private_whatever_a_leftover_temporary_file_allowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = StateDir::open(&tempdir()).unwrap();
+        let tmp = dir.path.join("drain.tmp");
+        fs::write(&tmp, "").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).unwrap();
+        dir.write_drain(&DrainState::of(["a".to_owned()])).unwrap();
+        let mode = fs::metadata(dir.path.join(DRAIN)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::remove_dir_all(&dir.path).unwrap();
     }
 
     #[test]

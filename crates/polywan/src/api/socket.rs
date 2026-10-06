@@ -57,8 +57,8 @@ impl Record {
 
     pub fn write(&self, sockets: &[Published]) -> io::Result<()> {
         let text = serde_json::to_vec(sockets).map_err(io::Error::other)?;
-        crate::state::write_atomic(&self.file, &text).map_err(io::Error::other)?;
-        fs::set_permissions(&self.file, fs::Permissions::from_mode(0o600))
+        // Mode 0600, as every file written atomically.
+        crate::state::write_atomic(&self.file, &text).map_err(io::Error::other)
     }
 }
 
