@@ -24,7 +24,7 @@
 
 use std::fs;
 use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::thread::sleep;
@@ -77,7 +77,7 @@ impl Default for Options {
             run_id: None,
             work_root: std::env::var_os("POLYWAN_TESTBED_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp/polywan-testbed")),
+                .unwrap_or_else(|| PathBuf::from(WORK_ROOT)),
             agent_bin: default_agent_bin(),
             ipv6: true,
             pppoe: true,
@@ -118,12 +118,20 @@ pub const POLYWAN_ROOT: &str = "/run/polywan-tests";
 /// which may be mounted `noexec`.
 pub const EXEC_ROOT: &str = "/var/lib/polywan-tests";
 
+/// Default parent of the runs' working directories, where root writes the
+/// scripts it then runs (`udhcpc-script`, `pppd-ip-up`, `dhclient-script`):
+/// a directory only root can create, unlike a fixed name under `/tmp` that
+/// any user can take first, and not under `/run` for the reason of
+/// [`EXEC_ROOT`].
+pub const WORK_ROOT: &str = "/var/lib/polywan-testbed";
+
 /// Reserves a run identifier: its working directory, created exclusively,
 /// and no namespace of that run. `None` when the identifier is taken.
 fn reserve(work_root: &Path, id: &str) -> Result<Option<PathBuf>> {
     fs::create_dir_all(work_root).with_context(|| format!("creating {}", work_root.display()))?;
+    check_work_root(work_root)?;
     let dir = work_root.join(id);
-    match fs::create_dir(&dir) {
+    match fs::DirBuilder::new().mode(0o755).create(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
@@ -133,6 +141,27 @@ fn reserve(work_root: &Path, id: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     Ok(Some(dir))
+}
+
+/// Refuses a work root that another user could have created or can still
+/// change: whoever controls it controls the run directories inside it. The
+/// directory must be owned by root and not a symbolic link; sticky, like
+/// `/tmp`, if group or others can write it.
+fn check_work_root(work_root: &Path) -> Result<()> {
+    // Rebuilt from its components: a trailing slash would make lstat follow a link.
+    let path: PathBuf = work_root.components().collect();
+    let meta = fs::symlink_metadata(&path).with_context(|| format!("reading {}", work_root.display()))?;
+    let mode = meta.mode();
+    if !meta.is_dir() || meta.uid() != 0 || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
+        bail!(
+            "{} must be a directory owned by root, not a symbolic link, and sticky if group or others can write it \
+             (owner {}, mode {:o}); choose another POLYWAN_TESTBED_DIR or --work-root",
+            work_root.display(),
+            meta.uid(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
 }
 
 /// Namespace name prefix of a run.

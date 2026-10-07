@@ -28,7 +28,7 @@ The router gets its uplink configuration the way an operating system would: `udh
 
 ## Helpers
 
-- `Topology::build(Options)`, `Topology::ns(Node)`, `Ns::run/ip/sh/nft/sysctl/spawn`: build the topology and run commands in any node. Dropping the `Topology` kills every process of the run, deletes its namespaces and removes its working directory (`/tmp/polywan-testbed/<run>`).
+- `Topology::build(Options)`, `Topology::ns(Node)`, `Ns::run/ip/sh/nft/sysctl/spawn`: build the topology and run commands in any node. Dropping the `Topology` kills every process of the run, deletes its namespaces and removes its working directory (`/var/lib/polywan-testbed/<run>`).
 - Failure injection (`src/inject.rs`): carrier loss (`carrier_down`), router interface down (`router_link`), provider disconnected upstream with the link up (`upstream_down`), deterministic nftables drop patterns in a provider (`drop_probe_echoes(uplink, 3)` drops every third echo request towards the probe targets; `provider_rules` for anything else), `tc netem` (`netem`), PPPoE session reset with a new `ppp0` ifindex (`pppoe_reset`), DHCP renewal (`dhcp_renew`).
 - Traffic (`src/traffic.rs`): `connect_many` opens N TCP or UDP connections with distinct 5-tuples from a node to up to 254 destinations and reports, for each, the outcome (`ok`, `unreachable`, `refused`, `timeout`) and the source address seen by the server, from which `ConnResult::uplink` attributes the egress uplink; `start_flow` runs a long-lived TCP flow and reports its longest stall (`FlowReport::continuous`); `udp_send` sends a one-way UDP flow from a fixed source port, attributed through the server log (`server_events`); `ping` distinguishes reply, ICMP unreachable and timeout.
 - Leak detection: every operating-system default route of the router carries realm 99, and the harness table `ip tb_observe` counts IPv4 packets routed by such a route (`ipv4_leaks`); any non-zero count while PolyWAN is installed violates INV-3. IPv6 routes have no realm, so for IPv6 the harness offers per-uplink egress counters (`egress_packets`, table `inet tb_egress`) for scenarios where no packet may leave, plus route lookups with `ip -6 route get`.
@@ -68,7 +68,7 @@ sudo target/debug/polywan-testbed exec RUN client ping 198.18.100.1
 sudo target/debug/polywan-testbed down RUN      # or: down --all
 ```
 
-Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to run the test agents inside namespaces), `POLYWAN_TESTBED_DIR` (root of the working directories, default `/tmp/polywan-testbed`), `POLYWAN_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection), `POLYWAN_TEST_UNIT` (the shipped unit file the daemon starts as).
+Environment variables: `POLYWAN_TESTBED_BIN` (path of `polywan-testbed`, used to run the test agents inside namespaces), `POLYWAN_TESTBED_DIR` (root of the working directories, default `/var/lib/polywan-testbed`; the harness refuses a root that is not a directory owned by root, is a symbolic link, or is writable by group or others without the sticky bit, because it writes there the scripts it runs as root), `POLYWAN_TESTBED_KEEP=1` (keep the namespaces of a failed test for inspection), `POLYWAN_TEST_UNIT` (the shipped unit file the daemon starts as).
 
 ## Environment notes
 

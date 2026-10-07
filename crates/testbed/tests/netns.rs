@@ -116,6 +116,35 @@ fn topology_comes_up_with_os_default_routes_and_tears_down() -> Result<()> {
 }
 
 #[test]
+#[ignore = "needs root"]
+fn a_work_root_another_user_controls_is_refused() -> Result<()> {
+    assert!(testbed::is_root(), "this test needs root");
+    let base = PathBuf::from(format!("/tmp/polywan-testbed-refused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir(&base)?;
+    let taken = base.join("taken");
+    std::fs::create_dir(&taken)?;
+    std::os::unix::fs::chown(&taken, Some(65534), Some(65534))?;
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&base, &link)?;
+    for root in [&taken, &link] {
+        let err = Topology::build(Options {
+            work_root: root.clone(),
+            ..options()
+        })
+        .err()
+        .with_context(|| format!("{} accepted", root.display()))?;
+        assert!(
+            format!("{err:#}").contains("must be a directory owned by root"),
+            "{err:#}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&taken)?.count(), 0, "a run directory was created");
+    std::fs::remove_dir_all(&base)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs root and network namespaces"]
 fn lan_traffic_is_attributed_to_the_steered_uplink() -> Result<()> {
     let t = build();

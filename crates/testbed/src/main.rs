@@ -36,7 +36,7 @@ enum Command {
         /// Skip provider C (PPPoE).
         #[arg(long)]
         no_pppoe: bool,
-        /// Working directory root (default /tmp/polywan-testbed or POLYWAN_TESTBED_DIR).
+        /// Working directory root (default /var/lib/polywan-testbed or POLYWAN_TESTBED_DIR).
         #[arg(long)]
         work_root: Option<PathBuf>,
     },
