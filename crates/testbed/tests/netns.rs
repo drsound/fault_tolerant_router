@@ -140,6 +140,14 @@ fn a_work_root_another_user_controls_is_refused() -> Result<()> {
         );
     }
     assert_eq!(std::fs::read_dir(&taken)?.count(), 0, "a run directory was created");
+    // `down` does not remove a run directory in such a work root either.
+    std::fs::create_dir(taken.join("run"))?;
+    let err = topology::destroy("run", &taken).err().context("destroyed")?;
+    assert!(
+        format!("{err:#}").contains("must be a directory owned by root"),
+        "{err:#}"
+    );
+    assert!(taken.join("run").is_dir(), "the run directory was removed");
     std::fs::remove_dir_all(&base)?;
     Ok(())
 }

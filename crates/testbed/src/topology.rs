@@ -593,8 +593,7 @@ exec dnsmasq {common} \
         );
         for (name, text) in [("ipv6-up", up), ("ipv6-down", down)] {
             let p = dir.join(name);
-            fs::write(&p, text)?;
-            chmod_x(&p)?;
+            write_executable(&p, &text)?;
         }
         Ok(())
     }
@@ -680,8 +679,7 @@ exec dnsmasq {common} \
     pub fn start_uplink_clients(&self) -> Result<()> {
         let r = self.router();
         let script = self.dir.join("udhcpc-script");
-        fs::write(&script, udhcpc_script())?;
-        chmod_x(&script)?;
+        write_executable(&script, udhcpc_script())?;
         for u in [Uplink::A, Uplink::B] {
             let ifc = u.carrier_iface();
             let mut c = r.command("env");
@@ -700,8 +698,7 @@ exec dnsmasq {common} \
         }
         if self.opts.pppoe {
             let up = self.dir.join("pppd-ip-up");
-            fs::write(&up, ppp_ip_up_script(Uplink::C.os_metric()))?;
-            chmod_x(&up)?;
+            write_executable(&up, &ppp_ip_up_script(Uplink::C.os_metric()))?;
             r.run(
                 "pppd",
                 [
@@ -1093,6 +1090,8 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
     let _ = fs::remove_file(format!("/var/run/ppp-tb-{run_id}-c.pid"));
     let dir = work_root.join(run_id);
     if dir.exists() {
+        // As at creation: whoever controls the work root chose what `dir` is.
+        check_work_root(work_root)?;
         fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
     if errors.is_empty() {
@@ -1102,8 +1101,25 @@ pub fn destroy(run_id: &str, work_root: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn chmod_x(p: &Path) -> Result<()> {
-    fs::set_permissions(p, fs::Permissions::from_mode(0o755))?;
+/// Writes a script that root will run, as a new file created with mode
+/// 0755 (less under a stricter umask): never writable by others, not even
+/// for a moment, and no descriptor to an earlier file reaches it.
+pub(crate) fn write_executable(p: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match fs::remove_file(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("removing {}", p.display()));
+        }
+        _ => {}
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(p)
+        .with_context(|| format!("creating {}", p.display()))?;
+    f.write_all(text.as_bytes())?;
     Ok(())
 }
 
@@ -1139,4 +1155,29 @@ fn ppp_ip_up_script(metric: u32) -> String {
     format!(
         "#!/bin/sh\n# polywan-testbed pppd ip-up: $1 is the interface.\nip -4 route replace default dev \"$1\" metric {metric} realm {OS_ROUTE_REALM} proto static\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_script_is_a_new_file_others_cannot_write() -> Result<()> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("polywan-testbed-script-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir)?;
+        let p = dir.join("script");
+        fs::write(&p, "old")?;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o666))?;
+        let mut held = fs::OpenOptions::new().write(true).open(&p)?;
+        write_executable(&p, "#!/bin/sh\n")?;
+        held.write_all(b"injected")?;
+        let mode = fs::metadata(&p)?.mode() & 0o7777;
+        assert_eq!(mode & 0o022, 0, "mode {mode:o}");
+        assert_ne!(mode & 0o100, 0, "mode {mode:o}");
+        assert_eq!(fs::read_to_string(&p)?, "#!/bin/sh\n");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

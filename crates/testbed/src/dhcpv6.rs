@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::netns;
 use crate::plan::{Family, Node, Uplink};
-use crate::topology::{Address, Topology, chmod_x};
+use crate::topology::{Address, Topology, write_executable};
 
 /// The address at which provider B's DHCPv6 server takes messages sent by
 /// unicast, announced in the server-unicast option: inside B's prefix and
@@ -151,8 +151,7 @@ impl Topology {
             }
             Dhcpv6Client::Dhclient => {
                 let script = d.join("dhclient-script");
-                fs::write(&script, dhclient_script())?;
-                chmod_x(&script)?;
+                write_executable(&script, dhclient_script())?;
                 let path = |name: &str| d.join(name).display().to_string();
                 r.spawn(
                     &self.unconfined("dhclient")?.to_string_lossy(),

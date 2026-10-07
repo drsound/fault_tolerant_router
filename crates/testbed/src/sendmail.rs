@@ -4,7 +4,6 @@
 //! and input, and behaves as the next mode of its script says.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -165,9 +164,9 @@ impl Stub {
         fs::create_dir_all(&dir)?;
         let path = t.exec_dir()?.join(name);
         let d = dir.display();
-        fs::write(
+        crate::topology::write_executable(
             &path,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 d={d}
 # The mode first, so that a recorded call has its mode: the script's next
@@ -193,7 +192,6 @@ esac
 "#
             ),
         )?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(Stub {
             path,
             dir,
