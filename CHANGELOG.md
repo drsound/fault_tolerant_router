@@ -2,7 +2,7 @@
 
 The notable changes of every PolyWAN release. Versions follow [Semantic Versioning](https://semver.org/): within a major version, the configuration, the command line, the `/v1` API and the metric names stay compatible. Fault Tolerant Router 1.x, the Ruby daemon, has no entries here; it is preserved on the `legacy/ruby` branch.
 
-## 2.0.0 (unreleased)
+## 2.0.0 (2026-10-07)
 
 PolyWAN 2.0 is a ground-up rewrite in Rust of Fault Tolerant Router, under a new name. It keeps the idea of 1.x, new connections spread over the healthy uplinks with the kernel's multipath routing and every connection kept on the uplink it started on, and brings it up to date with the Linux networking of 2026. The contract it is built and tested against is `SPEC.md` in the source tree.
 
@@ -17,6 +17,7 @@ PolyWAN 2.0 is a ground-up rewrite in Rust of Fault Tolerant Router, under a new
 - A status API on Unix sockets (a read-only status socket and a control socket for the `polywan` group), the commands `status`, `events`, `drain`, `undrain`, `reload`, `notify-test`, `cleanup` and `forget-uplink`, Prometheus metrics, event hooks, and email through the system's sendmail interface (msmtp is the documented configuration).
 - A sandboxed systemd unit with readiness notification, synchronous `systemctl reload` and exit status 78 for a configuration that refuses startup.
 - Static binaries for x86_64, aarch64 and armv7 (musl), and Debian packages for amd64, arm64 and armhf with the unit, the `polywan` group, a man page, shell completions and a commented example configuration (also printed by `polywan generate-config`).
+- Measured on a Raspberry Pi 4 (Raspberry Pi OS based on Debian 13, Linux 6.18) with four uplinks, both families and the default settings, under the packaged unit: 0.18% of one core and 8 MB of resident memory with the arm64 build, 0.18% and 7 MB with the armv7 build.
 
 ### Coming from 1.x
 
