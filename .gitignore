@@ -1,3 +1,2 @@
-.idea/
-# Rust
-/target
+# Cargo build output: the workspace's and the standalone spike crates'.
+target/
