@@ -4,33 +4,40 @@
 
 *Formerly Fault Tolerant Router.*
 
-Do you have several internet connections, from different providers, on one Linux router? Do you want to use all of their bandwidth and stay online when some of them fail? PolyWAN is a daemon for exactly that.
+## In brief
+
+Multi-WAN routing and failover for Linux.
+
+PolyWAN spreads new connections over several internet uplinks from different providers, takes a failed one out of use and puts it back when it recovers.
 
 ## What it does
 
-PolyWAN runs on a general-purpose Linux distribution (Debian, Ubuntu, Fedora, Arch, Raspberry Pi OS, a virtual machine, …) used as a router or firewall with two or more uplinks: fibre plus a 5G or Starlink backup, two lines in an office, a metered line kept for emergencies.
+PolyWAN is a daemon for a general-purpose Linux distribution (Debian, Ubuntu, Fedora, Arch, Raspberry Pi OS, a virtual machine, etc.) used as a router or firewall with two or more internet uplinks: fibre plus a 5G or Starlink backup, two lines in an office, a metered line kept for emergencies.
 
-- New outgoing connections from the internal networks are spread over the healthy uplinks with the kernel's multipath routing, according to weights and priority groups: a worse priority group is used only when no uplink of a better one is usable.
-- Every connection keeps the uplink it started on for its whole life, and inbound connections are answered through the uplink they arrived on.
-- Each uplink is probed through its own interface (ICMP echo or TCP handshakes to well-known public hosts), so that "link up but provider cut off from the internet" is detected; optional quality gates also take out a link that loses too many packets or is too slow.
-- IPv4 and IPv6 are independent: an uplink can be healthy for one family and failed for the other.
-- Uplinks can be static, DHCP, SLAAC or PPP. PolyWAN does not configure interfaces: it observes what systemd-networkd, NetworkManager, ifupdown or pppd configure, and coexists with the operating system's own default routes.
-- Policies send selected traffic through a chosen uplink; an uplink can be drained for maintenance.
-- Marking and optional source NAT live in an nftables table that PolyWAN owns, or, in external mode, in a ruleset you load yourself. PolyWAN never adds filtering verdicts and never touches objects it does not own.
-- A status API and command line (`polywan status`, `events`, `drain`, `reload`, …), Prometheus metrics, event hooks and email notifications.
-- One static binary, Debian packages and a sandboxed systemd unit.
+It routes the traffic of at least one internal network (a downlink), and the router's own connections are balanced and fail over too.
 
-How it works is explained in [docs/how-it-works.md](docs/how-it-works.md).
+- **Load balancing**: new outgoing connections are spread over the healthy uplinks with the kernel's *multipath routing*, according to weights and priority groups. A worse priority group is used only when no uplink of a better one is usable: that's how a metered line stays idle until it's really needed.
+- **Failover**: an uplink that fails its health checks is taken out of the balancing, and put back when it recovers. New connections go over the remaining uplinks, while the connections that were using the failed one generally have to reconnect.
+- **Health checks**: each uplink is probed through its own interface, with ICMP echo or TCP handshakes to well-known public hosts. This way an uplink that looks "up" while its provider is cut off from the internet is detected as failed. Optional quality gates also take out an uplink that loses too many packets or is too slow.
+- **Sticky connections**: every connection keeps the uplink it started on for its whole life, and inbound connections are answered through the uplink they arrived on.
+- **Dual stack**: IPv4 and IPv6 are independent, so an uplink can be healthy for one family and failed for the other.
+- **Dynamic uplinks**: uplinks can be static, DHCP, SLAAC or PPP. PolyWAN doesn't configure interfaces: it observes what systemd-networkd, NetworkManager, ifupdown or pppd configure, and coexists with the operating system's own default routes.
+- **Policies and maintenance**: policies send selected traffic through a chosen uplink, and an uplink can be drained before working on it.
+- **Firewall**: marking and optional source NAT live in an nftables table owned by PolyWAN or, in external mode, in a ruleset you load yourself. PolyWAN never adds filtering verdicts and never touches objects it doesn't own.
+- **Observability**: a status API and command line (`polywan status`, `events`, `drain`, `reload`, etc.), Prometheus metrics, event hooks and email notifications.
+- **Packaging**: one static binary, Debian packages and a sandboxed systemd unit.
+
+The details are in [How PolyWAN works](docs/how-it-works.md).
 
 ## Requirements
 
 - Linux 6.1 or later, on x86_64, aarch64 or armv7.
 - nftables 1.0.6 or later, for the managed firewall mode.
-- Root privileges. systemd is the supported service manager, but not required.
+- Root privileges. systemd is the supported service manager, but it isn't required.
 
 ## Quick start
 
-On Debian or Ubuntu, with the package of your architecture from the releases page:
+On Debian or Ubuntu, download the package for your architecture from the releases page, then:
 
 ```sh
 apt install ./polywan_2.0.0-1_amd64.deb
@@ -41,7 +48,7 @@ systemctl enable --now polywan
 polywan status
 ```
 
-Other distributions use the static binary; see [installation](docs/installation.md).
+On other distributions, use the static binary: see [Installation](docs/installation.md).
 
 ## Documentation
 
@@ -52,17 +59,19 @@ Other distributions use the static binary; see [installation](docs/installation.
 - [API, command line and access](docs/api.md): the sockets, every command and endpoint, metrics.
 - [Email notifications](docs/email.md): msmtp and how sending works.
 - [Troubleshooting](docs/troubleshooting.md): by symptom.
-- `man 8 polywan` for every command and option.
+- `man 8 polywan`: every command and option.
 
 ## Releases
 
-PolyWAN 2.0 is a ground-up rewrite of Fault Tolerant Router in Rust. Debian packages and static binaries are on the [releases page](https://github.com/drsound/polywan/releases), and the crate is on [crates.io](https://crates.io/crates/polywan). The changes of each release are in [CHANGELOG.md](CHANGELOG.md); the specification the code is built and tested against is [SPEC.md](SPEC.md).
+Debian packages and static binaries are on the [releases page](https://github.com/drsound/polywan/releases), and the crate is on [crates.io](https://crates.io/crates/polywan). The changes of each release are listed in [CHANGELOG.md](CHANGELOG.md).
 
-Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It is no longer developed.
+The code is built and tested against a specification: [SPEC.md](SPEC.md).
 
 ## Building
 
-With a Rust toolchain (1.89 or later), `cargo install polywan` builds and installs the latest release from crates.io. From the source:
+With a Rust toolchain (1.89 or later), `cargo install polywan` builds and installs the latest release from crates.io.
+
+From the source:
 
 ```sh
 cargo build --release -p polywan
@@ -72,16 +81,28 @@ target/release/polywan check-config --offline --config config.toml
 
 ## Testing
 
-Every functional requirement is verified by acceptance scenarios that move real packets through network namespaces: a router, a client, three providers (DHCP, CGNAT and PPPoE, dual-stack) and an internet with probe targets. `tests/vm/run-suite.sh --host` builds and runs the whole suite on the running kernel (as root, through sudo), and `--unit` runs it with the daemon under the packaged systemd unit; `tests/vm/run-suite.sh --vm ROOTFS` runs it in a virtme-ng virtual machine booted from a root filesystem made by `tests/vm/build-rootfs.sh`, which is how CI covers Debian 12 (Linux 6.1, nftables 1.0.6). The harness is described in [crates/testbed/README.md](crates/testbed/README.md).
+Every functional requirement is verified by acceptance scenarios that move real packets through network namespaces: a router, a client, three providers (DHCP, CGNAT and PPPoE, all dual-stack) and an internet with the probe targets.
+
+- `tests/vm/run-suite.sh --host` builds and runs the whole suite on the running kernel, as root (through sudo).
+- `tests/vm/run-suite.sh --host --unit` does the same with the daemon running under the packaged systemd unit.
+- `tests/vm/run-suite.sh --vm ROOTFS` runs the suite in a virtme-ng virtual machine, booted from a root filesystem made by `tests/vm/build-rootfs.sh`. That's how CI covers Debian 12 (Linux 6.1, nftables 1.0.6).
+
+The test harness is described in [crates/testbed/README.md](crates/testbed/README.md).
 
 ## Coming from Fault Tolerant Router 1.x
 
-2.0 keeps the purpose of 1.x, not its interface. It does not read 1.x YAML configurations, and it no longer needs hand-integrated iptables rules or a main table without default routes: a 2.0 configuration is written anew, starting from the example it ships. Fault Tolerant Router 1.x was featured on [Slashdot](http://linux.slashdot.org/story/15/03/03/1910206/linux-and-multiple-internet-uplinks-a-new-tool) in 2015.
+PolyWAN 2.0 is a ground-up rewrite of Fault Tolerant Router in Rust. It keeps the purpose of 1.x, not its interface.
+
+It doesn't read 1.x YAML configurations, so a 2.0 configuration has to be written anew, starting from the example it ships. However, it no longer needs hand-integrated iptables rules, nor a main routing table without default routes.
+
+Version 1.x, the Ruby daemon published as the `fault_tolerant_router` gem, is preserved on the `legacy/ruby` branch and the `v1-ruby-final` tag. It's no longer developed.
 
 ## License
 
 PolyWAN 2.0 is licensed under either of the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) or the MIT license ([LICENSE-MIT](LICENSE-MIT)), at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions. Fault Tolerant Router 1.x (the Ruby code on the `legacy/ruby` branch) was released under the GNU General Public License v2.0.
 
-## Author
+## Contact
 
-Alessandro Zarrilli (Firenze, Italy), alessandro@zarrilli.net
+Bugs and feature requests go to the [issues](https://github.com/drsound/polywan/issues), and security reports as described in [SECURITY.md](SECURITY.md).
+
+PolyWAN is written and maintained by Alessandro Zarrilli (Firenze, Italy).
