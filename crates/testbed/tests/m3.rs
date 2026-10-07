@@ -1,4 +1,4 @@
-//! M3 acceptance scenarios (SPEC.md §14.3, §17): operations (API and CLI,
+//! M3 acceptance scenarios (SPEC.md §14.3): operations (API and CLI,
 //! drain, policies, events, email, hooks, metrics, quality gates), with the
 //! daemon under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
 //!

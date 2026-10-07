@@ -1,4 +1,4 @@
-//! M4 acceptance scenarios (SPEC.md §14.3, §17): the systemd integration
+//! M4 acceptance scenarios (SPEC.md §14.3): the systemd integration
 //! that the daemon provides by itself (IMPL-10: the configuration exit
 //! status, readiness, status and stopping notifications) and `cleanup`
 //! over the union of the manifest and the configuration (IMPL-7), with the

@@ -1,4 +1,4 @@
-//! M2 acceptance scenarios (SPEC.md §14.3, §17) that exist only for IPv6
+//! M2 acceptance scenarios (SPEC.md §14.3) that exist only for IPv6
 //! or for both families together; the IPv6 variants of the M1 scenarios are
 //! in `m1.rs`. The daemon under test (`POLYWAN_DAEMON_BIN`) runs in the router
 //! namespace.

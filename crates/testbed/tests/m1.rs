@@ -1,4 +1,4 @@
-//! M1 acceptance scenarios (SPEC.md §14.3, §17), IPv4, with the daemon
+//! M1 acceptance scenarios (SPEC.md §14.3), IPv4, with the daemon
 //! under test (`POLYWAN_DAEMON_BIN`) in the router namespace.
 //!
 //! They need root and the harness tools: `tests/vm/run-suite.sh`.

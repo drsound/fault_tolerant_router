@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The package lifecycle of SPEC.md DIST-1 (milestone M4, item H4) on this
-# host: install, upgrade, removal and purge of the polywan .deb, with the
-# maintainer scripts run by dpkg as on a real system.
+# The package lifecycle of SPEC.md DIST-1 on this host: install, upgrade,
+# removal and purge of the polywan .deb, with the maintainer scripts run by
+# dpkg as on a real system.
 #
 # Usage: lifecycle.sh [--hooks BINARY] [--suite BINDIR] DEB
 #   --hooks BINARY  the daemon built with the test hooks (run-suite.sh
