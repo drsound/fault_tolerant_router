@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/polywan", "crates/testbed", "crates/xtask"]
-# Spike crates are standalone throw-away experiments (spikes/README.md).
+# Spike crates are standalone experiments (spikes/README.md).
 exclude = ["spikes"]
 
 [workspace.package]

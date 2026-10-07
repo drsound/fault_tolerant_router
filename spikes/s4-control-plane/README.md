@@ -1,6 +1,6 @@
 # S4 — Coexistence and control plane
 
-Spike S4 of SPEC.md §15 (v0.5): FR-CT-5 (control-plane compatibility), FR-COEX-1 and FR-COEX-2 (systemd-networkd and NetworkManager), FR-SYS-3 (Router Advertisements), and the `suppress_prefixlength 0` main bypass (INV-1) with operating-system default routes in the main table.
+Spike S4 of SPEC.md §15: FR-CT-5 (control-plane compatibility), FR-COEX-1 and FR-COEX-2 (systemd-networkd and NetworkManager), FR-SYS-3 (Router Advertisements), and the `suppress_prefixlength 0` main bypass (INV-1) with operating-system default routes in the main table.
 
 ## Result in one paragraph
 
